@@ -25,6 +25,11 @@ test("notification latch sends once and outputConsumed suppresses delivery", asy
     assert.equal(await sendCompletionNotification(pi as never, registry, payload), true);
     assert.equal(await sendCompletionNotification(pi as never, registry, payload), false);
     assert.equal(calls, 1);
+    const followUpCalls: unknown[][] = [];
+    const followUpPi = { sendMessage: async (...args: unknown[]) => { followUpCalls.push(args); } };
+    const followUpTask = registry.submit({ command: "sleep 5" });
+    assert.equal(await sendCompletionNotification(followUpPi as never, registry, { ...payload, taskId: followUpTask.taskId }, { triggerTurn: false }), true);
+    assert.deepEqual(followUpCalls[0]?.[1], { deliverAs: "followUp" });
     const other = registry.submit({ command: "sleep 5" });
     registry.consume(other.taskId);
     assert.equal(await sendCompletionNotification(pi as never, registry, { ...payload, taskId: other.taskId }), false);

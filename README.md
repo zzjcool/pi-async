@@ -35,7 +35,7 @@ The extension registers five tools:
 | `/async` | Open the task panel. |
 | `/async-clear` | Clear completed-task history badges. |
 | `Ctrl+Alt+A` | Open the task panel (when the host allows the shortcut; `/async` remains available as fallback). |
-| `↑` / `↓` | Select tasks; in task details, scroll output. |
+| `↑` / `↓` / `j` / `k` | Select tasks; in task details, scroll output. |
 | `Enter` | Open selected task details. |
 | `h` | Toggle history in the task list. |
 | `k` | Kill a running task (press again to confirm). |
@@ -60,7 +60,7 @@ In a legion child session, collect task results with `async_wait` before returni
 
 ## Known limitations
 
-- Crash-durability is not guaranteed: metadata is atomically replaced, but captured output is not fsynced.
+- Crash-durability is not guaranteed: metadata is atomically replaced, but captured output is not fsynced. After a crash, orphaned tasks and delayed tasks are not automatically restored; recovery is limited to `/reload` in the same running process.
 - Busy-hold behavior depends on upstream pi-legion issue [#156](https://github.com/zzjcool/pi-legion/issues/156); the extension does not patch Pi or legion.
 - TUI rail and panel are available only in the main TUI session, not in RPC/print/child contexts.
 - `pi --print` notification delivery requires an available configured provider. If no provider is available, end-to-end print-mode verification remains pending a user run.

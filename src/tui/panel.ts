@@ -64,7 +64,7 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
     },
   });
   try {
-    host.registerShortcut?.("ctrl+alt+a", { description: "Open async task panel", handler: (ctx) => openPanel(ctx, registry) });
+    host.registerShortcut?.(process.env.PI_ASYNC_DOCK_SHORTCUT ?? "ctrl+alt+a", { description: "Open async task panel", handler: (ctx) => openPanel(ctx, registry) });
   } catch {
     // The /async command remains the fallback when Pi reserves this shortcut.
   }

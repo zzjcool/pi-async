@@ -15,14 +15,22 @@ export function buildNotificationXml(p: NotifyPayload): string {
   return `<async-task-notification>${fields.map(([tag, value]) => `<${tag}>${escapeXml(value)}</${tag}>`).join("")}</async-task-notification>`;
 }
 
-export async function sendCompletionNotification(pi: PiCtx, registry: TaskRegistry, p: NotifyPayload): Promise<boolean> {
+export async function sendCompletionNotification(
+  pi: PiCtx,
+  registry: TaskRegistry,
+  p: NotifyPayload,
+  options: { triggerTurn?: boolean } = {},
+): Promise<boolean> {
   if (registry.get(p.taskId)?.outputConsumed || !registry.claimNotification(p.taskId)) return false;
   // SAFETY: The pi extension API provides sendMessage in supported hosts; detect it at runtime for other contexts.
   const target = pi as unknown as { sendMessage?: (message: unknown, options: unknown) => unknown };
   if (!target.sendMessage) { registry.rollbackNotification(p.taskId); return false; }
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await target.sendMessage({ customType: "async-task-notification", content: buildNotificationXml(p) }, { deliverAs: "followUp", triggerTurn: true });
+      await target.sendMessage(
+        { customType: "async-task-notification", content: buildNotificationXml(p) },
+        { deliverAs: "followUp", ...(options.triggerTurn === false ? {} : { triggerTurn: true }) },
+      );
       return true;
     } catch {
       if (attempt < 2) await Promise.resolve();
