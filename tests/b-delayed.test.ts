@@ -36,6 +36,45 @@ test("pending delayed task can be canceled as a user kill", async () => {
   } finally { await f.cleanup(); }
 });
 
+test("reload starts a delayed task immediately when persisted dueAt is expired", async () => {
+  const f = fixture();
+  const restored = new TaskRegistry({ dataDir: f.dir });
+  try {
+    const task = f.registry.scheduleDelayed({ command: "printf overdue" }, 5000);
+    const snapshot = JSON.parse(JSON.stringify(task)) as typeof task;
+    assert.equal(f.registry.cancel(task.taskId), true);
+    snapshot.status = "pending";
+    snapshot.finishedAt = undefined;
+    snapshot.killKind = undefined;
+    snapshot.dueAt = Date.now() - 1000;
+    writeFileSync(join(f.dir, `${task.taskId}.json`), JSON.stringify(snapshot));
+
+    await restored.reloadFromDisk();
+    const outcome = await restored.wait([task.taskId], 3000);
+    assert.ok("results" in outcome);
+    assert.equal(outcome.results[0]?.status, "completed");
+    assert.equal(restored.logs(task.taskId, { tail: true }).text, "overdue");
+  } finally {
+    await restored.shutdown();
+    await f.cleanup();
+  }
+});
+
+test("delayed stdout watch records its success metadata", async () => {
+  const f = fixture();
+  try {
+    const task = f.registry.scheduleDelayed({
+      command: "printf ready; sleep 0.2",
+      watch: { intervalMs: 1000, timeoutMs: 3000, success_when: [{ type: "stdout_contains", value: "ready" }], failure_when: [] },
+    }, 100);
+    const outcome = await f.registry.wait([task.taskId], 3000);
+    assert.ok("results" in outcome);
+    assert.equal(outcome.results[0]?.status, "completed");
+    assert.equal(typeof f.registry.get(task.taskId)?.metadata.watchSuccess, "string");
+    assert.notEqual(f.registry.get(task.taskId)?.metadata.watchSuccess, "");
+  } finally { await f.cleanup(); }
+});
+
 test("reload restores remaining delayed time from persisted dueAt", async () => {
   const f = fixture();
   const restored = new TaskRegistry({ dataDir: f.dir });

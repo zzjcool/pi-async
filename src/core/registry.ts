@@ -97,8 +97,20 @@ export class TaskRegistry {
       getExitCode: () => this.tasks.get(taskId)?.exitCode,
       onSuccess: (detail) => this.markWatchSuccess(taskId, detail),
       onFailure: () => { void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: watch failure kill failed for task ${taskId}`, error)); },
-      onBlindExhausted: () => { const current = this.tasks.get(taskId); if (current && !isTerminal(current.status)) this.finalize(current, "failed"); },
-      onWatchTimeout: () => { const current = this.tasks.get(taskId); if (current && !isTerminal(current.status)) this.finalize(current, "failed"); },
+      onBlindExhausted: () => {
+        const current = this.tasks.get(taskId);
+        if (current && !isTerminal(current.status)) {
+          this.finalize(current, "failed");
+          void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: blind-check kill failed for task ${taskId}`, error));
+        }
+      },
+      onWatchTimeout: () => {
+        const current = this.tasks.get(taskId);
+        if (current && !isTerminal(current.status)) {
+          this.finalize(current, "failed");
+          void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: watch-timeout kill failed for task ${taskId}`, error));
+        }
+      },
     });
     this.watchLoops.set(taskId, loop);
     if (task.status === "running") loop.start();
@@ -153,7 +165,7 @@ export class TaskRegistry {
       if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
       task.exitCode = code;
       task.metadata.capped = this.isOutputCapped(task);
-      if (task.metadata.capped) this.persist(task);
+      if (task.metadata.capped || task.metadata.watchSuccess !== undefined) this.persist(task);
       if (!isTerminal(task.status) && task.watch) {
         try {
           const output = this.readWatchOutput(task.taskId);
@@ -270,14 +282,17 @@ export class TaskRegistry {
 
   async kill(taskId: string, kind: KillKind): Promise<void> {
     const task = this.tasks.get(taskId);
-    const live = this.live.get(taskId);
-    if (!task || !live) return;
+    if (!task) return;
+    const live = this.live.get(taskId) ?? (task.pid !== undefined
+      ? { outputFile: String(task.metadata.outputFile ?? join(this.config.dataDir, `${task.taskId}.output`)), processExited: !this.pidAlive(task.pid) }
+      : undefined);
+    if (!live) return;
     if (task.status === "pending") {
       if (kind === "user") this.cancel(taskId);
       else this.finalize(task, "killed", undefined, kind);
       return;
     }
-    if (isTerminal(task.status) && (live.processExited || task.metadata.watchSuccess === undefined)) return;
+    if (isTerminal(task.status) && live.processExited) return;
     live.killKind = kind;
     if (task.pid && !live.processExited) {
       const result = await killTree(task.pid);
@@ -305,12 +320,20 @@ export class TaskRegistry {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.closed = true;
     this.shutdownPromise = (async () => {
-      const ids = [...this.tasks.values()].filter((task) => !isTerminal(task.status) || (task.metadata.watchSuccess !== undefined && !this.live.get(task.taskId)?.processExited)).map((task) => task.taskId);
+      const ids = [...this.tasks.values()].filter((task) => {
+        const live = this.live.get(task.taskId);
+        return !isTerminal(task.status) || (task.pid !== undefined && (live ? !live.processExited : this.pidAlive(task.pid)));
+      }).map((task) => task.taskId);
       await Promise.all(ids.map(async (id) => {
-        try { await this.kill(id, "shutdown"); } catch (error) { console.error(`pi-async: shutdown could not confirm task ${id} process-group exit`, error); }
+        try {
+          await this.kill(id, "shutdown");
+          await this.live.get(id)?.exit;
+        } catch (error) {
+          // A failed bounded kill must be reported, but must not turn shutdown into an unbounded wait.
+          console.error(`pi-async: shutdown could not confirm task ${id} process-group exit`, error);
+        }
         return undefined;
       }));
-      await Promise.all([...this.live.values()].map((item) => item.exit).filter((exit): exit is Promise<{ code: number }> => Boolean(exit)));
     })();
     return this.shutdownPromise;
   }

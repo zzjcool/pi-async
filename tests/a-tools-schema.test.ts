@@ -16,6 +16,7 @@ test("tool schemas enforce sync/wait timeout requirements and output byte budget
     assert.equal(tools.size, 5);
     assert.ok(tools.get("async_wait")?.parameters.required?.includes("timeoutMs"));
     await assert.rejects(tools.get("async_run")!.execute("call", { command: "true", mode: "sync" }), /timeoutMs is required/);
+    await assert.rejects(tools.get("async_run")!.execute("call", { command: "true", mode: "delayed" }), /delayMs is required/);
     await assert.rejects(tools.get("async_wait")!.execute("call", { taskIds: [] }), /timeoutMs is required/);
     assert.equal((tools.get("async_logs")?.parameters.properties?.maxBytes as { maximum: number }).maximum, 50 * 1024);
     registry.submit({ command: "sleep 5" });
