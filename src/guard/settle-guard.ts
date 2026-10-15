@@ -47,7 +47,7 @@ export class SettleGuard {
       hooks.off?.("agent_start", beforeRun);
       this.removeHooks = [];
     };
-    hooks.on?.("session_shutdown", cleanup);
+    hooks.on?.("session_shutdown", () => { void cleanup(); });
     this.removeHooks.push(cleanup);
     this.startHeartbeat(hooks);
     this.reportActivity();

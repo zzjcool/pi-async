@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
+import { registerPanelCommands } from "../src/tui/panel.ts";
 
 type Tool = {
   name: string;
@@ -67,6 +68,23 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     assert.match(String(notification.message.content), /<status>completed<\/status>/);
     await wait("e2e-wait-notification", { taskIds: [notified.taskId], timeoutMs: 5000 });
 
+    const noTrigger = await run("e2e-no-trigger", {
+      command: "echo no-trigger-marker",
+      mode: "background",
+      triggerOnCompletion: false,
+    }) as Receipt;
+    await waitFor(() => messages.some(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("no-trigger-marker")));
+    const noTriggerMessage = messages.find(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("no-trigger-marker"))!;
+    assert.equal(noTriggerMessage.options.deliverAs, "followUp");
+    assert.equal("triggerTurn" in noTriggerMessage.options, false);
+    await wait("e2e-wait-no-trigger", { taskIds: [noTrigger.taskId], timeoutMs: 5000 });
+
+    const failed = await run("e2e-failed-notification", { command: "echo failure-marker; exit 1", mode: "background" }) as Receipt;
+    await waitFor(() => messages.some(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("failure-marker")));
+    const failedMessage = messages.find(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("failure-marker"))!;
+    assert.match(String(failedMessage.message.content), /<guidance>Inspect task output with async_logs/);
+    await wait("e2e-wait-failed", { taskIds: [failed.taskId], timeoutMs: 5000 });
+
     // Delayed admission plus a real stdout_contains watch condition.
     const delayed = await run("e2e-delayed-watch", {
       command: "printf watch-marker; sleep 0.15",
@@ -112,5 +130,55 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     const shutdown = hooks.get("session_shutdown");
     if (shutdown) await shutdown();
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("TUI init registers status, rail widget, and panel commands", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-async-i-tui-"));
+  const hooks = new Map<string, Hook>();
+  const commands: string[] = [];
+  const widgets: string[] = [];
+  const statuses: string[] = [];
+  const shortcuts: string[] = [];
+  const pi = {
+    cwd,
+    pid: process.pid,
+    mode: "tui",
+    sessionManager: { getSessionId: () => "i-tui-session" },
+    registerTool: () => undefined,
+    registerCommand: (name: string) => { commands.push(name); },
+    registerShortcut: (key: string) => { shortcuts.push(key); },
+    on: (event: string, handler: Hook) => { hooks.set(event, handler); return () => hooks.delete(event); },
+    ui: {
+      setStatus: (key: string) => { statuses.push(key); },
+      setWidget: (key: string) => { widgets.push(key); },
+    },
+  };
+  try {
+    await init(pi as never);
+    assert.ok(statuses.includes("pi-async"));
+    assert.ok(widgets.includes("pi-async-rail"));
+    assert.deepEqual(commands, ["async", "async-clear"]);
+    assert.deepEqual(shortcuts, ["ctrl+alt+a"]);
+  } finally {
+    const shutdown = hooks.get("session_shutdown");
+    if (shutdown) await shutdown();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("panel shortcut honors PI_ASYNC_DOCK_SHORTCUT", () => {
+  const previous = process.env.PI_ASYNC_DOCK_SHORTCUT;
+  const shortcuts: string[] = [];
+  process.env.PI_ASYNC_DOCK_SHORTCUT = "ctrl+shift+p";
+  try {
+    registerPanelCommands({
+      mode: "tui",
+      registerShortcut: (key: string) => { shortcuts.push(key); },
+    } as never, {} as never);
+    assert.deepEqual(shortcuts, ["ctrl+shift+p"]);
+  } finally {
+    if (previous === undefined) delete process.env.PI_ASYNC_DOCK_SHORTCUT;
+    else process.env.PI_ASYNC_DOCK_SHORTCUT = previous;
   }
 });

@@ -35,7 +35,6 @@ function registryDataDir(pi: PiCtx): string {
 /** Wire the task runtime to the host API, degrading optional Pi features gracefully. */
 export async function init(pi: PiCtx): Promise<void> {
   const registry = new TaskRegistry({ dataDir: registryDataDir(pi) });
-  await registry.reloadFromDisk();
   const tui = (pi as RuntimeContext).mode === "tui";
 
   registry.setEvents({
@@ -55,7 +54,8 @@ export async function init(pi: PiCtx): Promise<void> {
         outputFile,
         ...(outputTail ? { summary: outputTail } : {}),
         ...(guidance ? { guidance } : {}),
-      }).catch((error: unknown) => console.error(`pi-async: completion notification failed for ${snapshot.taskId}`, error));
+      }, { triggerTurn: snapshot.metadata.triggerOnCompletion !== false })
+        .catch((error: unknown) => console.error(`pi-async: completion notification failed for ${snapshot.taskId}`, error));
     },
     onStateChange: (snapshot) => {
       const active = registry.activeCount();
@@ -65,6 +65,12 @@ export async function init(pi: PiCtx): Promise<void> {
       if (tui) initStatus(pi, registry);
     },
   });
+
+  try {
+    await registry.reloadFromDisk();
+  } catch (error) {
+    console.error("pi-async: failed to reload task state; continuing with an empty registry", error);
+  }
 
   const context = pi as RuntimeContext;
   if (typeof context.registerTool === "function") registerTools(pi, registry);
