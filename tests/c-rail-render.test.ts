@@ -8,6 +8,11 @@ test("rail rows are empty when there are no visible tasks", () => {
   assert.deepEqual(renderRailRows([makeSnapshot({ status: "pending" })], 80), []);
 });
 
+test("rail render rows strip ANSI and use the injected clock", () => {
+  const rows = renderRailRows([makeSnapshot({ name: "\u001b]0;pwned\u0007job", startedAt: 10_000 })], 80, 12_000);
+  assert.equal(rows[0], "▶ job · running · 2s");
+});
+
 test("rail renders task identity, status and elapsed and caps rows at ten", () => {
   const startedAt = Date.now() - 2_000;
   const snapshots = Array.from({ length: 14 }, (_, i) => makeSnapshot({ taskId: `task-${i}`, name: `job-${i}`, startedAt }));
