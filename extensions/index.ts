@@ -8,6 +8,7 @@ import { registerTools } from "../src/tools/index.ts";
 import { registerRail } from "../src/tui/rail.ts";
 import { disposeStatus, initStatus } from "../src/tui/status.ts";
 import { registerPanelCommands } from "../src/tui/panel.ts";
+import { bindTuiHost } from "../src/tui/host.ts";
 import { isTerminal } from "../src/core/task.ts";
 
 export type PiCtx = ExtensionAPI;
@@ -35,7 +36,17 @@ function registryDataDir(pi: PiCtx): string {
 /** Wire the task runtime to the host API, degrading optional Pi features gracefully. */
 export async function init(pi: PiCtx): Promise<void> {
   const registry = new TaskRegistry({ dataDir: registryDataDir(pi) });
-  const tui = (pi as RuntimeContext).mode === "tui";
+  // NOTE: pi's factory-time ExtensionAPI exposes no `mode`/`ui` — those live on
+  // event-handler contexts (pi.on("session_start", (event, ctx) => ...)). TUI
+  // registration must therefore bind lazily from the first event context.
+  let tui = false;
+  const bindTui = (ctx: unknown): void => {
+    if (!bindTuiHost(ctx)) return;
+    tui = true;
+    initStatus(pi, registry);
+    registerRail(pi, registry);
+    registerPanelCommands(pi, registry);
+  };
 
   registry.setEvents({
     onFinalize: (snapshot) => {
@@ -74,10 +85,10 @@ export async function init(pi: PiCtx): Promise<void> {
 
   const context = pi as RuntimeContext;
   if (typeof context.registerTool === "function") registerTools(pi, registry);
-  if (tui) {
-    initStatus(pi, registry);
-    registerRail(pi, registry);
-    registerPanelCommands(pi, registry);
+  // Bind TUI surfaces from the first event context (factory API has no mode/ui).
+  if (typeof context.on === "function") {
+    context.on("session_start", (_event: unknown, ctx: unknown) => bindTui(ctx));
+    context.on("message_start", (_event: unknown, ctx: unknown) => bindTui(ctx));
   }
   if (typeof context.on === "function") new SettleGuard(pi, registry).register();
 

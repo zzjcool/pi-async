@@ -163,6 +163,8 @@ test("TUI init registers status, rail widget, and panel commands", async () => {
   };
   try {
     await init(pi as never);
+    // Factory API has no mode; TUI binds from the first event context.
+    hooks.get("session_start")?.({ type: "session_start" }, { mode: "tui", hasUI: true, ui: pi.ui });
     assert.ok(statuses.includes("pi-async"));
     assert.ok(widgets.includes("pi-async-rail"));
     assert.deepEqual(commands, ["async", "async-clear"]);

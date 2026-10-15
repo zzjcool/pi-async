@@ -3,6 +3,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
+import { tuiHost } from "./host.ts";
 
 type Theme = { fg(color: string, text: string): string; getFgAnsi?(color: string): string };
 export interface RailWidget {
@@ -133,8 +134,9 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
 
 /** The sole rail widget registration point. */
 export function registerRail(pi: PiCtx, registry: TaskRegistry): void {
-  // SAFETY: `mode` is supplied by Pi at runtime but omitted from ExtensionAPI's peer declaration.
-  const host = pi as unknown as { mode?: string; ui?: { setWidget?: (key: string, factory: ReturnType<typeof createRailFactory> | undefined, options?: { placement: "aboveEditor" }) => void } };
-  if (host.mode !== "tui") return;
-  host.ui?.setWidget?.("pi-async-rail", createRailFactory(pi, registry, { onOpenTask: (id) => openPanel(pi, registry, id) }), { placement: "aboveEditor" });
+  // TUI surfaces bind from event contexts; the factory API has no mode/ui.
+  const bound = tuiHost();
+  if (!bound) return;
+  const setWidget = bound.ui["setWidget"] as ((key: string, factory: ReturnType<typeof createRailFactory> | undefined, options?: { placement: "aboveEditor" }) => void) | undefined;
+  setWidget?.("pi-async-rail", createRailFactory(pi, registry, { onOpenTask: (id) => openPanel(pi, registry, id) }), { placement: "aboveEditor" });
 }

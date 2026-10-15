@@ -1,6 +1,7 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import { reportActivity } from "../core/bus.ts";
+import { tuiHost } from "./host.ts";
 
 export function formatStatus(active: { running: number; pending: number }, done: number): string {
   return ` ${active.running + active.pending} running · ${done} done `;
@@ -23,13 +24,14 @@ export function clearDoneStatus(): void {
 
 export function initStatus(pi: PiCtx, registry: TaskRegistry): void {
   disposeStatus();
-  // SAFETY: ExtensionAPI omits `mode` in some peer typings; runtime TUI entrypoints provide it.
-  const host = pi as unknown as { mode?: string; ui?: { setStatus?: (key: string, text: string | undefined) => void } };
-  if (host.mode !== "tui") return;
+  // TUI surfaces bind from event contexts; the factory API has no mode/ui.
+  const bound = tuiHost();
+  if (!bound) return;
+  const setStatus = bound.ui["setStatus"] as ((key: string, text: string | undefined) => void) | undefined;
   const refresh = (): void => {
     const active = registry.activeCount();
     const done = registry.list({ includeHistory: true }).filter((task) => task.status === "completed" && (task.finishedAt ?? task.createdAt) >= clearedAt).length;
-    host.ui?.setStatus?.("pi-async", formatStatus(active, done));
+    setStatus?.("pi-async", formatStatus(active, done));
     reportActivity(pi, active);
   };
   refreshCurrent = refresh;

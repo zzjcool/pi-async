@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createRailFactory, registerRail } from "../src/tui/rail.ts";
 import { makeSnapshot } from "./helpers/index.ts";
+import { bindTuiHost, resetTuiHostForTests } from "../src/tui/host.ts";
 
 function setup() {
   const calls: string[] = [];
@@ -35,11 +36,15 @@ test("registerRail does not register a widget outside TUI mode", () => {
 });
 
 test("registered rail opens a selected task in the panel", () => {
+  resetTuiHostForTests();
   const task = makeSnapshot({ taskId: "opened" });
   let factory: ((tui: unknown, theme: unknown) => { render(width: number): string[]; handleMouse(event: unknown): unknown }) | undefined;
   let panelFactory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => { render(width: number): string[] }) | undefined;
   const registry = { list: () => [task], logs: () => ({ text: "output\n", truncated: false, fullPath: "" }) };
-  registerRail({ mode: "tui", ui: { setWidget: (_key: string, next: typeof factory) => { factory = next; }, custom: (next: typeof panelFactory) => { panelFactory = next; return Promise.resolve(); } } } as never, registry as never);
+  const ui = { setWidget: (_key: string, next: typeof factory) => { factory = next; }, custom: (next: typeof panelFactory) => { panelFactory = next; return Promise.resolve(); } };
+  // TUI surfaces bind from event contexts; simulate one before registering.
+  bindTuiHost({ mode: "tui", ui });
+  registerRail({} as never, registry as never);
   const widget = factory!({ requestRender() {} }, { fg: (_token: string, text: string) => text });
   widget.render(80);
   widget.handleMouse({ type: "press", button: "left", y: 0 });
