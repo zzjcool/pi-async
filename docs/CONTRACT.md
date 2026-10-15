@@ -243,3 +243,15 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 8. kill：进程组全灭（子进程不残留）；20MiB 超限 kill(output_cap)
 9. settle 守卫：有未决任务时 agent_before_settle 注入提醒并 continue；3 次后放行
 10. TUI（人工）：widget 轨道图渲染 + 点击进面板详情 + 输出 tail 跟随；RPC 下无 TUI 路径执行
+
+## 15. 加固层（2026-10-15 事故后追加）
+
+- **factory API 契约测试**：pi 1.2.0 的 factory-time ExtensionAPI **没有** `mode`/`ui`/`cwd`（探针实测，
+  仅 registerTool/on/sendMessage/appendEntry/sessionManager 等）。TUI 绑定只能从事件 ctx
+  （`pi.on(event, (event, ctx) => ...)`）获取。`tests/i-factory-contract.test.ts` 固化该形状：
+  mock 的 factory pi **禁止**发明真实宿主没有的字段（此前两起生产事故均源于 mock 幻觉字段）。
+- **工具返回值契约**：pi 不自动包装扩展工具返回值；全部 execute 必须经 `toolResult()` 包装成
+  `{content:[{type:"text"}], details, isError}`（TUI getTextOutput 直接 `result.content.filter`）。
+  `tests/a-tool-result-contract.test.ts` 逐工具断言。
+- **rail 终态滞留**：completed/failed/killed 任务在轨道图上保留 `PI_ASYNC_RAIL_LINGER_MS`
+  （默认 30s）供用户看到结果，之后自动消失；running/pending 恒显示；全空闲渲染空（§8）。

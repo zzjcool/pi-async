@@ -79,6 +79,12 @@ export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = D
   return rows.map((row) => Array.from(row).length > limit ? `${Array.from(row).slice(0, Math.max(0, limit - 1)).join("")}…` : row);
 }
 
+/** Terminal-task linger window on the rail, overridable for tests. */
+function lingerMsFromEnv(): number {
+  const raw = Number(process.env.PI_ASYNC_RAIL_LINGER_MS ?? 30_000);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+}
+
 export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onOpenTask?: (taskId: string) => void } = {}): (tui: TUI, theme: Theme) => RailWidget {
   // Factory signature includes the extension context for future host-specific rail integrations.
   void pi;
@@ -86,8 +92,13 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     let scroll = 0;
     let hitRows: string[] = [];
     let latchedId: string | undefined;
-    const ordered = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => task.status !== "pending")
-      .sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt));
+    // Terminal tasks linger briefly so the user sees the outcome, then drop off
+    // the rail (CONTRACT §8: idle sessions render nothing). Live tasks always show.
+    const lingerMs = lingerMsFromEnv();
+    const ordered = (now = Date.now()): TaskSnapshot[] => registry.list({ includeHistory: true })
+      .filter((task) => task.status === "running" || task.status === "pending"
+        || (now - (task.finishedAt ?? task.startedAt ?? task.createdAt)) < lingerMs)
+      .sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? b.createdAt));
     const render = (width = 120): string[] => {
       const tasks = ordered();
       scroll = Math.max(0, Math.min(scroll, Math.max(0, tasks.length - 10)));
