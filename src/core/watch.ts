@@ -1,5 +1,7 @@
 import type { Condition, WatchSpec } from "./task.ts";
 
+const compiledRegexes = new WeakMap<Condition, RegExp>();
+
 export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; error: string } {
   const invalid = (error: string) => ({ ok: false as const, error });
   if (!spec || typeof spec !== "object") return invalid("watch must be an object");
@@ -17,40 +19,47 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
     return invalid("success_when and failure_when must be arrays");
   }
 
-  for (const [index, condition] of [...spec.success_when, ...spec.failure_when].entries()) {
-    if (!condition || typeof condition !== "object" || !("type" in condition)) {
-      return invalid(`condition ${index + 1} is invalid`);
-    }
-    switch (condition.type) {
-      case "exit_code":
-        if (!Number.isFinite(condition.equals)) return invalid(`condition ${index + 1}: equals must be finite`);
-        break;
-      case "stdout_contains":
-      case "stderr_contains":
-        if (typeof condition.value !== "string") return invalid(`condition ${index + 1}: value must be a string`);
-        break;
-      case "json_path_exists":
-        if (typeof condition.path !== "string" || parseJsonPath(condition.path) === undefined) {
-          return invalid(`condition ${index + 1}: invalid JSON path`);
-        }
-        break;
-      case "output_matches":
-        if (typeof condition.regex !== "string") return invalid(`condition ${index + 1}: regex must be a string`);
-        try {
-          new RegExp(condition.regex);
-        } catch {
-          return invalid(`condition ${index + 1}: invalid regex`);
-        }
-        break;
-      default:
-        return invalid(`condition ${index + 1}: unknown condition type`);
+  for (const [group, conditions] of [
+    ["success_when", spec.success_when],
+    ["failure_when", spec.failure_when],
+  ] as const) {
+    for (const [index, condition] of conditions.entries()) {
+      const location = `${group}[${index}]`;
+      if (!condition || typeof condition !== "object" || !("type" in condition)) {
+        return invalid(`${location} is invalid`);
+      }
+      switch (condition.type) {
+        case "exit_code":
+          if (!Number.isFinite(condition.equals)) return invalid(`${location}: equals must be finite`);
+          break;
+        case "stdout_contains":
+        case "stderr_contains":
+          if (typeof condition.value !== "string") return invalid(`${location}: value must be a string`);
+          break;
+        case "json_path_exists":
+          if (typeof condition.path !== "string" || parseJsonPath(condition.path) === undefined) {
+            return invalid(`${location}: invalid JSON path`);
+          }
+          break;
+        case "output_matches":
+          if (typeof condition.regex !== "string") return invalid(`${location}: regex must be a string`);
+          try {
+            compiledRegexes.set(condition, new RegExp(condition.regex));
+          } catch {
+            return invalid(`${location}: invalid regex`);
+          }
+          break;
+        default:
+          return invalid(`${location}: unknown condition type`);
+      }
     }
   }
   return { ok: true };
 }
 
 export function evalConditions(conds: Condition[], ctx: { output: string; exitCode?: number }): boolean {
-  return conds.some((condition) => evaluateCondition(condition, ctx).matched);
+  const result = evaluateConditionsDetailed(conds, ctx);
+  return result.status === "matched" && result.matched;
 }
 
 export interface WatchLoopDeps {
@@ -67,6 +76,7 @@ export interface WatchLoopDeps {
 export class WatchLoop {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = true;
+  private finished = false;
   private deadline = 0;
   private blindCount = 0;
   private readonly deps: WatchLoopDeps;
@@ -76,7 +86,7 @@ export class WatchLoop {
   }
 
   start(): void {
-    if (!this.stopped) return;
+    if (!this.stopped || this.finished) return;
     this.stopped = false;
     this.blindCount = 0;
     this.deadline = Date.now() + this.deps.spec.timeoutMs;
@@ -107,37 +117,38 @@ export class WatchLoop {
       if (needsOutput) output = this.deps.readOutput();
       if (needsExitCode) exitCode = this.deps.getExitCode();
     } catch {
-      this.blindCount++;
-      if (this.blindCount >= (this.deps.spec.blind_checks ?? 3)) {
-        this.finish(this.deps.onBlindExhausted);
-        return;
-      }
-      this.scheduleNext();
+      this.countBlindCheck();
       return;
     }
 
     const ctx = { output, exitCode };
     const failure = evaluateConditionsDetailed(this.deps.spec.failure_when, ctx);
-    if (failure.match) {
+    if (failure.status === "matched" && failure.matched) {
       this.finish(this.deps.onFailure);
       return;
     }
     const success = evaluateConditionsDetailed(this.deps.spec.success_when, ctx);
-    if (success.match) {
-      const matched = success.match;
+    if (success.status === "matched" && success.matched) {
+      const matched = success.condition;
       this.finish(() => this.deps.onSuccess(`success_when matched: ${JSON.stringify(matched)}`));
       return;
     }
 
-    const configured = conditions.map((condition) => evaluateCondition(condition, ctx));
-    if (configured.length > 0 && configured.every((result) => !result.evaluable)) {
-      this.blindCount++;
-      if (this.blindCount >= (this.deps.spec.blind_checks ?? 3)) {
-        this.finish(this.deps.onBlindExhausted);
-        return;
-      }
+    // Pending observations (e.g. a process still running or incomplete JSON output)
+    // are not infrastructure failures and must not consume the blind-check budget.
+    if (failure.status === "error" || success.status === "error") {
+      this.countBlindCheck();
     } else {
       this.blindCount = 0;
+      this.scheduleNext();
+    }
+  }
+
+  private countBlindCheck(): void {
+    this.blindCount++;
+    if (this.blindCount >= (this.deps.spec.blind_checks ?? 3)) {
+      this.finish(this.deps.onBlindExhausted);
+      return;
     }
     this.scheduleNext();
   }
@@ -156,64 +167,77 @@ export class WatchLoop {
   }
 
   private finish(callback: () => void): void {
+    this.finished = true;
     this.stop();
     callback();
   }
 }
 
-type ConditionEvaluation = { evaluable: boolean; matched: boolean };
-type ConditionMatch = Condition & { type: Condition["type"] };
+type ConditionEvaluation =
+  | { status: "matched"; matched: boolean; condition?: Condition }
+  | { status: "pending" }
+  | { status: "error" };
 
-function evaluateConditionsDetailed(conditions: Condition[], ctx: { output: string; exitCode?: number }): {
-  match?: ConditionMatch;
-} {
+function evaluateConditionsDetailed(conditions: Condition[], ctx: { output: string; exitCode?: number }): ConditionEvaluation {
+  let pending = false;
+  let error = false;
   for (const condition of conditions) {
     const result = evaluateCondition(condition, ctx);
-    if (result.evaluable && result.matched) return { match: condition };
+    if (result.status === "matched" && result.matched) return { status: "matched", matched: true, condition };
+    if (result.status === "pending") pending = true;
+    if (result.status === "error") error = true;
   }
-  return {};
+  if (error) return { status: "error" };
+  if (pending) return { status: "pending" };
+  return { status: "matched", matched: false };
 }
 
 function evaluateCondition(condition: Condition, ctx: { output: string; exitCode?: number }): ConditionEvaluation {
   switch (condition.type) {
     case "exit_code":
       return ctx.exitCode === undefined
-        ? { evaluable: false, matched: false }
-        : { evaluable: true, matched: ctx.exitCode === condition.equals };
+        ? { status: "pending" }
+        : { status: "matched", matched: ctx.exitCode === condition.equals };
     case "stdout_contains":
     case "stderr_contains":
       // The frozen WatchLoop context exposes the captured merged output stream.
-      return { evaluable: true, matched: ctx.output.includes(condition.value) };
+      return { status: "matched", matched: ctx.output.includes(condition.value) };
     case "output_matches": {
-      try {
-        return { evaluable: true, matched: new RegExp(condition.regex).test(ctx.output) };
-      } catch {
-        // Validation should prevent this; treat mutated/invalid input as not matched.
-        return { evaluable: false, matched: false };
+      let regex = compiledRegexes.get(condition);
+      if (!regex) {
+        try {
+          regex = new RegExp(condition.regex);
+          compiledRegexes.set(condition, regex);
+        } catch {
+          return { status: "error" };
+        }
       }
+      // Global/sticky expressions otherwise retain lastIndex between watch polls.
+      regex.lastIndex = 0;
+      return { status: "matched", matched: regex.test(ctx.output) };
     }
     case "json_path_exists": {
       let root: unknown;
       try {
         root = JSON.parse(ctx.output);
       } catch {
-        return { evaluable: false, matched: false };
+        return { status: "pending" };
       }
       const tokens = parseJsonPath(condition.path);
-      if (tokens === undefined) return { evaluable: false, matched: false };
+      if (tokens === undefined) return { status: "error" };
       let current = root;
       for (const token of tokens) {
         if (typeof token === "number") {
-          if (!Array.isArray(current) || token >= current.length) return { evaluable: true, matched: false };
+          if (!Array.isArray(current) || token >= current.length) return { status: "matched", matched: false };
           current = current[token];
         } else {
           if (current === null || typeof current !== "object" || !Object.hasOwn(current, token)) {
-            return { evaluable: true, matched: false };
+            return { status: "matched", matched: false };
           }
           current = (current as Record<string, unknown>)[token];
         }
       }
-      return { evaluable: true, matched: true };
+      return { status: "matched", matched: true };
     }
   }
 }

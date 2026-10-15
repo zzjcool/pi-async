@@ -22,10 +22,19 @@ test("rejects malformed or unsupported JSON paths before scheduling", () => {
   assert.equal(validateWatchSpec(validSpec({ success_when: [{ type: "json_path_exists", path: "$.a.b[0]" }] })).ok, true);
 });
 
-test("rejects invalid regular expressions before scheduling", () => {
-  const result = validateWatchSpec(validSpec({ success_when: [{ type: "output_matches", regex: "[" }] }));
+test("rejects invalid regular expressions before scheduling with grouped condition indexes", () => {
+  const result = validateWatchSpec(validSpec({
+    success_when: [{ type: "output_matches", regex: "^ready$" }, { type: "output_matches", regex: "[" }],
+  }));
   assert.equal(result.ok, false);
-  if (!result.ok) assert.match(result.error, /regex/);
+  if (!result.ok) assert.match(result.error, /success_when\[1\].*regex/);
+
+  const failureResult = validateWatchSpec(validSpec({
+    success_when: [],
+    failure_when: [{ type: "stdout_contains", value: "fatal" }, { type: "output_matches", regex: "[" }],
+  }));
+  assert.equal(failureResult.ok, false);
+  if (!failureResult.ok) assert.match(failureResult.error, /failure_when\[1\].*regex/);
 });
 
 test("enforces interval and watch timeout boundaries", () => {
