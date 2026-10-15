@@ -14,7 +14,7 @@ export class SettleGuard {
     this.pi = pi;
     this.registry = registry;
     this.maxReminders = opts?.maxReminders ?? 3;
-    this.heartbeatMs = opts?.heartbeatMs ?? Number(process.env.PI_ASYNC_HEARTBEAT_MS ?? 60_000);
+    this.heartbeatMs = opts?.heartbeatMs ?? finiteEnvNumber("PI_ASYNC_HEARTBEAT_MS", 60_000);
   }
 
   register(): void {
@@ -26,7 +26,7 @@ export class SettleGuard {
     };
     const beforeSettle = () => {
       const active = this.registry.list({ includeHistory: false });
-      if (active.length === 0) { this.reminders = 0; return; }
+      if (active.length === 0) { this.reminders = 0; this.reportActivity(); return; }
       this.reportActivity();
       if (this.reminders >= this.maxReminders) {
         hooks.appendEntry?.("async-task-unresolved", { message: `${active.length} async task(s) remain unresolved: ${active.map((task) => task.taskId).join(", ")}` });
@@ -70,4 +70,9 @@ export class SettleGuard {
     }, this.heartbeatMs);
     this.heartbeat.unref?.();
   }
+}
+
+function finiteEnvNumber(name: string, fallback: number): number {
+  const parsed = Number(process.env[name] ?? fallback);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }

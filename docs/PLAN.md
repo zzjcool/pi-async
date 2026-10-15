@@ -89,14 +89,8 @@ export interface TaskSnapshot {
 ```
 
 ```ts
-// ===== src/core/output.ts（stripAnsi 由 Step 0 实装；OutputCapture 归 Line A）=====
+// ===== src/core/output.ts（stripAnsi 由 Step 0 实装；REV-3：Line A 保留 spawn 流式输出捕获，不导出 OutputCapture）=====
 export function stripAnsi(text: string): string;                 // ANSI/CSI/OSC 全剥离（§9 安全项）
-export class OutputCapture {
-  constructor(file: string, capBytes: number);
-  write(chunk: string | Buffer): { capped: boolean; totalBytes: number };
-  readTail(maxBytes: number): { text: string; truncated: boolean; totalBytes: number };
-  readLatestLines(maxLines: number): string[];
-}
 ```
 
 ```ts
@@ -373,3 +367,4 @@ Step 0 ──► (A ∥ B1 ∥ C 并行开发) ──► merge A ──► B2（
 |---|---|---|---|
 | 2026-10-15 | REV-1 | §2 rail.ts 接口拆分：原 `createRailFactory(registry): (width)=>string[]` 纯渲染函数无法承载 CONTRACT §8 的 wheel/press→latch→click 交互与 setWidget 注册。修订为：`renderRailRows`（纯渲染，单测锚点，不变）+ `createRailFactory(pi, registry, {onOpenTask}): (tui, theme) => RailWidget {render, handleMouse, dispose}` + `registerRail`（setWidget 唯一调用点，工厂捕获 tui/theme，legion status.ts 同款模式）。TuiMouseEvent/Theme/TUI 类型自 peer `@earendil-works/pi-tui` import type。C 线 c-rail-render.test.ts 锚 renderRailRows 纯函数；新增 c-rail-mouse.test.ts 测 press→latch→click/wheel。 | worker-C 按契约正确拒绝（PLAN §2 与 CONTRACT §8 矛盾） |
 | 2026-10-15 | REV-2 | CONTRACT §4 blind_checks 语义澄清：仅「检查基础设施失败」（readOutput 报错等）计入 blind 累计；「尚未可判定」（exit_code 未退出、json_path_exists 输出尚非 JSON）为 pending 态，不累计、照常轮询。原实现两者合并导致 default 参数下 watch >90s 的健康任务被误判 failed（reviewer 探针验证）。WatchLoop 求值增加三态：matched / pending / error；仅 error 计 blind。 | reviewer-b1 major finding（探针验证） |
+| 2026-10-15 | REV-3 | §2 output.ts 接口修订：实际输出上限由 `spawn.ts` 的流式 stdout/stderr 捕获与进程组终止实现；删除未被使用的 `OutputCapture` 类，`output.ts` 仅提供 `stripAnsi`。 | reviewer-A F6（死代码/双实现） |

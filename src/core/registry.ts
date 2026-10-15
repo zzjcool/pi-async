@@ -10,7 +10,7 @@ export interface RegistryEvents {
   onStateChange(snapshot: TaskSnapshot): void;
 }
 export interface RegistryConfig { dataDir: string; maxTasks?: number; maxOutputBytes?: number; }
-interface LiveTask { outputFile: string; exit?: Promise<{ code: number }>; timer?: ReturnType<typeof setTimeout>; killKind?: KillKind; }
+interface LiveTask { outputFile: string; exit?: Promise<{ code: number }>; timer?: ReturnType<typeof setTimeout>; watcher?: ReturnType<typeof setInterval>; killKind?: KillKind; }
 interface Waiter { ids: Set<string>; resolve: () => void; }
 const DEFAULT_MAX_OUTPUT = 20 * 1024 * 1024;
 
@@ -28,8 +28,8 @@ export class TaskRegistry {
   private readonly config: RegistryConfig;
   constructor(config: RegistryConfig) {
     this.config = config;
-    this.maxTasks = config.maxTasks ?? Number(process.env.PI_ASYNC_MAX_TASKS ?? 32);
-    this.maxOutputBytes = config.maxOutputBytes ?? Number(process.env.PI_ASYNC_MAX_OUTPUT_BYTES ?? DEFAULT_MAX_OUTPUT);
+    this.maxTasks = config.maxTasks ?? finiteEnvNumber("PI_ASYNC_MAX_TASKS", 32);
+    this.maxOutputBytes = config.maxOutputBytes ?? finiteEnvNumber("PI_ASYNC_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT);
     mkdirSync(config.dataDir, { recursive: true });
   }
 
@@ -54,10 +54,11 @@ export class TaskRegistry {
       const handle = spawnDetached(opts.command, { outputFile, env: { ...opts.env, PI_ASYNC_INTERNAL_MAX_OUTPUT_BYTES: String(this.maxOutputBytes) } });
       task.pid = handle.pid;
       live.exit = handle.exit.then(({ code }) => {
-        const capped = existsSync(`${outputFile}.capped`);
+        task.metadata.capped = this.isOutputCapped(task);
+        if (task.metadata.capped) this.persist(task);
         if (!isTerminal(task.status)) {
           if (live.killKind === "shutdown" || live.killKind === "user" || live.killKind === "timeout" || live.killKind === "watch_failure") this.finalize(task, "killed", undefined, live.killKind);
-          else if (capped) this.finalize(task, "failed", code, "output_cap");
+          else if (task.metadata.capped) this.finalize(task, "failed", code, "output_cap");
           else this.finalize(task, code === 0 ? "completed" : "failed", code);
         }
         return { code };
@@ -66,7 +67,9 @@ export class TaskRegistry {
         return { code: 1 };
       });
       this.persist(task);
-      if (opts.taskTimeoutMs !== undefined && opts.taskTimeoutMs > 0) live.timer = setTimeout(() => { void this.kill(taskId, "timeout"); }, opts.taskTimeoutMs);
+      if (opts.taskTimeoutMs !== undefined && opts.taskTimeoutMs > 0) live.timer = setTimeout(() => {
+        void this.kill(taskId, "timeout").catch((error: unknown) => console.error(`pi-async: timeout kill failed for task ${taskId}`, error));
+      }, opts.taskTimeoutMs);
       this.emitState(task);
     } catch (error) {
       this.live.delete(taskId);
@@ -153,7 +156,7 @@ export class TaskRegistry {
     this.shutdownPromise = (async () => {
       const ids = [...this.tasks.values()].filter((task) => !isTerminal(task.status)).map((task) => task.taskId);
       await Promise.all(ids.map(async (id) => {
-        try { await this.kill(id, "shutdown"); } catch { /* Preserve shutdown progress; kill reports its own leak error to callers. */ }
+        try { await this.kill(id, "shutdown"); } catch (error) { console.error(`pi-async: shutdown could not confirm task ${id} process-group exit`, error); }
         return undefined;
       }));
       await Promise.all([...this.live.values()].map((item) => item.exit).filter((exit): exit is Promise<{ code: number }> => Boolean(exit)));
@@ -168,6 +171,20 @@ export class TaskRegistry {
         this.tasks.set(snapshot.taskId, snapshot);
         if (snapshot.status === "running" && (!snapshot.pid || !this.pidAlive(snapshot.pid))) {
           snapshot.status = "failed"; snapshot.failureKind = "lost"; snapshot.finishedAt = Date.now(); this.persist(snapshot); this.events.onFinalize(snapshot);
+        } else if (snapshot.status === "running" && snapshot.pid) {
+          const outputFile = String(snapshot.metadata.outputFile ?? join(this.config.dataDir, `${snapshot.taskId}.output`));
+          const live: LiveTask = { outputFile };
+          this.live.set(snapshot.taskId, live);
+          live.watcher = setInterval(() => {
+            if (snapshot.pid && !this.pidAlive(snapshot.pid)) {
+              if (live.watcher) clearInterval(live.watcher);
+              snapshot.metadata.capped = this.isOutputCapped(snapshot);
+              if (live.killKind) this.finalize(snapshot, "killed", undefined, live.killKind);
+              else if (snapshot.metadata.capped) this.finalize(snapshot, "failed", undefined, "output_cap");
+              else { snapshot.failureKind = "lost"; this.finalize(snapshot, "failed"); }
+            }
+          }, 100);
+          live.watcher.unref?.();
         }
       } catch { /* Ignore incomplete/corrupt metadata files; atomic writer leaves prior version intact. */ }
     }
@@ -180,7 +197,7 @@ export class TaskRegistry {
   private finalize(task: TaskSnapshot, status: TaskSnapshot["status"], code?: number, killKind?: KillKind): void {
     if (isTerminal(task.status)) return;
     task.status = status; task.exitCode = code; task.killKind = killKind; task.finishedAt = Date.now();
-    const live = this.live.get(task.taskId); if (live?.timer) clearTimeout(live.timer);
+    const live = this.live.get(task.taskId); if (live?.timer) clearTimeout(live.timer); if (live?.watcher) clearInterval(live.watcher);
     this.persist(task); this.emitState(task); this.events.onFinalize(task);
     for (const waiter of [...this.waiters]) if (waiter.ids.has(task.taskId)) waiter.resolve();
   }
@@ -189,5 +206,19 @@ export class TaskRegistry {
     const file = join(this.config.dataDir, `${task.taskId}.json`); const temp = `${file}.${process.pid}.tmp`;
     writeFileSync(temp, JSON.stringify(task), { mode: 0o600 }); renameSync(temp, file);
   }
-  private pidAlive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
+  private isOutputCapped(task: TaskSnapshot): boolean {
+    try {
+      const persisted = JSON.parse(readFileSync(join(this.config.dataDir, `${task.taskId}.json`), "utf8")) as TaskSnapshot;
+      return persisted.metadata.capped === true;
+    } catch { return task.metadata.capped === true; }
+  }
+  private pidAlive(pid: number): boolean {
+    try { process.kill(-pid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+  }
+}
+
+function finiteEnvNumber(name: string, fallback: number): number {
+  const parsed = Number(process.env[name] ?? fallback);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
