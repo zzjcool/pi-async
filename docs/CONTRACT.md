@@ -192,6 +192,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   **不承诺 crash-durability**（metadata 原子写，output 不 fsync）。
 - reload：registry 重建后扫描 `.pi/async/<session-id>-*`，running 且 pid 已死 → 标 failed(lost)；
   delayed pending → 恢复计时（reload 保留）；**切换 session 不迁移**（旧目录只读留档）。
+  **REV-5 裁决（F3）**：reload 恢复仅限同进程存活期内的 /reload（dataDir 按进程固定
+  `<session-id>-<pid>`）；跨 pid 崩溃遗留目录只读留档、不恢复，崩溃后遗留的 pending 延迟任务
+  不会自动续跑。理由：跨 pid 收养需处理写入归属与幂等重建，与 v1 不承诺 crash-durability 的
+  定位一致。README 已知限制同步标注。
 
 ## 11. 配置与环境变量
 
