@@ -109,6 +109,9 @@ type Condition =
 - `success_when` 命中 → **不杀进程**：任务标 completed，通知带命中详情；进程按 taskTimeoutMs/kill 自然管理。
   （区别于 better-bg 的 check 命令模式：我们 watch 的是**已存在任务**的输出/退出。）
 - 条件在 async_run 时**启动前校验**，非法 regex/JSON path 直接拒绝（不产生 pending 任务）。
+- **blind_checks 语义（REV-2 澄清）**：仅计「检查基础设施失败」（readOutput 抐错等）；
+  「尚未可判定」（exit_code 未退出 / json_path 输出尚非 JSON）为 **pending 态，不累计 blind、照常
+  继续轮询**。两者是不同语义，禁止合并。
 - promptGuidelines（写进工具 description）：check 不要 `|| true` 自吞错误；未知态映射失败；
   结构化输出优先 jq -e；`output_matches` 的 regex 须加锚定防止过早匹配。
 

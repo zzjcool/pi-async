@@ -199,9 +199,19 @@ export class WatchLoop {
 
 ```ts
 // ===== src/tui/*（Line C；所有入口自检 pi.mode === "tui"，D6；custom() 返回 undefined 即 return）=====
-// rail.ts
-export function createRailFactory(registry: TaskRegistry): (width: number) => string[];
-// setWidget("pi-async-rail", factory, {placement:"aboveEditor"})；≤10 行硬约束；空闲返回 []
+// rail.ts（REV-1 修订：渲染纯函数与可交互 widget 工厂拆开，事件与注册归 registerRail）
+export function renderRailRows(snapshots: TaskSnapshot[], width: number): string[];
+// 纯渲染：每行 '▶ name · state · elapsed'；≤10 行；空闲返回 []（单测锚点）
+export interface RailWidget {
+  render: (width?: number) => string[];
+  handleMouse: (event: TuiMouseEvent) => { handled: boolean } | undefined;  // wheel 滚动；press→latch→click 同任务才触发 onOpenTask
+  dispose?: () => void;
+}
+export function createRailFactory(pi: PiCtx, registry: TaskRegistry,
+  opts: { onOpenTask?: (taskId: string) => void }): (tui: Tui, theme: Theme) => RailWidget;
+export function registerRail(pi: PiCtx, registry: TaskRegistry): void;
+// setWidget("pi-async-rail", createRailFactory(...), {placement:"aboveEditor"}) 的唯一调用点；
+// 工厂捕获 tui/theme（legion status.ts 同款），dispose 清 ticker
 // status.ts
 export function initStatus(pi: PiCtx, registry: TaskRegistry): void;
 // setStatus("pi-async", " N running · M done ") + 经 bus.reportActivity 上报
@@ -354,3 +364,12 @@ Step 0 ──► (A ∥ B1 ∥ C 并行开发) ──► merge A ──► B2（
   4→`b-delayed.test.ts`；5→`b-watch-integration.test.ts` + `b-watch-validate.test.ts`；
   6→`a-registry-background.test.ts`（wait 多任务/notReady/AbortSignal）；7→`a-strip-ansi.test.ts`；
   8→`a-kill-tree.test.ts` + `a-output-cap.test.ts`；9→`a-settle-guard.test.ts`；10→人工 checklist（Step I 交付）。
+
+---
+
+## 8. 修订记录
+
+| 日期 | REV | 内容 | 触发 |
+|---|---|---|---|
+| 2026-10-15 | REV-1 | §2 rail.ts 接口拆分：原 `createRailFactory(registry): (width)=>string[]` 纯渲染函数无法承载 CONTRACT §8 的 wheel/press→latch→click 交互与 setWidget 注册。修订为：`renderRailRows`（纯渲染，单测锚点，不变）+ `createRailFactory(pi, registry, {onOpenTask}): (tui, theme) => RailWidget {render, handleMouse, dispose}` + `registerRail`（setWidget 唯一调用点，工厂捕获 tui/theme，legion status.ts 同款模式）。TuiMouseEvent/Theme/TUI 类型自 peer `@earendil-works/pi-tui` import type。C 线 c-rail-render.test.ts 锚 renderRailRows 纯函数；新增 c-rail-mouse.test.ts 测 press→latch→click/wheel。 | worker-C 按契约正确拒绝（PLAN §2 与 CONTRACT §8 矛盾） |
+| 2026-10-15 | REV-2 | CONTRACT §4 blind_checks 语义澄清：仅「检查基础设施失败」（readOutput 报错等）计入 blind 累计；「尚未可判定」（exit_code 未退出、json_path_exists 输出尚非 JSON）为 pending 态，不累计、照常轮询。原实现两者合并导致 default 参数下 watch >90s 的健康任务被误判 failed（reviewer 探针验证）。WatchLoop 求值增加三态：matched / pending / error；仅 error 计 blind。 | reviewer-b1 major finding（探针验证） |
