@@ -114,6 +114,10 @@ type Condition =
   继续轮询**。两者是不同语义，禁止合并。
 - promptGuidelines（写进工具 description）：check 不要 `|| true` 自吞错误；未知态映射失败；
   结构化输出优先 jq -e；`output_matches` 的 regex 须加锚定防止过早匹配。
+- **watch 失败性终态的进程处置（REV-4 裁决）**：`failure_when` 命中、blind 耗尽、watch timeout
+  三条 watch 失败路径在 finalize 任务的同时**必须 kill 进程组**（与 `failure_when → killed(watch_failure)`
+  同语义）；仅 `success_when`（D4）不干预进程。杀失败时响亮上报（kill 链已有 catch），
+  绝不允许「终态任务 + 活进程」残留导致 async_kill 静默不杀或 shutdown 挂起。
 
 ## 5. async_wait（唤醒原语，冻结）
 
