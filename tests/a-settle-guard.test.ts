@@ -25,6 +25,17 @@ test("settle guard reminds three times, then permits settle while retaining unre
   } finally { if (previous === undefined) delete process.env.PI_LEGION_NODE_ID; else process.env.PI_LEGION_NODE_ID = previous; }
 });
 
+test("settle guard clears activity when no tasks remain", () => {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const calls: unknown[][] = [];
+  const pi = { on: (event: string, cb: (...args: unknown[]) => unknown) => handlers.set(event, cb), ui: { setActivity: (...args: unknown[]) => calls.push(args) } };
+  const registry = { list: () => [], activeCount: () => ({ running: 0, pending: 0 }), hasActiveWork: () => false };
+  new SettleGuard(pi as never, registry as never, { heartbeatMs: 0 }).register();
+  handlers.get("agent_before_settle")!();
+  assert.equal(calls.at(-1)?.[0], "pi-async");
+  assert.equal(calls.at(-1)?.[1], undefined);
+});
+
 test("a new agent run rearms the reminder limit", () => {
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
   const pi = { on: (event: string, cb: (...args: unknown[]) => unknown) => handlers.set(event, cb) };

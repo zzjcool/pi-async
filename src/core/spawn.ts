@@ -1,14 +1,15 @@
-import { createWriteStream, mkdirSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import type { TaskSnapshot } from "./task.ts";
 
 export interface SpawnHandle { pid: number; exit: Promise<{ code: number }>; }
 
 /** Start a shell command in its own POSIX process group and capture merged output. */
 export function spawnDetached(command: string, opts: { outputFile: string; env?: Record<string, string> }): SpawnHandle {
   mkdirSync(dirname(opts.outputFile), { recursive: true });
-  const capBytes = Number(opts.env?.PI_ASYNC_INTERNAL_MAX_OUTPUT_BYTES ?? process.env.PI_ASYNC_MAX_OUTPUT_BYTES ?? 20 * 1024 * 1024);
+  const capBytes = finiteNumber(opts.env?.PI_ASYNC_INTERNAL_MAX_OUTPUT_BYTES ?? process.env.PI_ASYNC_MAX_OUTPUT_BYTES, 20 * 1024 * 1024);
   const env = { ...process.env, ...opts.env };
   delete env.PI_ASYNC_INTERNAL_MAX_OUTPUT_BYTES;
   const child = spawn("/bin/sh", ["-c", command], { detached: true, stdio: ["ignore", "pipe", "pipe"], env });
@@ -26,8 +27,12 @@ export function spawnDetached(command: string, opts: { outputFile: string; env?:
     }
     if (accepted.length < chunk.length) {
       capReached = true;
-      writeFileSync(`${opts.outputFile}.capped`, "output cap exceeded", { mode: 0o600 });
-      void killTree(child.pid ?? 0, { graceMs: 3000 });
+      persistOutputCap(opts.outputFile);
+      void killTree(child.pid ?? 0, { graceMs: 3000 }).then(({ confirmed }) => {
+        if (!confirmed) console.error(`pi-async: output cap could not confirm process group ${child.pid} exited`);
+      }).catch((error: unknown) => {
+        console.error(`pi-async: failed to kill process group ${child.pid} after output cap`, error);
+      });
     }
   };
   child.stdout?.on("data", (chunk: Buffer) => copy(Buffer.from(chunk)));
@@ -39,6 +44,26 @@ export function spawnDetached(command: string, opts: { outputFile: string; env?:
     });
   });
   return { pid: child.pid, exit };
+}
+
+function finiteNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** Merge the cap marker into the task snapshot with the same atomic-rename strategy as the registry. */
+function persistOutputCap(outputFile: string): void {
+  const metadataFile = outputFile.endsWith(".output") ? `${outputFile.slice(0, -7)}.json` : `${outputFile}.json`;
+  try {
+    if (!existsSync(metadataFile)) throw new Error(`Task metadata is not available at ${metadataFile}`);
+    const snapshot = JSON.parse(readFileSync(metadataFile, "utf8")) as TaskSnapshot;
+    snapshot.metadata = { ...snapshot.metadata, capped: true };
+    const temp = `${metadataFile}.${process.pid}.tmp`;
+    writeFileSync(temp, JSON.stringify(snapshot), { mode: 0o600 });
+    renameSync(temp, metadataFile);
+  } catch (error) {
+    console.error(`pi-async: failed to persist output cap metadata for ${outputFile}`, error);
+  }
 }
 
 function groupExists(pid: number): boolean {

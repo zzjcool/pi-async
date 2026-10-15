@@ -89,14 +89,8 @@ export interface TaskSnapshot {
 ```
 
 ```ts
-// ===== src/core/output.ts（stripAnsi 由 Step 0 实装；OutputCapture 归 Line A）=====
+// ===== src/core/output.ts（stripAnsi 由 Step 0 实装；REV-3：Line A 保留 spawn 流式输出捕获，不导出 OutputCapture）=====
 export function stripAnsi(text: string): string;                 // ANSI/CSI/OSC 全剥离（§9 安全项）
-export class OutputCapture {
-  constructor(file: string, capBytes: number);
-  write(chunk: string | Buffer): { capped: boolean; totalBytes: number };
-  readTail(maxBytes: number): { text: string; truncated: boolean; totalBytes: number };
-  readLatestLines(maxLines: number): string[];
-}
 ```
 
 ```ts
@@ -354,3 +348,8 @@ Step 0 ──► (A ∥ B1 ∥ C 并行开发) ──► merge A ──► B2（
   4→`b-delayed.test.ts`；5→`b-watch-integration.test.ts` + `b-watch-validate.test.ts`；
   6→`a-registry-background.test.ts`（wait 多任务/notReady/AbortSignal）；7→`a-strip-ansi.test.ts`；
   8→`a-kill-tree.test.ts` + `a-output-cap.test.ts`；9→`a-settle-guard.test.ts`；10→人工 checklist（Step I 交付）。
+
+## 8. 修订记录
+
+### REV-3
+Line A reviewer 修复：实际输出上限由 `spawn.ts` 的流式 stdout/stderr 捕获与进程组终止实现；删除未被使用的 `OutputCapture` 类，`output.ts` 仅提供 `stripAnsi`。
