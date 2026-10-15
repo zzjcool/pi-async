@@ -71,3 +71,11 @@ In a legion child session, collect task results with `async_wait` before returni
 npm run typecheck
 npm test
 ```
+
+## Known upstream issue (print mode)
+
+`pi --print` + background task completing **after** the agent settles: the wake happens but the woken
+run's `turn_end` boundary fails with `Extension error (<boundary>): turn_end could not resolve the
+persisted assistant entry ID` (pi 1.2.0 core, reproduced identically with pi-background-tasks —
+upstream issue https://github.com/earendil-works/pi/issues/11001). **RPC mode (legion subagents) and
+turn-internal waits are unaffected.**
