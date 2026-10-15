@@ -11,6 +11,13 @@ function fixture() {
   const registry = new TaskRegistry({ dataDir: dir });
   return { registry, cleanup: async () => { await registry.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
 }
+function assertProcessGroupDead(pid: number): void {
+  assert.throws(() => process.kill(-pid, 0), (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH");
+}
+function forceKillProcessGroup(pid: number | undefined): void {
+  if (pid === undefined) return;
+  try { process.kill(-pid, "SIGKILL"); } catch { /* Already gone. */ }
+}
 const watch = (condition: WatchSpec["success_when"][number], overrides: Partial<WatchSpec> = {}): WatchSpec => ({
   intervalMs: 1000, timeoutMs: 5000, success_when: [condition], failure_when: [], ...overrides,
 });
@@ -43,6 +50,63 @@ test("failure_when kills task with watch_failure kind", async () => {
     assert.equal(result.results[0]?.status, "killed");
     assert.equal(f.registry.get(task.taskId)?.killKind, "watch_failure");
   } finally { await f.cleanup(); }
+});
+
+test("watch timeout fails the task and kills its process group", async () => {
+  const f = fixture();
+  let pid: number | undefined;
+  try {
+    const task = f.registry.submit({ command: "sleep 8" });
+    pid = task.pid;
+    f.registry.attachWatch(task.taskId, watch({ type: "stdout_contains", value: "never" }, { timeoutMs: 1200 }));
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    assert.equal(f.registry.get(task.taskId)?.status, "failed");
+    assert.ok(pid);
+    assertProcessGroupDead(pid);
+  } finally {
+    forceKillProcessGroup(pid);
+    await f.cleanup();
+  }
+});
+
+test("async_kill still kills a process after watch timeout finalized it", async () => {
+  const f = fixture();
+  let pid: number | undefined;
+  try {
+    const task = f.registry.submit({ command: "sleep 8" });
+    pid = task.pid;
+    f.registry.attachWatch(task.taskId, watch({ type: "stdout_contains", value: "never" }, { timeoutMs: 1200 }));
+    const result = await f.registry.wait([task.taskId], 3000);
+    assert.ok("results" in result);
+    assert.equal(result.results[0]?.status, "failed");
+    await f.registry.kill(task.taskId, "user");
+    assert.ok(pid);
+    assertProcessGroupDead(pid);
+  } finally {
+    forceKillProcessGroup(pid);
+    await f.cleanup();
+  }
+});
+
+test("async_kill stops a process after D4 watch success completed the task", async () => {
+  const f = fixture();
+  let pid: number | undefined;
+  try {
+    const task = f.registry.submit({ command: "printf ready; sleep 3" });
+    pid = task.pid;
+    f.registry.attachWatch(task.taskId, watch({ type: "stdout_contains", value: "ready" }));
+    const result = await f.registry.wait([task.taskId], 3000);
+    assert.ok("results" in result);
+    assert.equal(result.results[0]?.status, "completed");
+    const killStartedAt = Date.now();
+    await f.registry.kill(task.taskId, "user");
+    assert.ok(Date.now() - killStartedAt < 3500);
+    assert.ok(pid);
+    assertProcessGroupDead(pid);
+  } finally {
+    forceKillProcessGroup(pid);
+    await f.cleanup();
+  }
 });
 
 test("terminal task stops watch loop and invalid specs are rejected before admission", async () => {
