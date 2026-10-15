@@ -53,10 +53,12 @@ test("async_run dispatches sync and delayed modes and only permits watch on back
     assert.ok(schema.properties.watch);
     assert.ok(schema.allOf.length >= 3);
     const sync = await run.execute("call", { command: "printf sync", mode: "sync", timeoutMs: 3000 });
-    assert.equal((sync as { exitCode: number }).exitCode, 0);
+    const syncPayload = (sync as { details: { payload: { exitCode?: number } } }).details.payload;
+    assert.equal(syncPayload.exitCode, 0);
     await assert.rejects(run.execute("call", { command: "true", mode: "sync", timeoutMs: 1, watch: { intervalMs: 1000, timeoutMs: 1000, success_when: [], failure_when: [] } }), /watch is only supported/);
     const delayed = await run.execute("call", { command: "printf delayed", mode: "delayed", delayMs: 30, watch: { intervalMs: 1000, timeoutMs: 3000, success_when: [{ type: "stdout_contains", value: "delayed" }], failure_when: [] } });
-    assert.equal((delayed as { status: string }).status, "pending");
+    const delayedPayload = (delayed as { details: { payload: { status: string } } }).details.payload;
+    assert.equal(delayedPayload.status, "pending");
   } finally { await f.cleanup(); }
 });
 

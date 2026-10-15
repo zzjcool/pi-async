@@ -2,6 +2,25 @@ import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { WatchSpec } from "../core/task.ts";
 
+/**
+ * Wrap an extension-tool return value into pi's ToolResultMessage shape.
+ *
+ * pi 1.2.0 does NOT auto-wrap extension tool return values (the executor
+ * passes `await tool.execute(...)` through verbatim; only builtin tools
+ * return `{content:[{type:"text",...}]}`). A bare object without `content`
+ * crashes the TUI's ToolExecutionComponent.getTextOutput
+ * (`result.content.filter` on undefined) and persists as content:[] —
+ * see the user-reported uncaughtException on 2026-10-15.
+ *
+ * Every async_* tool MUST route its return value through this helper so the
+ * result satisfies the ToolResultMessage contract: content is an array of
+ * typed blocks, and the original payload rides along in `details` for tests
+ * and structured consumers.
+ */
+function toolResult(payload: unknown, isError = false): { content: Array<{ type: "text"; text: string }>; details: unknown; isError: boolean } {
+  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], details: { payload }, isError };
+}
+
 const promptGuidelines = "Check commands must not swallow errors with || true; map unknown states to failure; prefer structured output and jq -e; anchor output_matches regexes to avoid premature matches.";
 const MAX_LOG_BYTES = 50 * 1024;
 const schema = (properties: Record<string, unknown>, required: string[] = [], allOf: unknown[] = []) => ({ type: "object", properties, required, additionalProperties: false, ...(allOf.length ? { allOf } : {}) });
@@ -52,22 +71,22 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry): void {
         ...(params.env && typeof params.env === "object" ? { env: params.env as Record<string, string> } : {}),
         ...(params.watch && typeof params.watch === "object" ? { watch: params.watch as WatchSpec } : {}),
       };
-      if (mode === "sync") return registry.runSync({ ...options, mode: "sync" }, Number(params.timeoutMs), params.onTimeout === "abort" ? "abort" : "promote", signal);
+      if (mode === "sync") { const r = await registry.runSync({ ...options, mode: "sync" }, Number(params.timeoutMs), params.onTimeout === "abort" ? "abort" : "promote", signal); return toolResult(r); }
       const task = mode === "delayed"
         ? registry.scheduleDelayed({ ...options, mode: "delayed" }, Number(params.delayMs))
         : registry.submit({ ...options, mode: "background" });
-      return { taskId: task.taskId, name: task.name, status: task.status, mode: task.mode, outputHint: `Use async_logs with taskId ${task.taskId} to inspect early output.` };
+      return toolResult({ taskId: task.taskId, name: task.name, status: task.status, mode: task.mode, outputHint: `Use async_logs with taskId ${task.taskId} to inspect early output.` });
     },
   });
   api.registerTool({ name: "async_wait", label: "Wait for async tasks", description: "Wait for tasks to finish or return notReady; waiting does not kill tasks.", parameters: schema({ taskIds: { type: "array", items: stringField }, timeoutMs: timeoutField }, ["taskIds", "timeoutMs"]), execute: async (_id, params, signal) => {
     if (params.timeoutMs === undefined) throw new Error("timeoutMs is required");
-    return registry.wait(params.taskIds as string[], Number(params.timeoutMs), signal);
+    return toolResult(await registry.wait(params.taskIds as string[], Number(params.timeoutMs), signal));
   } });
   api.registerTool({ name: "async_logs", label: "Read async output", description: "Read bounded, ANSI-stripped task output.", parameters: schema({ taskId: stringField, maxBytes: { type: "number", minimum: 0, maximum: MAX_LOG_BYTES }, tail: { type: "boolean" } }, ["taskId"]), execute: async (_id, params) => {
     const maxBytes = params.maxBytes === undefined ? MAX_LOG_BYTES : Number(params.maxBytes);
     if (maxBytes > MAX_LOG_BYTES) throw new Error("maxBytes must be at most 50 KiB");
-    return registry.logs(String(params.taskId), { maxBytes, tail: params.tail !== false });
+    return toolResult(registry.logs(String(params.taskId), { maxBytes, tail: params.tail !== false }));
   } });
-  api.registerTool({ name: "async_status", label: "Async task status", description: "List async tasks and current status.", parameters: schema({ includeHistory: { type: "boolean" } }), execute: async (_id, params) => registry.list({ includeHistory: params.includeHistory !== false }) });
-  api.registerTool({ name: "async_kill", label: "Kill async task", description: "Terminate an async task and its process group.", parameters: schema({ taskId: stringField }, ["taskId"]), execute: async (_id, params) => { await registry.kill(String(params.taskId), "user"); return { taskId: params.taskId, status: registry.get(String(params.taskId))?.status }; } });
+  api.registerTool({ name: "async_status", label: "Async task status", description: "List async tasks and current status.", parameters: schema({ includeHistory: { type: "boolean" } }), execute: async (_id, params) => toolResult(registry.list({ includeHistory: params.includeHistory !== false })) });
+  api.registerTool({ name: "async_kill", label: "Kill async task", description: "Terminate an async task and its process group.", parameters: schema({ taskId: stringField }, ["taskId"]), execute: async (_id, params) => { await registry.kill(String(params.taskId), "user"); return toolResult({ taskId: params.taskId, status: registry.get(String(params.taskId))?.status }); } });
 }

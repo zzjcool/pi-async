@@ -13,6 +13,12 @@ type Tool = {
 type Hook = (...args: unknown[]) => unknown;
 type Receipt = { taskId: string; status: string; outputTail?: string; exitCode?: number; mode?: string };
 
+/** Unwrap the toolResult envelope (contract: content text + details.payload). */
+function payload(result: unknown): Receipt {
+  const wrapped = result as { details?: { payload?: Receipt } };
+  return (wrapped.details?.payload ?? result) as Receipt;
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -44,21 +50,21 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     const wait = tools.get("async_wait")!.execute;
 
     // Background: real shell child, event-driven wait, and captured stdout/exit status.
-    const background = await run("e2e-background", { command: "echo hi", mode: "background" }) as Receipt;
+    const background = payload(await run("e2e-background", { command: "echo hi", mode: "background" }));
     assert.equal(background.status, "running");
-    const backgroundResult = await wait("e2e-wait-background", { taskIds: [background.taskId], timeoutMs: 5000 }) as { results: Receipt[] };
+    const backgroundResult = payload(await wait("e2e-wait-background", { taskIds: [background.taskId], timeoutMs: 5000 })) as unknown as { results: Receipt[] };
     assert.equal(backgroundResult.results[0]?.status, "completed");
     assert.equal(backgroundResult.results[0]?.exitCode, 0);
     assert.match(backgroundResult.results[0]?.outputTail ?? "", /hi/);
 
     // onFinalize must invoke the actual notification chain wired by the extension.
-    const notified = await run("e2e-notification", {
+    const notified = payload(await run("e2e-notification", {
       command: "echo notify-marker",
       name: "notify <&> task",
       mode: "background",
       notifyOnCompletion: true,
       triggerOnCompletion: true,
-    }) as Receipt;
+    }));
     await waitFor(() => messages.some(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("notify &lt;&amp;&gt; task")));
     const notification = messages.find(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("notify &lt;&amp;&gt; task"))!;
     assert.equal(notification.options.deliverAs, "followUp");
@@ -68,25 +74,25 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     assert.match(String(notification.message.content), /<status>completed<\/status>/);
     await wait("e2e-wait-notification", { taskIds: [notified.taskId], timeoutMs: 5000 });
 
-    const noTrigger = await run("e2e-no-trigger", {
+    const noTrigger = payload(await run("e2e-no-trigger", {
       command: "echo no-trigger-marker",
       mode: "background",
       triggerOnCompletion: false,
-    }) as Receipt;
+    }));
     await waitFor(() => messages.some(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("no-trigger-marker")));
     const noTriggerMessage = messages.find(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("no-trigger-marker"))!;
     assert.equal(noTriggerMessage.options.deliverAs, "followUp");
     assert.equal("triggerTurn" in noTriggerMessage.options, false);
     await wait("e2e-wait-no-trigger", { taskIds: [noTrigger.taskId], timeoutMs: 5000 });
 
-    const failed = await run("e2e-failed-notification", { command: "echo failure-marker; exit 1", mode: "background" }) as Receipt;
+    const failed = payload(await run("e2e-failed-notification", { command: "echo failure-marker; exit 1", mode: "background" }));
     await waitFor(() => messages.some(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("failure-marker")));
     const failedMessage = messages.find(({ message }) => message.customType === "async-task-notification" && String(message.content).includes("failure-marker"))!;
     assert.match(String(failedMessage.message.content), /<guidance>Inspect task output with async_logs/);
     await wait("e2e-wait-failed", { taskIds: [failed.taskId], timeoutMs: 5000 });
 
     // Delayed admission plus a real stdout_contains watch condition.
-    const delayed = await run("e2e-delayed-watch", {
+    const pending = await run("e2e-delayed-watch", {
       command: "printf watch-marker; sleep 0.15",
       mode: "delayed",
       delayMs: 50,
@@ -97,31 +103,32 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
         failure_when: [],
       },
       notifyOnCompletion: false,
-    }) as Receipt;
+    });
+    const delayed = payload(pending);
     assert.equal(delayed.status, "pending");
-    const delayedResult = await wait("e2e-wait-delayed", { taskIds: [delayed.taskId], timeoutMs: 5000 }) as { results: Receipt[] };
+    const delayedResult = payload(await wait("e2e-wait-delayed", { taskIds: [delayed.taskId], timeoutMs: 5000 })) as unknown as { results: Receipt[] };
     assert.equal(delayedResult.results[0]?.status, "completed");
-    const delayedSnapshot = await tools.get("async_status")!.execute("e2e-status", { includeHistory: true }) as Array<{ taskId: string; metadata: Record<string, unknown> }>;
+    const delayedSnapshot = payload(await tools.get("async_status")!.execute("e2e-status", { includeHistory: true })) as unknown as Array<{ taskId: string; metadata: Record<string, unknown> }>;
     const delayedTask = delayedSnapshot.find((task) => task.taskId === delayed.taskId);
     assert.equal(typeof delayedTask?.metadata.watchSuccess, "string");
     assert.match(String(delayedTask?.metadata.watchSuccess), /watch-marker/);
 
     // Sync mode returns exit code and captured output directly.
-    const synchronous = await run("e2e-sync", { command: "printf sync-marker", mode: "sync", timeoutMs: 5000 }) as Receipt;
+    const synchronous = payload(await run("e2e-sync", { command: "printf sync-marker", mode: "sync", timeoutMs: 5000 }));
     assert.equal(synchronous.status, "completed");
     assert.equal(synchronous.exitCode, 0);
     assert.match(synchronous.outputTail ?? "", /sync-marker/);
 
     // session_shutdown is repeatable and kills every active process with shutdown semantics.
-    const active = await run("e2e-shutdown", { command: "sleep 30", mode: "background", notifyOnCompletion: false }) as Receipt;
-    const activeStatus = await tools.get("async_status")!.execute("e2e-pre-shutdown", { includeHistory: true }) as Array<{ taskId: string; pid?: number }>;
+    const active = payload(await run("e2e-shutdown", { command: "sleep 30", mode: "background", notifyOnCompletion: false }));
+    const activeStatus = payload(await tools.get("async_status")!.execute("e2e-pre-shutdown", { includeHistory: true })) as unknown as Array<{ taskId: string; pid?: number }>;
     const activePid = activeStatus.find((task) => task.taskId === active.taskId)?.pid;
     assert.ok(activePid);
     const shutdown = hooks.get("session_shutdown");
     assert.ok(shutdown);
     await shutdown();
     await shutdown();
-    const afterShutdown = await tools.get("async_status")!.execute("e2e-post-shutdown", { includeHistory: true }) as Array<{ taskId: string; status: string; killKind?: string }>;
+    const afterShutdown = payload(await tools.get("async_status")!.execute("e2e-post-shutdown", { includeHistory: true })) as unknown as Array<{ taskId: string; status: string; killKind?: string }>;
     const killed = afterShutdown.find((task) => task.taskId === active.taskId);
     assert.equal(killed?.status, "killed");
     assert.equal(killed?.killKind, "shutdown");
