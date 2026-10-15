@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createRailFactory } from "../src/tui/rail.ts";
+import { createRailFactory, registerRail } from "../src/tui/rail.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 function setup() {
@@ -26,6 +26,25 @@ test("rail ignores a click on a different task than the latched press", () => {
   widget.handleMouse({ type: "press", button: "left", x: 1, y: 0 } as never);
   widget.handleMouse({ type: "click", button: "left", x: 1, y: 1 } as never);
   assert.deepEqual(calls, []);
+});
+
+test("registerRail does not register a widget outside TUI mode", () => {
+  let calls = 0;
+  registerRail({ mode: "rpc", ui: { setWidget: () => { calls++; } } } as never, {} as never);
+  assert.equal(calls, 0);
+});
+
+test("registered rail opens a selected task in the panel", () => {
+  const task = makeSnapshot({ taskId: "opened" });
+  let factory: ((tui: unknown, theme: unknown) => { render(width: number): string[]; handleMouse(event: unknown): unknown }) | undefined;
+  let panelFactory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => { render(width: number): string[] }) | undefined;
+  const registry = { list: () => [task], logs: () => ({ text: "output\n", truncated: false, fullPath: "" }) };
+  registerRail({ mode: "tui", ui: { setWidget: (_key: string, next: typeof factory) => { factory = next; }, custom: (next: typeof panelFactory) => { panelFactory = next; return Promise.resolve(); } } } as never, registry as never);
+  const widget = factory!({ requestRender() {} }, { fg: (_token: string, text: string) => text });
+  widget.render(80);
+  widget.handleMouse({ type: "press", button: "left", y: 0 });
+  widget.handleMouse({ type: "click", button: "left", y: 0 });
+  assert.ok(panelFactory!({ requestRender() {} }, {}, {}, () => {}).render(80).some((line) => line.includes("command:")));
 });
 
 test("rail consumes wheel to scroll overflow rows", () => {

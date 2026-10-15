@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { openSync, closeSync, fstatSync, readSync } from "node:fs";
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
@@ -13,14 +13,19 @@ const isTui = (pi: PiCtx): boolean => {
 const UI_TAIL_BYTES = 128 * 1024;
 const PANEL_ROWS = 12;
 let historyClearedAt = 0;
-const visible = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\r\n\t]+/g, " ");
+const visible = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "").replace(/[\r\n\t]+/g, " ");
 function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: string; truncated: boolean } {
   const outputPath = task.metadata.outputFile;
   if (typeof outputPath !== "string") return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
   try {
-    const data = readFileSync(outputPath);
-    const start = Math.max(0, data.byteLength - UI_TAIL_BYTES);
-    return { text: stripAnsi(data.subarray(start).toString("utf8")), truncated: start > 0 };
+    const fd = openSync(outputPath, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const start = Math.max(0, size - UI_TAIL_BYTES);
+      const buffer = Buffer.alloc(Math.min(size, UI_TAIL_BYTES));
+      readSync(fd, buffer, 0, buffer.length, start);
+      return { text: stripAnsi(buffer.toString("utf8")), truncated: start > 0 };
+    } finally { closeSync(fd); }
   } catch {
     return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
   }
@@ -71,7 +76,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     mode?: string;
     ui?: {
       copyToClipboard?: (text: string) => void;
-      custom?: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => unknown, options: unknown) => unknown;
+      custom?: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => unknown, options: unknown) => Promise<unknown>;
       notify?: (message: string, level?: string) => void;
       setStatus?: (key: string, text: string | undefined) => void;
     };
@@ -99,7 +104,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       if (!detail) {
         return ["↑/↓ select · Enter details · h history · q close", ...tasks.map((task) => {
           const output = task.status === "running" ? registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text.split(/\r?\n/).filter(Boolean).at(-1) : undefined;
-          return `${task.taskId === selected ? "▶" : " "} ${task.name} · ${task.status} · ${duration(task, Date.now())}${output ? ` · ${visible(output)}` : ""}`;
+          return `${task.taskId === selected ? "▶" : " "} ${visible(task.name)} · ${task.status} · ${duration(task, Date.now())}${output ? ` · ${visible(output)}` : ""}`;
         })];
       }
       const task = choose();
@@ -110,8 +115,9 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       const tail = outputLines.slice(Math.max(0, outputLines.length - PANEL_ROWS - scroll), outputLines.length - scroll);
       const meta = JSON.stringify(task.metadata);
       return [
-        `${task.name} [${task.taskId}]`, `status: ${task.status} · elapsed: ${duration(task, Date.now())}`,
-        `command: ${task.command}`, `metadata: ${meta}`, `output${output.truncated ? " (tail truncated)" : ""}:`,
+        `${visible(task.name)} [${task.taskId}]`, `status: ${task.status} · elapsed: ${duration(task, Date.now())}`,
+        `command: ${visible(task.command)}`, `metadata: ${meta}`, `output${output.truncated ? " (tail truncated)" : ""}:`,
+        // registry.logs caps its own data at 50 KiB; the TUI intentionally reads a larger 128 KiB tail directly from the output file.
         ...tail.map(visible), ...(confirmKill ? ["Kill this task? press k again to confirm; any other key cancels"] : []),
         "Esc return · k kill · R rerun · c copy output path · ↑/↓ scroll",
       ];
@@ -134,6 +140,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       else if (detail && delta > 0) { scroll = Math.max(0, scroll - delta); follow = scroll === 0; }
       requestRender();
     };
+    let latchedId: string | undefined;
     return {
       render,
       handleInput(data: string): void {
@@ -151,7 +158,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           requestRender(); return;
         } move(-1); return; }
         if (data === "\u001b[B" || key === "j") { move(1); return; }
-        if (key === "r" && detail) {
+        if (data === "R" && detail) {
           const task = choose();
           if (task) {
             try { registry.submit({ command: task.command, name: task.name, mode: "background" }); }
@@ -159,7 +166,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           }
           requestRender(); return;
         }
-        if (key === "c" && detail) {
+        if (data === "c" && detail) {
           const path = choose()?.metadata.outputFile;
           if (typeof path === "string") {
             if (host.ui?.copyToClipboard) host.ui.copyToClipboard(path);
@@ -167,11 +174,35 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           }
         }
       },
-      handleMouse(event: { type: string; wheelDelta?: number }): { handled: boolean } | undefined {
-        if (event.type !== "wheel") return undefined;
-        const delta = Math.trunc(event.wheelDelta ?? 0);
-        if (detail) { scroll = Math.max(0, scroll + delta); follow = scroll === 0; }
-        else move(delta);
+      handleMouse(event: { type: string; y?: number; button?: string; wheelDelta?: number }): { handled: boolean } | undefined {
+        if (event.type === "wheel") {
+          const delta = Math.trunc(event.wheelDelta ?? 0);
+          if (detail) { scroll = Math.max(0, scroll + delta); follow = scroll === 0; }
+          else move(delta);
+          requestRender();
+          return { handled: true };
+        }
+        if (event.type === "press") {
+          latchedId = undefined;
+          if (detail) return undefined;
+          if (event.button !== "left") return undefined;
+          const index = (event.y ?? -1) - 2;
+          const tasks = snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
+          const task = tasks[index];
+          if (!task) return undefined;
+          latchedId = task.taskId;
+          return { handled: true };
+        }
+        if (event.type !== "click" || event.button !== "left" || detail) return undefined;
+        const index = (event.y ?? -1) - 2;
+        const tasks = snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
+        const task = tasks[index];
+        if (!latchedId || !task || task.taskId !== latchedId) { latchedId = undefined; return undefined; }
+        selected = latchedId;
+        detail = true;
+        scroll = 0;
+        follow = true;
+        latchedId = undefined;
         requestRender();
         return { handled: true };
       },
@@ -179,6 +210,6 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     };
   };
   // Required full-screen overlay geometry. custom() resolves undefined outside supported TUI contexts.
-  const result = custom(factory, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 } });
-  if (result === undefined) return;
+  // The RPC peer's custom() returns a Promise even though the overlay is unavailable there; mode guards above prevent invocation.
+  void custom(factory, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 } }).catch(() => undefined);
 }

@@ -8,6 +8,13 @@ export function formatStatus(active: { running: number; pending: number }, done:
 
 let clearedAt = 0;
 let refreshCurrent: (() => void) | undefined;
+let refreshInterval: ReturnType<typeof setInterval> | undefined;
+
+export function disposeStatus(): void {
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = undefined;
+  refreshCurrent = undefined;
+}
 
 export function clearDoneStatus(): void {
   clearedAt = Date.now();
@@ -15,6 +22,7 @@ export function clearDoneStatus(): void {
 }
 
 export function initStatus(pi: PiCtx, registry: TaskRegistry): void {
+  disposeStatus();
   // SAFETY: ExtensionAPI omits `mode` in some peer typings; runtime TUI entrypoints provide it.
   const host = pi as unknown as { mode?: string; ui?: { setStatus?: (key: string, text: string | undefined) => void } };
   if (host.mode !== "tui") return;
@@ -27,5 +35,6 @@ export function initStatus(pi: PiCtx, registry: TaskRegistry): void {
   refreshCurrent = refresh;
   refresh();
   // Registry intentionally exposes no event subscription API; keep the footer current without replacing its core events.
-  setInterval(refresh, 1_000).unref?.();
+  refreshInterval = setInterval(refresh, 1_000);
+  refreshInterval.unref?.();
 }
