@@ -21,7 +21,7 @@ function toolResult(payload: unknown, isError = false): { content: Array<{ type:
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], details: { payload }, isError };
 }
 
-const promptGuidelines = "Check commands must not swallow errors with || true; map unknown states to failure; prefer structured output and jq -e; anchor output_matches regexes to avoid premature matches.";
+const promptGuidelines = "Check commands must not swallow errors with || true; map unknown states to failure; prefer structured output and jq -e; anchor output_matches regexes (compiled with m: ^/$ are line boundaries) to avoid premature matches.";
 const MAX_LOG_BYTES = 50 * 1024;
 const schema = (properties: Record<string, unknown>, required: string[] = [], allOf: unknown[] = []) => ({ type: "object", properties, required, additionalProperties: false, ...(allOf.length ? { allOf } : {}) });
 const stringField = { type: "string" };

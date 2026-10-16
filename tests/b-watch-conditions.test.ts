@@ -30,6 +30,13 @@ test("output_matches applies a regular expression to the output stream", () => {
   assert.equal(evalConditions([condition], { output: "prefix device-code=AB12" }), false);
 });
 
+test("output_matches compiles with m so ^/$ anchor per line (CONTRACT #48)", () => {
+  const condition: Condition = { type: "output_matches", regex: "^READY$" };
+  // Marker on a middle line — without m, ^READY$ would require the whole stream to be READY.
+  assert.equal(evalConditions([condition], { output: "NOT_READY_YET\nREADY\n" }), true);
+  assert.equal(evalConditions([condition], { output: "NOT_READY_YET\nSTILL_WAITING\n" }), false);
+});
+
 test("conditions are ORed", () => {
   assert.equal(evalConditions([
     { type: "stdout_contains", value: "not here" },

@@ -44,7 +44,7 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
         case "output_matches":
           if (typeof condition.regex !== "string") return invalid(`${location}: regex must be a string`);
           try {
-            compiledRegexes.set(condition, new RegExp(condition.regex));
+            compiledRegexes.set(condition, new RegExp(condition.regex, "m"));
           } catch {
             return invalid(`${location}: invalid regex`);
           }
@@ -206,7 +206,7 @@ function evaluateCondition(condition: Condition, ctx: { output: string; exitCode
       let regex = compiledRegexes.get(condition);
       if (!regex) {
         try {
-          regex = new RegExp(condition.regex);
+          regex = new RegExp(condition.regex, "m");
           compiledRegexes.set(condition, regex);
         } catch {
           return { status: "error" };
