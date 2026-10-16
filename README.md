@@ -53,6 +53,8 @@ The panel and rail are only enabled in the main Pi TUI session; RPC, print, and 
 | `PI_ASYNC_MAX_TASKS` | `32` | Maximum concurrent running and pending tasks. |
 | `PI_ASYNC_HEARTBEAT_MS` | `60000` | Settle-guard heartbeat interval in milliseconds. |
 | `PI_ASYNC_DOCK_SHORTCUT` | `ctrl+alt+a` | Configured panel shortcut; the command remains available as fallback. |
+| `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
+| `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
 
 ## Legion child sessions
 

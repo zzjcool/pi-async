@@ -1,19 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { killTree, spawnDetached } from "./spawn.ts";
 import { stripAnsi } from "./output.ts";
-import { deriveName, isTerminal, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
+import { deriveName, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
 import { evalConditions, validateWatchSpec, WatchLoop } from "./watch.ts";
 
 export interface RegistryEvents {
   onFinalize(snapshot: TaskSnapshot): void;
   onStateChange(snapshot: TaskSnapshot): void;
 }
-export interface RegistryConfig { dataDir: string; maxTasks?: number; maxOutputBytes?: number; }
+export interface RegistryConfig { dataDir: string; maxTasks?: number; maxOutputBytes?: number; retentionMs?: number; retentionCount?: number; }
 interface LiveTask { outputFile: string; exit?: Promise<{ code: number }>; timer?: ReturnType<typeof setTimeout>; delayTimer?: ReturnType<typeof setTimeout>; watcher?: ReturnType<typeof setInterval>; killKind?: KillKind; processExited?: boolean; }
 interface Waiter { ids: Set<string>; resolve: () => void; }
 const DEFAULT_MAX_OUTPUT = 20 * 1024 * 1024;
+const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_RETENTION_COUNT = 100;
 
 export class TaskRegistry {
   private readonly tasks = new Map<string, TaskSnapshot>();
@@ -24,7 +26,10 @@ export class TaskRegistry {
   private events: RegistryEvents = { onFinalize: () => undefined, onStateChange: () => undefined };
   private readonly maxTasks: number;
   private readonly maxOutputBytes: number;
+  private readonly retentionMs: number;
+  private readonly retentionCount: number;
   private closed = false;
+  private reloading = false;
   private shutdownPromise?: Promise<void>;
 
   private readonly config: RegistryConfig;
@@ -32,6 +37,8 @@ export class TaskRegistry {
     this.config = config;
     this.maxTasks = config.maxTasks ?? finiteEnvNumber("PI_ASYNC_MAX_TASKS", 32);
     this.maxOutputBytes = config.maxOutputBytes ?? finiteEnvNumber("PI_ASYNC_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT);
+    this.retentionMs = config.retentionMs ?? Math.max(0, finiteEnvNumber("PI_ASYNC_RETENTION_MS", DEFAULT_RETENTION_MS));
+    this.retentionCount = config.retentionCount ?? Math.max(0, Math.floor(finiteEnvNumber("PI_ASYNC_RETENTION_COUNT", DEFAULT_RETENTION_COUNT)));
     mkdirSync(config.dataDir, { recursive: true });
   }
 
@@ -100,14 +107,16 @@ export class TaskRegistry {
       onBlindExhausted: () => {
         const current = this.tasks.get(taskId);
         if (current && !isTerminal(current.status)) {
-          this.finalize(current, "failed");
+          current.failureKind = "blind_exhausted";
+          this.finalize(current, "failed", undefined, "watch_failure");
           void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: blind-check kill failed for task ${taskId}`, error));
         }
       },
       onWatchTimeout: () => {
         const current = this.tasks.get(taskId);
         if (current && !isTerminal(current.status)) {
-          this.finalize(current, "failed");
+          current.failureKind = "watch_timeout";
+          this.finalize(current, "failed", undefined, "watch_failure");
           void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: watch-timeout kill failed for task ${taskId}`, error));
         }
       },
@@ -338,48 +347,102 @@ export class TaskRegistry {
     return this.shutdownPromise;
   }
   async reloadFromDisk(): Promise<void> {
-    for (const file of readdirSync(this.config.dataDir).filter((name) => name.endsWith(".json"))) {
-      try {
-        const snapshot = JSON.parse(readFileSync(join(this.config.dataDir, file), "utf8")) as TaskSnapshot;
-        if (!snapshot.taskId || this.tasks.has(snapshot.taskId)) continue;
-        this.tasks.set(snapshot.taskId, snapshot);
-        if (snapshot.status === "pending" && snapshot.mode === "delayed") {
-          const outputFile = String(snapshot.metadata.outputFile ?? join(this.config.dataDir, `${snapshot.taskId}.output`));
-          this.live.set(snapshot.taskId, { outputFile });
-          if (snapshot.watch) this.attachWatch(snapshot.taskId, snapshot.watch);
-          const dueAt = snapshot.dueAt ?? Date.now();
-          this.scheduleDelayedStart(snapshot, Math.max(0, dueAt - Date.now()));
-          continue;
-        }
-        if ((snapshot.status === "running" || snapshot.metadata.watchSuccess !== undefined) && snapshot.pid && this.pidAlive(snapshot.pid)) {
-          const outputFile = String(snapshot.metadata.outputFile ?? join(this.config.dataDir, `${snapshot.taskId}.output`));
-          const live: LiveTask = { outputFile };
-          this.live.set(snapshot.taskId, live);
-          live.watcher = setInterval(() => {
-            if (snapshot.pid && !this.pidAlive(snapshot.pid)) {
-              if (live.watcher) clearInterval(live.watcher);
-              live.processExited = true;
-              if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
-              snapshot.metadata.capped = this.isOutputCapped(snapshot);
-              if (!isTerminal(snapshot.status)) {
-                if (live.killKind) this.finalize(snapshot, "killed", undefined, live.killKind);
-                else if (snapshot.metadata.capped) this.finalize(snapshot, "failed", undefined, "output_cap");
-                else { snapshot.failureKind = "lost"; this.finalize(snapshot, "failed"); }
+    this.reloading = true;
+    try {
+      for (const file of readdirSync(this.config.dataDir).filter((name) => name.endsWith(".json"))) {
+        try {
+          const snapshot = JSON.parse(readFileSync(join(this.config.dataDir, file), "utf8")) as TaskSnapshot;
+          if (!snapshot.taskId || this.tasks.has(snapshot.taskId)) continue;
+          this.tasks.set(snapshot.taskId, snapshot);
+          if (snapshot.status === "pending" && snapshot.mode === "delayed") {
+            const outputFile = String(snapshot.metadata.outputFile ?? join(this.config.dataDir, `${snapshot.taskId}.output`));
+            this.live.set(snapshot.taskId, { outputFile });
+            if (snapshot.watch) this.attachWatch(snapshot.taskId, snapshot.watch);
+            const dueAt = snapshot.dueAt ?? Date.now();
+            this.scheduleDelayedStart(snapshot, Math.max(0, dueAt - Date.now()));
+            continue;
+          }
+          if ((snapshot.status === "running" || snapshot.metadata.watchSuccess !== undefined) && snapshot.pid && this.pidAlive(snapshot.pid)) {
+            const outputFile = String(snapshot.metadata.outputFile ?? join(this.config.dataDir, `${snapshot.taskId}.output`));
+            const live: LiveTask = { outputFile };
+            this.live.set(snapshot.taskId, live);
+            live.watcher = setInterval(() => {
+              if (snapshot.pid && !this.pidAlive(snapshot.pid)) {
+                if (live.watcher) clearInterval(live.watcher);
+                live.processExited = true;
+                if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
+                snapshot.metadata.capped = this.isOutputCapped(snapshot);
+                if (!isTerminal(snapshot.status)) {
+                  if (live.killKind) this.finalize(snapshot, "killed", undefined, live.killKind);
+                  else if (snapshot.metadata.capped) this.finalize(snapshot, "failed", undefined, "output_cap");
+                  else { snapshot.failureKind = "lost"; this.finalize(snapshot, "failed"); }
+                }
               }
-            }
-          }, 100);
-          live.watcher.unref?.();
-          if (snapshot.status === "running" && snapshot.watch) this.attachWatch(snapshot.taskId, snapshot.watch);
-        } else if (snapshot.status === "running") {
-          snapshot.status = "failed"; snapshot.failureKind = "lost"; snapshot.finishedAt = Date.now(); this.persist(snapshot); this.events.onFinalize(snapshot);
-        }
-      } catch { /* Ignore incomplete/corrupt metadata files; atomic writer leaves prior version intact. */ }
+            }, 100);
+            live.watcher.unref?.();
+            if (snapshot.status === "running" && snapshot.watch) this.attachWatch(snapshot.taskId, snapshot.watch);
+          } else if (snapshot.status === "running") {
+            snapshot.status = "failed"; snapshot.failureKind = "lost"; snapshot.finishedAt = Date.now(); this.persist(snapshot); this.events.onFinalize(snapshot);
+          }
+        } catch { /* Ignore incomplete/corrupt metadata files; atomic writer leaves prior version intact. */ }
+      }
+    } finally {
+      this.reloading = false;
+      this.prune();
     }
   }
 
-  private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number; outputTail: string } {
+  /**
+   * Drop terminal-task artifacts that fall outside the retention window.
+   *
+   * Policy (per dataDir): keep the union of (1) the newest `retentionCount`
+   * terminal tasks by finishedAt/createdAt and (2) any terminal task still
+   * younger than `retentionMs`. Everything else terminal is deleted
+   * (.json + .output via metadata.outputFile) and removed from memory.
+   * Non-terminal tasks are never touched. Missing files are ignored.
+   */
+  prune(now = Date.now()): { pruned: number } {
+    const terminal = this.list({ includeHistory: true })
+      .filter((task) => isTerminal(task.status))
+      .sort((a, b) => (b.finishedAt ?? b.createdAt) - (a.finishedAt ?? a.createdAt));
+    let pruned = 0;
+    for (let i = 0; i < terminal.length; i++) {
+      const task = terminal[i]!;
+      const ageAnchor = task.finishedAt ?? task.createdAt;
+      const withinCount = i < this.retentionCount;
+      const withinAge = now - ageAnchor < this.retentionMs;
+      if (withinCount || withinAge) continue;
+      this.removeArtifacts(task);
+      pruned++;
+    }
+    return { pruned };
+  }
+
+  private removeArtifacts(task: TaskSnapshot): void {
+    const outputFile = String(task.metadata.outputFile ?? join(this.config.dataDir, `${task.taskId}.output`));
+    try { rmSync(outputFile, { force: true }); } catch { /* force already ignores ENOENT; swallow other rare races */ }
+    try { rmSync(join(this.config.dataDir, `${task.taskId}.json`), { force: true }); } catch { /* same */ }
+    const live = this.live.get(task.taskId);
+    if (live?.timer) clearTimeout(live.timer);
+    if (live?.delayTimer) clearTimeout(live.delayTimer);
+    if (live?.watcher) clearInterval(live.watcher);
+    this.live.delete(task.taskId);
+    this.watchLoops.get(task.taskId)?.stop();
+    this.watchLoops.delete(task.taskId);
+    this.tasks.delete(task.taskId);
+    this.notifyClaims.delete(task.taskId);
+  }
+
+  private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind } {
     this.consume(task.taskId);
-    return { taskId: task.taskId, status: task.status, ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }), outputTail: this.logs(task.taskId, { maxBytes: 8192, tail: true }).text };
+    return {
+      taskId: task.taskId,
+      status: task.status,
+      ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
+      outputTail: this.logs(task.taskId, { maxBytes: 8192, tail: true }).text,
+      ...(task.killKind ? { killKind: task.killKind } : {}),
+      ...(task.failureKind ? { failureKind: task.failureKind } : {}),
+    };
   }
   private finalize(task: TaskSnapshot, status: TaskSnapshot["status"], code?: number, killKind?: KillKind): void {
     if (isTerminal(task.status)) return;
@@ -392,6 +455,7 @@ export class TaskRegistry {
     if (live?.timer && !(task.metadata.watchSuccess !== undefined && !live.processExited)) { clearTimeout(live.timer); live.timer = undefined; }
     this.persist(task); this.emitState(task); this.events.onFinalize(task);
     for (const waiter of [...this.waiters]) if (waiter.ids.has(task.taskId)) waiter.resolve();
+    if (!this.reloading) this.prune();
   }
   private emitState(task: TaskSnapshot): void { this.persist(task); this.events.onStateChange(task); }
   private persist(task: TaskSnapshot): void {

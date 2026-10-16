@@ -1,16 +1,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TaskRegistry } from "./registry.ts";
-import type { TaskStatus } from "./task.ts";
+import type { FailureKind, KillKind, TaskStatus } from "./task.ts";
 
 export type PiCtx = ExtensionAPI;
-export interface NotifyPayload { taskId: string; name: string; status: TaskStatus; exitCode?: number; outputFile: string; summary?: string; guidance?: string; }
+export interface NotifyPayload {
+  taskId: string; name: string; status: TaskStatus; exitCode?: number;
+  outputFile: string; summary?: string; guidance?: string;
+  killKind?: KillKind;
+  failureKind?: FailureKind;
+  summaryTruncated?: boolean;
+}
 const escapeXml = (value: unknown): string => String(value).replace(/[<&>\"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&apos;" })[char]!);
 
 export function buildNotificationXml(p: NotifyPayload): string {
   const fields: Array<[string, unknown]> = [["task-id", p.taskId], ["name", p.name], ["status", p.status]];
   if (p.exitCode !== undefined) fields.push(["exit-code", p.exitCode]);
+  if (p.killKind) fields.push(["kill-kind", p.killKind]);
+  if (p.failureKind) fields.push(["failure-kind", p.failureKind]);
   fields.push(["output-file", p.outputFile]);
   if (p.summary) fields.push(["summary", p.summary]);
+  if (p.summaryTruncated) fields.push(["summary-truncated", "true"]);
   if (p.status === "failed" && p.guidance) fields.push(["guidance", p.guidance]);
   return `<async-task-notification>${fields.map(([tag, value]) => `<${tag}>${escapeXml(value)}</${tag}>`).join("")}</async-task-notification>`;
 }

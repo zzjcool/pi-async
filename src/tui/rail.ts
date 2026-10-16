@@ -1,6 +1,7 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
+import { visibleText } from "../core/output.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
 import { tuiHost } from "./host.ts";
@@ -58,10 +59,6 @@ function typeColor(theme: Theme, mode: string, used: Swatch[]): string {
 }
 
 const statePriority: Record<TaskSnapshot["status"], number> = { running: 0, pending: 1, completed: 2, failed: 3, killed: 4 };
-function stripAnsi(value: string): string {
-  return value.replace(/\u001b(?:\][\s\S]*?(?:\u0007|\u001b\\|\u009c)|\[[0-?]*[ -/]*[@-~]|[PX^_][\s\S]*?\u001b\\|[ -/]*[0-~])|\u009b[0-?]*[ -/]*[@-~]|\u009d[\s\S]*?(?:\u0007|\u001b\\|\u009c)/g, "");
-}
-
 function elapsed(snapshot: TaskSnapshot, now: number): string {
   const seconds = Math.floor(Math.max(0, now - (snapshot.startedAt ?? snapshot.createdAt)) / 1000);
   if (seconds < 60) return `${seconds}s`;
@@ -74,7 +71,7 @@ export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = D
   const rows = snapshots.filter((task) => task.status !== "pending")
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
     .slice(0, 10)
-    .map((task) => `▶ ${stripAnsi(task.name).replace(/[\r\n]+/g, " ")} · ${task.status} · ${elapsed(task, now)}`);
+    .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${elapsed(task, now)}`);
   const limit = Math.max(0, Math.floor(width));
   return rows.map((row) => Array.from(row).length > limit ? `${Array.from(row).slice(0, Math.max(0, limit - 1)).join("")}…` : row);
 }

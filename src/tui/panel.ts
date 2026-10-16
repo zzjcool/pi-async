@@ -2,7 +2,7 @@ import { openSync, closeSync, fstatSync, readSync } from "node:fs";
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
-import { stripAnsi } from "../core/output.ts";
+import { stripAnsi, visibleText } from "../core/output.ts";
 import { clearDoneStatus } from "./status.ts";
 import { tuiHost } from "./host.ts";
 
@@ -15,7 +15,7 @@ const isTui = (pi: unknown): boolean => {
 const UI_TAIL_BYTES = 128 * 1024;
 const PANEL_ROWS = 12;
 let historyClearedAt = 0;
-const visible = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "").replace(/[\r\n\t]+/g, " ");
+const visible = visibleText;
 function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: string; truncated: boolean } {
   const outputPath = task.metadata.outputFile;
   if (typeof outputPath !== "string") return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
