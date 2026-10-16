@@ -28,7 +28,7 @@ pi-async/
 │   │   ├── spawn.ts        # detached spawn + 进程组 kill 升级链
 │   │   ├── output.ts       # 输出捕获、tail 读取、ANSI 剥离
 │   │   ├── watch.ts        # 轮询 + 条件匹配引擎
-│   │   ├── notify.ts       # 完成通知/唤醒、合并、抑制闩
+│   │   ├── notify.ts       # 完成通知/唤醒、抑制闩（每任务一条，不合并）
 │   │   └── bus.ts          # 预留 eventbus + OSC activity 上报
 │   ├── tools/
 │   │   └── index.ts        # 5 个工具的注册与 schema
@@ -108,7 +108,7 @@ type Condition =
   | { type: "stdout_contains"; value: string }
   | { type: "stderr_contains"; value: string }
   | { type: "json_path_exists"; path: string }        // $.a.b[0] 形式，启动前校验
-  | { type: "output_matches"; regex: string }         // 我们新增：对合并输出流匹配（设备码等）
+  | { type: "output_matches"; regex: string }         // 合并输出流匹配；编译带 m（^/$ 按行）
 ```
 
 - `success_when` 命中 → **不杀进程**：任务标 completed，通知带命中详情；进程按 taskTimeoutMs/kill 自然管理。
@@ -118,7 +118,8 @@ type Condition =
   「尚未可判定」（exit_code 未退出 / json_path 输出尚非 JSON）为 **pending 态，不累计 blind、照常
   继续轮询**。两者是不同语义，禁止合并。
 - promptGuidelines（写进工具 description）：check 不要 `|| true` 自吞错误；未知态映射失败；
-  结构化输出优先 jq -e；`output_matches` 的 regex 须加锚定防止过早匹配。
+  结构化输出优先 jq -e；`output_matches` 的 regex 须加锚定防止过早匹配（编译固定带 `m`，
+  `^`/`$` 按行边界，故 `^READY$` 可命中多行输出中的某一行）。
 - **watch 失败性终态的进程处置（REV-4 裁决）**：`failure_when` 命中、blind 耗尽、watch timeout
   三条 watch 失败路径在 finalize 任务的同时**必须 kill 进程组**（与 `failure_when → killed(watch_failure)`
   同语义）；仅 `success_when`（D4）不干预进程。杀失败时响亮上报（kill 链已有 catch），
@@ -126,6 +127,9 @@ type Condition =
   - **终态标注（REV-11）**：`failure_when` → `killed` + `killKind=watch_failure`；blind 耗尽 /
     watch timeout → `failed` + `killKind=watch_failure` + 对应 `failureKind`
     （`blind_exhausted` / `watch_timeout`）。三条都杀进程，用 status+failureKind 区分语义。
+- **REV-10 裁决（#48）**：`output_matches` 以 `new RegExp(regex, "m")` 编译（validate 与求值同）。
+  契约原先要求锚定（`^READY$`）防止过早匹配，但无 `m` 时 `^`/`$` 只锚整段输出，多行流上锚定
+  永不相交。加 `m` 使锚定与意图一致；整段匹配请用不含 `^`/`$` 的模式或显式 `\A`/`\z` 等价写法。
 
 ## 5. async_wait（唤醒原语，冻结）
 
@@ -167,6 +171,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     | blind 耗尽 | failed | watch_failure | blind_exhausted | kill-kind + failure-kind |
     | watch timeout | failed | watch_failure | watch_timeout | kill-kind + failure-kind |
     | reload lost | failed | — | lost | failure-kind |
+- **REV-9 裁决（#47）**：v1 **每任务一条**完成通知（各带己方 summary/output-file）；**不合并**。
+  模块图原先写「合并」为假承诺——同时完成会各发一条并各可能 `triggerTurn`。防 chatter 靠
+  `outputConsumed` 闩与 failed-only guidance（D5），不靠跨任务 debounce。真合并需改多任务 XML
+  schema + 窗宽策略，另开后续 REV（可派 Drift）。
 - 心跳：有 running/pending 任务期间，每 60s `pi.appendEntry` 一条 heartbeat（触发 legion
   `collectArtifactGrowing` 宽限续期）；session jsonl 增长由守卫的提醒消息自然产生，心跳为兜底。
 
@@ -178,6 +186,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - OSC busy 上报（feature-detect，无 API 则跳过）：
   - `ui.setActivity("pi-async", { message: "N async tasks" })`，全清时 `undefined`
   - 每任务 `id=plugin/pi-async/<task-id>`，raise/clear 与任务状态同步
+  - **REV-8 裁决（#26）**：实现必须带 `plugin/` 前缀（对齐 legion
+    `docs/contracts/osc-busy-plugin.md` 的 `plugin/<name>/…`）；聚合源仍为 `pi-async`（§7 冻结）。
+    此前实现漏前缀会导致宿主按 `plugin/` 路由时 per-task activity 静默无效。
   - **禁止 printf OSC**；尊重 `PI_PROGRAM_STATUS`
   - 上报时机：任务启动、终态、以及 `agent_before_settle`（闭合 retire 竞态窗口的关键，见 #156 补充评论）
 - RPC（legion child）内：setActivity 依赖 legion `extension_activity` 转发（#156 落地后生效），
@@ -271,8 +282,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
    `<async-task-notification>` 并继续 turn）
 3. sync：短命令阻塞返回 exitCode；长命令 timeoutMs 到点 promote 转 background，任务不死
 4. delayed：delayMs 后启动；pending 期 cancel；reload 后恢复
-5. watch：stdout_contains/output_matches 命中 completed；failure_when 命中 killed(watch_failure)；
-   非法 regex 启动前拒绝
+5. watch：stdout_contains/output_matches 命中 completed（含多行上 `^READY$` 因 m 命中）；
+   failure_when 命中 killed(watch_failure)；非法 regex 启动前拒绝
 6. async_wait：多任务等待全部终态；timeout 返回 notReady 且任务存活；混合超时同时含 results+notReady（已完成侧已 consume）；Esc 中断不杀任务
 7. 输出安全：注入 ANSI 转义的任务输出，async_logs 返回已剥离
 8. kill：进程组全灭（子进程不残留）；20MiB 超限 kill(output_cap)
