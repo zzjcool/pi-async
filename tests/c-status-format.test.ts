@@ -17,7 +17,7 @@ test("status refresh counts failed and killed toward done", () => {
   const originalSetInterval = globalThis.setInterval;
   (globalThis as unknown as { setInterval: typeof setInterval }).setInterval = (() => {
     return { unref() {} } as unknown as ReturnType<typeof setInterval>;
-  }) as typeof setInterval;
+  }) as unknown as typeof setInterval;
   try {
     const now = Date.now();
     const registry = {
