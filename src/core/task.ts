@@ -1,6 +1,7 @@
 export type TaskStatus = "pending" | "running" | "completed" | "failed" | "killed";
 export type TaskMode = "background" | "sync" | "delayed";
 export type KillKind = "user" | "timeout" | "output_cap" | "shutdown" | "watch_failure";
+export type FailureKind = "lost" | "blind_exhausted" | "watch_timeout";
 
 export const TERMINAL_STATUSES = ["completed", "failed", "killed"] as const satisfies readonly TaskStatus[];
 
@@ -60,7 +61,7 @@ export interface SyncResult extends RunReceipt {
 }
 
 export type WaitOutcome =
-  | { results: Array<{ taskId: string; status: TaskStatus; exitCode?: number; outputTail: string }> }
+  | { results: Array<{ taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind }> }
   | { notReady: Array<{ taskId: string; status: "running" | "pending"; elapsedMs: number }> };
 
 export interface TaskSnapshot {
@@ -72,7 +73,7 @@ export interface TaskSnapshot {
   pid?: number;
   exitCode?: number;
   killKind?: KillKind;
-  failureKind?: "lost";
+  failureKind?: FailureKind;
   createdAt: number;
   startedAt?: number;
   finishedAt?: number;
