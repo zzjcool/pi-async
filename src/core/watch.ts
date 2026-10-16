@@ -38,7 +38,8 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
           break;
         case "json_path_exists":
           if (typeof condition.path !== "string" || parseJsonPath(condition.path) === undefined) {
-            return invalid(`${location}: invalid JSON path`);
+            const shown = typeof condition.path === "string" ? JSON.stringify(condition.path) : String(condition.path);
+            return invalid(`${location}: invalid JSON path ${shown}: paths must start with "$" (e.g. $.ready or $.items[0].state)`);
           }
           break;
         case "output_matches":
