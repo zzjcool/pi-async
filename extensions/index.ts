@@ -55,8 +55,10 @@ export async function init(pi: PiCtx): Promise<void> {
       if (tui) initStatus(pi, registry);
       if (snapshot.metadata.notifyOnCompletion === false) return;
       const outputFile = String(snapshot.metadata.outputFile ?? "");
-      const outputTail = registry.logs(snapshot.taskId, { maxBytes: 8192, tail: true }).text;
+      const logSlice = registry.logs(snapshot.taskId, { maxBytes: 8192, tail: true });
+      const outputTail = logSlice.text;
       const guidance = snapshot.status === "failed" ? `Inspect task output with async_logs (taskId: ${snapshot.taskId}).` : undefined;
+      const summaryTruncated = snapshot.metadata.capped === true || logSlice.truncated;
       void sendCompletionNotification(pi, registry, {
         taskId: snapshot.taskId,
         name: snapshot.name,
@@ -65,6 +67,9 @@ export async function init(pi: PiCtx): Promise<void> {
         outputFile,
         ...(outputTail ? { summary: outputTail } : {}),
         ...(guidance ? { guidance } : {}),
+        ...(snapshot.killKind ? { killKind: snapshot.killKind } : {}),
+        ...(snapshot.failureKind ? { failureKind: snapshot.failureKind } : {}),
+        ...(summaryTruncated ? { summaryTruncated: true } : {}),
       }, { triggerTurn: snapshot.metadata.triggerOnCompletion !== false })
         .catch((error: unknown) => console.error(`pi-async: completion notification failed for ${snapshot.taskId}`, error));
     },

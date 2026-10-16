@@ -54,8 +54,13 @@ pending --(delay 到期/spawn 成功)--> running --┬-- exit 0 --> completed
 ```
 
 - 状态词汇：`pending | running | completed | failed | killed`；terminal = 后三者。
-- KillKind：`user | timeout | output_cap | shutdown | watch_failure`（watch 条件命中 failure_when →
-  主动 kill，任务记 killed，killKind=watch_failure）。
+- KillKind：`user | timeout | output_cap | shutdown | watch_failure`（进程被主动杀掉的原因）。
+- FailureKind：`lost | blind_exhausted | watch_timeout`（非「退出码失败」、需与 KillKind 并列区分的失败原因）。
+  - `lost`：reload 发现 pid 已死（§10）。
+  - `blind_exhausted`：watch blind_checks 耗尽。
+  - `watch_timeout`：watch `timeoutMs` 到期。
+- **双字段、不统一 reason（REV-11）**：KillKind 答「谁杀的/为何杀进程」；FailureKind 答「任务为何 failed」。
+  禁止发明第三套 `reason` 枚举把两者揉扁——通知与投影字段各自透传已有字段即可。
 - delayed 任务在 pending 期可 cancel（→ killed, kind=user）。
 - `notified` 持久闩（写进 metadata，reload 不重置），单次投递；发送失败回滚重试 ≤3 次。
 
@@ -118,6 +123,9 @@ type Condition =
   三条 watch 失败路径在 finalize 任务的同时**必须 kill 进程组**（与 `failure_when → killed(watch_failure)`
   同语义）；仅 `success_when`（D4）不干预进程。杀失败时响亮上报（kill 链已有 catch），
   绝不允许「终态任务 + 活进程」残留导致 async_kill 静默不杀或 shutdown 挂起。
+  - **终态标注（REV-11）**：`failure_when` → `killed` + `killKind=watch_failure`；blind 耗尽 /
+    watch timeout → `failed` + `killKind=watch_failure` + 对应 `failureKind`
+    （`blind_exhausted` / `watch_timeout`）。三条都杀进程，用 status+failureKind 区分语义。
 
 ## 5. async_wait（唤醒原语，冻结）
 
@@ -140,8 +148,20 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | legion child，跨 turn | **hold 模式**：settle 前守卫上报 busy（见 §7）；上游 #156 busy-hold 落地前，通知可能无法送达——**契约要求 agent 在 legion 环境用 async_wait 收割后再报 verdict**（守卫强制提醒，最多 3 次） |
 
 - 环境检测：`PI_LEGION_NODE_ID` 存在 → legion child 环境，settle 守卫默认开启。
-- 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/output-file/summary/guidance
+- 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/**kill-kind**/**failure-kind**/output-file/summary/**summary-truncated**/guidance
   （guidance 仅 failed 带，completed 纯信息——patty chatter 教训）。
+  - `kill-kind` / `failure-kind`：有值才输出（与 snapshot 同名语义）；模型据此区分非零退出 / output_cap / watch 失败 / lost，无需先 round-trip `async_status`（#37）。
+  - `summary-truncated`：summary 因 output_cap 或通知 tail 上限被截断时输出 `true`，避免把截断前缀误读为完整输出。
+  - **失败原因矩阵（REV-11）**：
+
+    | 原因 | status | killKind | failureKind | 通知要点 |
+    |---|---|---|---|---|
+    | 非零退出 | failed | — | — | exit-code |
+    | output cap | failed | output_cap | — | kill-kind + 常带 summary-truncated |
+    | failure_when 命中 | killed | watch_failure | — | kill-kind（status=killed 已区分） |
+    | blind 耗尽 | failed | watch_failure | blind_exhausted | kill-kind + failure-kind |
+    | watch timeout | failed | watch_failure | watch_timeout | kill-kind + failure-kind |
+    | reload lost | failed | — | lost | failure-kind |
 - 心跳：有 running/pending 任务期间，每 60s `pi.appendEntry` 一条 heartbeat（触发 legion
   `collectArtifactGrowing` 宽限续期）；session jsonl 增长由守卫的提醒消息自然产生，心跳为兜底。
 
@@ -180,7 +200,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 ## 9. 输出与预算（冻结）
 
 - 写盘 cap：默认 20 MiB（`PI_ASYNC_MAX_OUTPUT_BYTES`），超限 → kill(kind=output_cap) → failed。
-- 模型读取：`async_logs { taskId, maxBytes≤50KiB, tail=true }`，truncated 带全量路径提示。
+- 模型读取：`async_logs { taskId, maxBytes≤50KiB, tail=true }`，truncated 带全量路径提示（`fullPath` 有效至被 §10 retention prune）。
 - ANSI/CSI/OSC 剥离：`async_logs` 返回与 TUI 显示前必须剥离（安全项，防输出注入转义序列）。
 - sync 返回 outputTail ≤ 8 KiB / 200 行（whichever first）。
 
@@ -196,6 +216,14 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   `<session-id>-<pid>`）；跨 pid 崩溃遗留目录只读留档、不恢复，崩溃后遗留的 pending 延迟任务
   不会自动续跑。理由：跨 pid 收养需处理写入归属与幂等重建，与 v1 不承诺 crash-durability 的
   定位一致。README 已知限制同步标注。
+- **磁盘产物 retention（#25）**：每个 dataDir 内，终态任务的 `.json` / `.output` 按 age+count
+  并集策略 prune（启动 `reloadFromDisk` 末尾跑一次；每次 finalize 后再轻量触发）。
+  - 保留并集：按 `finishedAt ?? createdAt` 降序的最新 `PI_ASYNC_RETENTION_COUNT` 个终态任务，
+    **或** 年龄仍小于 `PI_ASYNC_RETENTION_MS` 的终态任务；其余终态任务删除产物并从内存移除。
+  - 非终态（running/pending）永不 prune。
+  - `async_logs` 返回的 `fullPath` **有效至被 prune**（过期后文件可能已删；缺文件时
+    `logs()` 仍安全返回空文本，不抛错）。措辞待 Loom 确认是否需在工具面增加 `missing` 标志。
+  - 跨 session 目录（`<session-id>-<pid>`）的整目录回收不在本条范围（仍只读留档）。
 
 ## 11. 配置与环境变量
 
@@ -205,6 +233,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_MAX_TASKS` | 32 | 注册表上限，超了拒绝新任务 |
 | `PI_ASYNC_HEARTBEAT_MS` | 60_000 | settle 守卫心跳 |
 | `PI_ASYNC_DOCK_SHORTCUT` | "ctrl+alt+a" | 可 off |
+| `PI_ASYNC_RETENTION_MS` | 604_800_000（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
+| `PI_ASYNC_RETENTION_COUNT` | 100 | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
 
 ## 12. 工程约束
 
