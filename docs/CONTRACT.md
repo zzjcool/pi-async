@@ -180,7 +180,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 ## 9. 输出与预算（冻结）
 
 - 写盘 cap：默认 20 MiB（`PI_ASYNC_MAX_OUTPUT_BYTES`），超限 → kill(kind=output_cap) → failed。
-- 模型读取：`async_logs { taskId, maxBytes≤50KiB, tail=true }`，truncated 带全量路径提示。
+- 模型读取：`async_logs { taskId, maxBytes≤50KiB, tail=true }`，truncated 带全量路径提示（`fullPath` 有效至被 §10 retention prune）。
 - ANSI/CSI/OSC 剥离：`async_logs` 返回与 TUI 显示前必须剥离（安全项，防输出注入转义序列）。
 - sync 返回 outputTail ≤ 8 KiB / 200 行（whichever first）。
 
@@ -196,6 +196,14 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   `<session-id>-<pid>`）；跨 pid 崩溃遗留目录只读留档、不恢复，崩溃后遗留的 pending 延迟任务
   不会自动续跑。理由：跨 pid 收养需处理写入归属与幂等重建，与 v1 不承诺 crash-durability 的
   定位一致。README 已知限制同步标注。
+- **磁盘产物 retention（#25）**：每个 dataDir 内，终态任务的 `.json` / `.output` 按 age+count
+  并集策略 prune（启动 `reloadFromDisk` 末尾跑一次；每次 finalize 后再轻量触发）。
+  - 保留并集：按 `finishedAt ?? createdAt` 降序的最新 `PI_ASYNC_RETENTION_COUNT` 个终态任务，
+    **或** 年龄仍小于 `PI_ASYNC_RETENTION_MS` 的终态任务；其余终态任务删除产物并从内存移除。
+  - 非终态（running/pending）永不 prune。
+  - `async_logs` 返回的 `fullPath` **有效至被 prune**（过期后文件可能已删；缺文件时
+    `logs()` 仍安全返回空文本，不抛错）。措辞待 Loom 确认是否需在工具面增加 `missing` 标志。
+  - 跨 session 目录（`<session-id>-<pid>`）的整目录回收不在本条范围（仍只读留档）。
 
 ## 11. 配置与环境变量
 
@@ -205,6 +213,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_MAX_TASKS` | 32 | 注册表上限，超了拒绝新任务 |
 | `PI_ASYNC_HEARTBEAT_MS` | 60_000 | settle 守卫心跳 |
 | `PI_ASYNC_DOCK_SHORTCUT` | "ctrl+alt+a" | 可 off |
+| `PI_ASYNC_RETENTION_MS` | 604_800_000（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
+| `PI_ASYNC_RETENTION_COUNT` | 100 | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
 
 ## 12. 工程约束
 
