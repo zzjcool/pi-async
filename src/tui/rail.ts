@@ -4,6 +4,7 @@ import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
 import { envNumber } from "../core/env.ts";
+import { truncateToWidth } from "./width.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
 import { tuiHost } from "./host.ts";
@@ -65,12 +66,9 @@ const statePriority: Record<TaskSnapshot["status"], number> = { running: 0, pend
 /** Alias for tests / callers still importing elapsed; single source is core/duration. */
 export { formatDuration as elapsed };
 /** Fit a row to at most `width` code points; never exceed the budget (empty when width<=0). */
+/** Truncate a rail row by terminal cell width (CJK/emoji-aware via #7). */
 export function fitRailRow(row: string, width: number): string {
-  const limit = Math.max(0, Math.floor(width));
-  const cells = Array.from(row);
-  if (cells.length <= limit) return row;
-  if (limit <= 0) return "";
-  return `${cells.slice(0, limit - 1).join("")}…`;
+  return truncateToWidth(row, Math.max(0, Math.floor(width)));
 }
 
 /** Pure, unstyled rail rows; active tasks first and a hard ten-row limit. */
@@ -79,7 +77,8 @@ export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = D
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
     .slice(0, 10)
     .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${formatDuration(task, now)}`);
-  return rows.map((row) => fitRailRow(row, width));
+  const limit = Math.max(0, Math.floor(width));
+  return rows.map((row) => truncateToWidth(row, limit));
 }
 
 /** Terminal-task linger window on the rail, overridable for tests. */
