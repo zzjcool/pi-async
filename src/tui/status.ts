@@ -15,6 +15,23 @@ let clearedAt = 0;
 let refreshCurrent: (() => void) | undefined;
 let refreshInterval: ReturnType<typeof setInterval> | undefined;
 
+/** Shared /async-clear watermark used by footer and panel (#31). */
+export function clearedAtMs(): number {
+  return clearedAt;
+}
+
+/**
+ * Shared clear predicate: running/pending always visible; otherwise compare
+ * finishedAt ?? createdAt against the watermark (footer semantics).
+ */
+export function survivesClearCutoff(
+  task: { status: string; createdAt: number; finishedAt?: number },
+  cutoffMs: number = clearedAt,
+): boolean {
+  if (task.status === "running" || task.status === "pending") return true;
+  return (task.finishedAt ?? task.createdAt) >= cutoffMs;
+}
+
 export function disposeStatus(): void {
   if (refreshInterval) clearInterval(refreshInterval);
   refreshInterval = undefined;
@@ -34,7 +51,7 @@ export function initStatus(pi: PiCtx, registry: TaskRegistry): void {
   const setStatus = bound.ui["setStatus"] as ((key: string, text: string | undefined) => void) | undefined;
   const refresh = (): void => {
     const active = registry.activeCount();
-    const done = registry.list({ includeHistory: true }).filter((task) => TERMINAL.has(task.status) && (task.finishedAt ?? task.createdAt) >= clearedAt).length;
+    const done = registry.list({ includeHistory: true }).filter((task) => TERMINAL.has(task.status) && survivesClearCutoff(task)).length;
     setStatus?.("pi-async", formatStatus(active, done));
     reportActivity(pi, active);
   };

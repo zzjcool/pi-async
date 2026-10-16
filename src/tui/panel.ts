@@ -3,7 +3,7 @@ import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi } from "../core/output.ts";
-import { clearDoneStatus } from "./status.ts";
+import { clearDoneStatus, survivesClearCutoff } from "./status.ts";
 import { tuiHost } from "./host.ts";
 
 const isTui = (pi: unknown): boolean => {
@@ -14,7 +14,6 @@ const isTui = (pi: unknown): boolean => {
 
 const UI_TAIL_BYTES = 128 * 1024;
 const PANEL_ROWS = 12;
-let historyClearedAt = 0;
 /** Single-line sanitizer: strip ANSI/C0 and fold whitespace (names, output previews). */
 const visible = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "").replace(/[\r\n\t]+/g, " ");
 /** Per-line sanitizer for multiline command display — keeps structure, strips controls. */
@@ -75,8 +74,7 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
     description: "Clear async task history",
     handler: (_args, ctx) => {
       if (!isTui(ctx)) return;
-      historyClearedAt = Date.now();
-      clearDoneStatus();
+      clearDoneStatus(); // shared watermark in status.ts (#31)
     },
   });
   try {
@@ -99,7 +97,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     } | undefined,
   };
   if (!isTui(pi) || typeof host.ui?.custom !== "function") return;
-  const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => task.createdAt >= historyClearedAt || task.status === "running" || task.status === "pending");
+  const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => survivesClearCutoff(task));
   const custom = host.ui.custom;
   const factory = (tui: unknown, _theme: unknown, _keybindings: unknown, done: (value?: unknown) => void) => {
     let selected = initialTaskId ?? snapshots()[0]?.taskId;
