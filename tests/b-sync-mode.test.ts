@@ -49,9 +49,10 @@ test("async_run dispatches sync and delayed modes and only permits watch on back
   try {
     registerTools(pi as never, f.registry);
     const run = tools.get("async_run")!;
-    const schema = run.parameters as { properties: Record<string, unknown>; allOf: unknown[] };
+    const schema = run.parameters as { properties: Record<string, unknown>; allOf?: unknown[] };
     assert.ok(schema.properties.watch);
-    assert.ok(schema.allOf.length >= 3);
+    // Mode-conditional required fields are enforced in execute (#45), not opaque allOf/then.
+    assert.ok(!schema.allOf || schema.allOf.length === 0);
     const sync = await run.execute("call", { command: "printf sync", mode: "sync", timeoutMs: 3000 });
     const syncPayload = (sync as { details: { payload: { exitCode?: number } } }).details.payload;
     assert.equal(syncPayload.exitCode, 0);
@@ -68,7 +69,9 @@ test("sync abort timeout and Esc interruption preserve the live task", async () 
     const result = await f.registry.runSync({ command: "sleep 0.4" }, 25, "abort");
     assert.equal(result.promoted, false);
     assert.equal(result.status, "running");
+    assert.equal(result.mode, "background");
     assert.equal(f.registry.get(result.taskId)?.status, "running");
+    assert.equal(f.registry.get(result.taskId)?.mode, "background");
 
     const controller = new AbortController();
     const waiting = f.registry.runSync({ command: "sleep 0.4" }, 2000, "promote", controller.signal);

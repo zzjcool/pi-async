@@ -2,6 +2,13 @@ import type { Condition, WatchSpec } from "./task.ts";
 
 const compiledRegexes = new WeakMap<Condition, RegExp>();
 
+/** Captured streams for watch evaluation: stdout/stderr are distinct; output is merged. */
+export interface WatchOutput {
+  output: string;
+  stdout: string;
+  stderr: string;
+}
+
 export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; error: string } {
   const invalid = (error: string) => ({ ok: false as const, error });
   if (!spec || typeof spec !== "object") return invalid("watch must be an object");
@@ -58,7 +65,9 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
   return { ok: true };
 }
 
-export function evalConditions(conds: Condition[], ctx: { output: string; exitCode?: number }): boolean {
+export type WatchEvalContext = WatchOutput & { exitCode?: number };
+
+export function evalConditions(conds: Condition[], ctx: WatchEvalContext): boolean {
   const result = evaluateConditionsDetailed(conds, ctx);
   return result.status === "matched" && result.matched;
 }
@@ -66,7 +75,7 @@ export function evalConditions(conds: Condition[], ctx: { output: string; exitCo
 export interface WatchLoopDeps {
   taskId: string;
   spec: WatchSpec;
-  readOutput: () => string;
+  readOutput: () => WatchOutput;
   getExitCode: () => number | undefined;
   onSuccess: (detail: string) => void;
   onFailure: () => void;
@@ -112,17 +121,17 @@ export class WatchLoop {
     const conditions = [...this.deps.spec.failure_when, ...this.deps.spec.success_when];
     const needsOutput = conditions.some((condition) => condition.type !== "exit_code");
     const needsExitCode = conditions.some((condition) => condition.type === "exit_code");
-    let output = "";
+    let streams: WatchOutput = { output: "", stdout: "", stderr: "" };
     let exitCode: number | undefined;
     try {
-      if (needsOutput) output = this.deps.readOutput();
+      if (needsOutput) streams = this.deps.readOutput();
       if (needsExitCode) exitCode = this.deps.getExitCode();
     } catch {
       this.countBlindCheck();
       return;
     }
 
-    const ctx = { output, exitCode };
+    const ctx: WatchEvalContext = { ...streams, exitCode };
     const failure = evaluateConditionsDetailed(this.deps.spec.failure_when, ctx);
     if (failure.status === "matched" && failure.matched) {
       this.finish(this.deps.onFailure);
@@ -179,7 +188,7 @@ type ConditionEvaluation =
   | { status: "pending" }
   | { status: "error" };
 
-function evaluateConditionsDetailed(conditions: Condition[], ctx: { output: string; exitCode?: number }): ConditionEvaluation {
+function evaluateConditionsDetailed(conditions: Condition[], ctx: WatchEvalContext): ConditionEvaluation {
   let pending = false;
   let error = false;
   for (const condition of conditions) {
@@ -193,16 +202,16 @@ function evaluateConditionsDetailed(conditions: Condition[], ctx: { output: stri
   return { status: "matched", matched: false };
 }
 
-function evaluateCondition(condition: Condition, ctx: { output: string; exitCode?: number }): ConditionEvaluation {
+function evaluateCondition(condition: Condition, ctx: WatchEvalContext): ConditionEvaluation {
   switch (condition.type) {
     case "exit_code":
       return ctx.exitCode === undefined
         ? { status: "pending" }
         : { status: "matched", matched: ctx.exitCode === condition.equals };
     case "stdout_contains":
+      return { status: "matched", matched: ctx.stdout.includes(condition.value) };
     case "stderr_contains":
-      // The frozen WatchLoop context exposes the captured merged output stream.
-      return { status: "matched", matched: ctx.output.includes(condition.value) };
+      return { status: "matched", matched: ctx.stderr.includes(condition.value) };
     case "output_matches": {
       let regex = compiledRegexes.get(condition);
       if (!regex) {

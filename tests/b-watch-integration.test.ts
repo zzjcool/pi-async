@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,7 +12,25 @@ function fixture() {
   return { registry, cleanup: async () => { await registry.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
 }
 function assertProcessGroupDead(pid: number): void {
-  assert.throws(() => process.kill(-pid, 0), (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH");
+  // Zombies still answer kill(-pgid, 0); only non-zombie members count as alive (#6).
+  let live = false;
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+        const closeParen = stat.lastIndexOf(") ");
+        if (closeParen < 0) continue;
+        const rest = stat.slice(closeParen + 2).split(" ");
+        if (Number(rest[2]) === pid && rest[0] !== "Z") { live = true; break; }
+      } catch { /* raced */ }
+    }
+  } catch {
+    try { process.kill(-pid, 0); live = true; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  assert.equal(live, false, `process group ${pid} still has a live member`);
 }
 function forceKillProcessGroup(pid: number | undefined): void {
   if (pid === undefined) return;

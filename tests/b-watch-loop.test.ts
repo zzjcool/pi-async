@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { WatchLoop } from "../src/core/watch.ts";
 import type { WatchSpec } from "../src/core/task.ts";
+import type { WatchOutput } from "../src/core/watch.ts";
+
+const streams = (text: string, which: "both" | "stdout" | "stderr" = "both"): WatchOutput => ({
+  output: text,
+  stdout: which === "stderr" ? "" : text,
+  stderr: which === "stdout" ? "" : text,
+});
 
 const spec = (overrides: Partial<WatchSpec> = {}): WatchSpec => ({
   intervalMs: 1_000,
@@ -30,7 +37,7 @@ test("success calls onSuccess and does not call failure or kill callbacks", asyn
     const loop = new WatchLoop({
       taskId: "success",
       spec: spec(),
-      readOutput: () => output,
+      readOutput: () => streams(output, "stdout"),
       getExitCode: () => undefined,
       onSuccess: (detail) => { assert.match(detail, /success_when/); successes++; done(); },
       onFailure: () => { failures++; done(); },
@@ -48,7 +55,7 @@ test("failure_when calls onFailure", async () => {
     new WatchLoop({
       taskId: "failure",
       spec: spec(),
-      readOutput: () => "fatal error",
+      readOutput: () => streams("fatal error", "stderr"),
       getExitCode: () => undefined,
       onSuccess: () => assert.fail("failure path must not succeed"),
       onFailure: done,
@@ -71,7 +78,7 @@ test("non-JSON output remains pending until valid JSON can be evaluated", async 
         success_when: [{ type: "json_path_exists", path: "$.status" }],
         failure_when: [],
       }),
-      readOutput: () => { reads++; return output; },
+      readOutput: () => { reads++; return streams(output, "stdout"); },
       getExitCode: () => undefined,
       onSuccess: () => { assert.ok(reads >= 2); done(); },
       onFailure: () => assert.fail("no failure conditions"),
@@ -95,7 +102,7 @@ test("an unavailable exit code remains pending until the process exits", async (
         success_when: [{ type: "exit_code", equals: 0 }],
         failure_when: [],
       }),
-      readOutput: () => "working",
+      readOutput: () => streams("working", "stdout"),
       getExitCode: () => { polls++; return exitCode; },
       onSuccess: () => { assert.ok(polls >= 2); done(); },
       onFailure: () => assert.fail("no failure conditions"),
@@ -111,7 +118,7 @@ test("watch timeout calls onWatchTimeout", async () => {
     new WatchLoop({
       taskId: "timeout",
       spec: spec({ timeoutMs: 40, intervalMs: 1_000, success_when: [], failure_when: [] }),
-      readOutput: () => "",
+      readOutput: () => streams("", "stdout"),
       getExitCode: () => undefined,
       onSuccess: () => assert.fail("empty conditions cannot succeed"),
       onFailure: () => assert.fail("empty conditions cannot fail"),
@@ -144,7 +151,7 @@ test("repeated start is idempotent and success fires only once", async () => {
     const loop = new WatchLoop({
       taskId: "repeat-start",
       spec: spec(),
-      readOutput: () => "ready",
+      readOutput: () => streams("ready"),
       getExitCode: () => undefined,
       onSuccess: () => { successes++; done(); },
       onFailure: () => assert.fail("success must win"),
@@ -163,7 +170,7 @@ test("stop prevents all callbacks for at least two intervals", async () => {
   const loop = new WatchLoop({
     taskId: "stopped",
     spec: spec({ intervalMs, timeoutMs: 5_000 }),
-    readOutput: () => "working",
+    readOutput: () => streams("working", "stdout"),
     getExitCode: () => undefined,
     onSuccess: () => { callbacks++; },
     onFailure: () => { callbacks++; },
@@ -185,7 +192,7 @@ test("failure wins when success and failure conditions both match", async () => 
         success_when: [{ type: "stdout_contains", value: "ready" }],
         failure_when: [{ type: "stderr_contains", value: "ready" }],
       }),
-      readOutput: () => "ready",
+      readOutput: () => streams("ready"),
       getExitCode: () => undefined,
       onSuccess: () => assert.fail("failure must take priority"),
       onFailure: () => { failures++; done(); },
@@ -211,7 +218,7 @@ test("blind count resets after conditions become evaluable", async () => {
       readOutput: () => {
         reads++;
         if (reads === 1 || reads === 3) throw new Error("temporarily unavailable");
-        return reads >= 4 ? "ready" : "working";
+        return streams(reads >= 4 ? "ready" : "working", "stdout");
       },
       getExitCode: () => undefined,
       onSuccess: () => done(),

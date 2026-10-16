@@ -52,12 +52,11 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry): void {
   const api = pi as unknown as { registerTool?: (tool: ToolDef) => void };
   if (!api.registerTool) throw new Error("Pi host does not expose registerTool");
   api.registerTool({
-    name: "async_run", label: "Run async command", description: `Run a background, delayed, or synchronous shell command. ${promptGuidelines}`,
-    parameters: schema({ command: stringField, name: stringField, mode: { type: "string", enum: ["background", "sync", "delayed"], default: "background" }, timeoutMs: timeoutField, delayMs: timeoutField, taskTimeoutMs: timeoutField, onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote" }, notifyOnCompletion: { type: "boolean" }, triggerOnCompletion: { type: "boolean" }, env: { type: "object", additionalProperties: { type: "string" } }, watch: watchSchema }, ["command"], [
-      { if: { properties: { mode: { const: "sync" } }, required: ["mode"] }, then: { required: ["timeoutMs"] } },
-      { if: { properties: { mode: { const: "delayed" } }, required: ["mode"] }, then: { required: ["delayMs"] } },
-      { if: { properties: { mode: { const: "sync" } }, required: ["mode"] }, then: { not: { required: ["watch"] } } },
-    ]),
+    name: "async_run", label: "Run async command",
+    description: `Run a background, delayed, or synchronous shell command. mode=sync requires timeoutMs; mode=delayed requires delayMs. onTimeout (sync only): "promote" (default) hands the still-running task to background and returns; "abort" stops WAITING only — the command keeps running in the background and will still notify on completion (Esc semantics; does not kill). ${promptGuidelines}`,
+    // Mode-conditional required fields are enforced in execute (precise errors) rather than
+    // allOf/then (host validator emits opaque "must match then schema") — see #45.
+    parameters: schema({ command: stringField, name: stringField, mode: { type: "string", enum: ["background", "sync", "delayed"], default: "background" }, timeoutMs: timeoutField, delayMs: timeoutField, taskTimeoutMs: timeoutField, onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote" }, notifyOnCompletion: { type: "boolean" }, triggerOnCompletion: { type: "boolean" }, env: { type: "object", additionalProperties: { type: "string" } }, watch: watchSchema }, ["command"]),
     execute: async (_id, params, signal) => {
       const mode = String(params.mode ?? "background");
       if (mode !== "background" && mode !== "sync" && mode !== "delayed") throw new Error(`Unsupported async_run mode: ${mode}`);
@@ -91,5 +90,16 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry): void {
     return toolResult(registry.logs(String(params.taskId), { maxBytes, tail: params.tail !== false }));
   } });
   api.registerTool({ name: "async_status", label: "Async task status", description: "List async tasks and current status.", parameters: schema({ includeHistory: { type: "boolean" } }), execute: async (_id, params) => toolResult(registry.list({ includeHistory: params.includeHistory !== false })) });
-  api.registerTool({ name: "async_kill", label: "Kill async task", description: "Terminate an async task and its process group.", parameters: schema({ taskId: stringField }, ["taskId"]), execute: async (_id, params) => { await registry.kill(String(params.taskId), "user"); return toolResult({ taskId: params.taskId, status: registry.get(String(params.taskId))?.status }); } });
+  api.registerTool({ name: "async_kill", label: "Kill async task", description: "Terminate an async task and its process group.", parameters: schema({ taskId: stringField }, ["taskId"]), execute: async (_id, params) => {
+    const taskId = String(params.taskId);
+    let warning: string | undefined;
+    try {
+      await registry.kill(taskId, "user");
+    } catch (error) {
+      // Kill may still have finalized the task; surface confirmation failures as warning (#6).
+      warning = error instanceof Error ? error.message : String(error);
+    }
+    const status = registry.get(taskId)?.status;
+    return toolResult({ taskId, status, ...(warning ? { warning } : {}) }, Boolean(warning && status !== "killed"));
+  } });
 }
