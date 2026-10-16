@@ -4,6 +4,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
+import { fitWidth } from "./width.ts";
 import { clearDoneStatus, survivesClearCutoff } from "./status.ts";
 import { tuiHost } from "./host.ts";
 
@@ -39,8 +40,9 @@ const frame = (title: string, body: string[], width: number, height: number): st
   const w = Math.max(8, Math.floor(width));
   const h = Math.max(4, Math.floor(height));
   // Title prefix is "╭─ " (3) + "─╮" (2) => budget w-5; body "│ "/" │" (2+2) => w-4.
-  const fitTitle = (text: string): string => Array.from(text).slice(0, w - 5).join("").padEnd(w - 5);
-  const fit = (text: string): string => Array.from(text).slice(0, w - 4).join("").padEnd(w - 4);
+  // #55 keeps fitTitle(w-5); #7/#62 routes both through fitWidth (cell-aware).
+  const fitTitle = (text: string): string => fitWidth(text, w - 5);
+  const fit = (text: string): string => fitWidth(text, w - 4);
   const content = [`╭─ ${fitTitle(title)}─╮`, ...body.slice(0, h - 2).map((line) => `│ ${fit(line)} │`), `╰${"─".repeat(w - 2)}╯`];
   while (content.length < height) content.splice(content.length - 1, 0, `│${" ".repeat(w - 2)}│`);
   // The solid background masks chat rows beneath the overlay, as in legion-viz's live overlay.
