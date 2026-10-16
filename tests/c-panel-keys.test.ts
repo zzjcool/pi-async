@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isEscapeKey, openPanel, registerPanelCommands } from "../src/tui/panel.ts";
-import { bindTuiHost, resetTuiHostForTests } from "../src/tui/host.ts";
+import { isEscapeKey, openPanel } from "../src/tui/panel.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 import type { TaskSnapshot } from "../src/core/task.ts";
 
@@ -9,6 +8,7 @@ function create(opts: {
   tasks?: TaskSnapshot[];
   submit?: (options: unknown) => TaskSnapshot;
   notify?: (message: string, level?: string) => void;
+  initialTaskId?: string;
 } = {}) {
   let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => any) | undefined;
   let closed = false;
@@ -30,14 +30,14 @@ function create(opts: {
     },
   };
   const ui = {
-    custom: (f: typeof factory, options: unknown) => { factory = f; assert.deepEqual(options, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 } }); return Promise.resolve(); },
+    custom: (f: typeof factory, options: unknown) => { factory = f; assert.deepEqual(options, { overlay: true, overlayOptions: { width: opts.initialTaskId ? "85%" : "80%", maxHeight: opts.initialTaskId ? "80%" : "70%", anchor: "center" } }); return Promise.resolve(); },
     copyToClipboard: (value: string) => copied.push(value),
     notify: (message: string, level?: string) => {
       notified.push({ message, level });
       opts.notify?.(message, level);
     },
   };
-  openPanel({ mode: "tui", ui } as never, registry as never);
+  openPanel({ mode: "tui", ui } as never, registry as never, opts.initialTaskId);
   const component = factory!({ requestRender() {} }, {}, {}, () => { closed = true; });
   return { component, task, tasks, killed, submitted, copied, notified, get closed() { return closed; } };
 }
@@ -158,47 +158,6 @@ test("panel list opens a task only after a matching press and click", () => {
   assert.ok(panel.component.render(100).some((line: string) => line.includes("command:")));
 });
 
-function withDockShortcutEnv(value: string | undefined, run: () => void): void {
-  const previous = process.env.PI_ASYNC_DOCK_SHORTCUT;
-  try {
-    if (value === undefined) delete process.env.PI_ASYNC_DOCK_SHORTCUT;
-    else process.env.PI_ASYNC_DOCK_SHORTCUT = value;
-    run();
-  } finally {
-    if (previous === undefined) delete process.env.PI_ASYNC_DOCK_SHORTCUT;
-    else process.env.PI_ASYNC_DOCK_SHORTCUT = previous;
-  }
-}
-
-function registerWithMockHost(): string[] {
-  resetTuiHostForTests();
-  bindTuiHost({ mode: "tui", ui: {} });
-  const shortcuts: string[] = [];
-  registerPanelCommands({
-    mode: "tui",
-    registerShortcut: (key: string) => { shortcuts.push(key); },
-  } as never, {} as never);
-  return shortcuts;
-}
-
-test("PI_ASYNC_DOCK_SHORTCUT=off/none/false/empty skips registerShortcut (#30)", () => {
-  for (const value of ["off", "OFF", "none", "false", "", "  off  ", "  "]) {
-    withDockShortcutEnv(value, () => {
-      const shortcuts = registerWithMockHost();
-      assert.deepEqual(shortcuts, [], `expected no registration for ${JSON.stringify(value)}`);
-    });
-  }
-});
-
-test("PI_ASYNC_DOCK_SHORTCUT unset or custom still registers (#30)", () => {
-  withDockShortcutEnv(undefined, () => {
-    assert.deepEqual(registerWithMockHost(), ["ctrl+alt+a"]);
-  });
-  withDockShortcutEnv("ctrl+shift+p", () => {
-    assert.deepEqual(registerWithMockHost(), ["ctrl+shift+p"]);
-  });
-});
-
 test("isEscapeKey recognises bare Esc and Kitty CSI-u variants", () => {
   assert.equal(isEscapeKey("\u001b"), true);
   assert.equal(isEscapeKey("\u001b["), true);
@@ -236,7 +195,9 @@ test("list scrolls so selection stays visible (#38)", () => {
   }));
   const { component } = create({ tasks });
   const prevRows = process.stdout.rows;
+  const prevColumns = process.stdout.columns;
   Object.defineProperty(process.stdout, "rows", { value: 14, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
   try {
     for (let i = 0; i < 25; i++) component.handleInput("\u001b[B");
     const lines = component.render(80) as string[];
@@ -245,6 +206,7 @@ test("list scrolls so selection stays visible (#38)", () => {
     assert.ok(/▶\s+task2[0-9]/.test(body) || /▶\s+task3[0-9]/.test(body), `expected selected row in view:\n${body}`);
   } finally {
     Object.defineProperty(process.stdout, "rows", { value: prevRows, configurable: true });
+    Object.defineProperty(process.stdout, "columns", { value: prevColumns, configurable: true });
   }
 });
 
