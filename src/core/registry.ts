@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { killTree, spawnDetached } from "./spawn.ts";
 import { stripAnsi } from "./output.ts";
+import { envNumber } from "./env.ts";
 import { deriveName, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
 import { evalConditions, validateWatchSpec, WatchLoop } from "./watch.ts";
 
@@ -35,10 +36,10 @@ export class TaskRegistry {
   private readonly config: RegistryConfig;
   constructor(config: RegistryConfig) {
     this.config = config;
-    this.maxTasks = config.maxTasks ?? finiteEnvNumber("PI_ASYNC_MAX_TASKS", 32);
-    this.maxOutputBytes = config.maxOutputBytes ?? finiteEnvNumber("PI_ASYNC_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT);
-    this.retentionMs = config.retentionMs ?? Math.max(0, finiteEnvNumber("PI_ASYNC_RETENTION_MS", DEFAULT_RETENTION_MS));
-    this.retentionCount = config.retentionCount ?? Math.max(0, Math.floor(finiteEnvNumber("PI_ASYNC_RETENTION_COUNT", DEFAULT_RETENTION_COUNT)));
+    this.maxTasks = config.maxTasks ?? envNumber("PI_ASYNC_MAX_TASKS", 32, { integer: true, min: 1 });
+    this.maxOutputBytes = config.maxOutputBytes ?? envNumber("PI_ASYNC_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT, { integer: true, min: 0 });
+    this.retentionMs = config.retentionMs ?? envNumber("PI_ASYNC_RETENTION_MS", DEFAULT_RETENTION_MS, { integer: true, min: 0 });
+    this.retentionCount = config.retentionCount ?? envNumber("PI_ASYNC_RETENTION_COUNT", DEFAULT_RETENTION_COUNT, { integer: true, min: 0 });
     mkdirSync(config.dataDir, { recursive: true });
   }
 
@@ -474,7 +475,3 @@ export class TaskRegistry {
   }
 }
 
-function finiteEnvNumber(name: string, fallback: number): number {
-  const parsed = Number(process.env[name] ?? fallback);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
