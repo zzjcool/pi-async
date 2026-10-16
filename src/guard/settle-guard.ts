@@ -60,7 +60,7 @@ export class SettleGuard {
     if (typeof ui?.setActivity !== "function") return;
     const count = this.registry.activeCount();
     const total = count.running + count.pending;
-    ui.setActivity("pi-async", total ? { message: `${total} async tasks` } : undefined);
+    ui.setActivity("pi-async", total ? { message: `${total} async task${total === 1 ? "" : "s"}` } : undefined);
   }
 
   private startHeartbeat(hooks: { appendEntry?: (customType: string, data: unknown) => void }): void {

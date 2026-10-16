@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { killTree, spawnDetached, streamPaths } from "./spawn.ts";
-import { stripAnsi } from "./output.ts";
+import { stripLogControls, truncateUtf8Bytes } from "./output.ts";
 import { envNumber } from "./env.ts";
-import { deriveName, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
+import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
 import { evalConditions, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
 
 export interface RegistryEvents {
@@ -58,7 +58,7 @@ export class TaskRegistry {
     const taskId = randomUUID();
     const outputFile = join(this.config.dataDir, `${taskId}.output`);
     const task: TaskSnapshot = {
-      taskId, name: opts.name?.slice(0, 48) ?? deriveName(opts.command), command: opts.command, mode: "delayed", status: "pending",
+      taskId, name: opts.name ? capName(opts.name) : deriveName(opts.command), command: opts.command, mode: "delayed", status: "pending",
       createdAt, dueAt: createdAt + delayMs, taskTimeoutMs: opts.taskTimeoutMs, notified: false, outputConsumed: false,
       ...(opts.watch ? { watch: opts.watch } : {}),
       metadata: { notifyOnCompletion: opts.notifyOnCompletion ?? true, triggerOnCompletion: opts.triggerOnCompletion ?? true, outputFile, ...(opts.env ? { delayedEnv: opts.env } : {}) },
@@ -151,7 +151,7 @@ export class TaskRegistry {
     const taskId = randomUUID();
     const outputFile = join(this.config.dataDir, `${taskId}.output`);
     const task: TaskSnapshot = {
-      taskId, name: opts.name?.slice(0, 48) ?? deriveName(opts.command), command: opts.command, mode, status: "running",
+      taskId, name: opts.name ? capName(opts.name) : deriveName(opts.command), command: opts.command, mode, status: "running",
       createdAt: Date.now(), startedAt: Date.now(), taskTimeoutMs: opts.taskTimeoutMs, notified: false, outputConsumed: false,
       ...(opts.watch ? { watch: opts.watch } : {}),
       metadata: { notifyOnCompletion: opts.notifyOnCompletion ?? true, triggerOnCompletion: opts.triggerOnCompletion ?? true, outputFile },
@@ -239,10 +239,11 @@ export class TaskRegistry {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`Unknown task id: ${taskId}`);
     const outputFile = String(task.metadata.outputFile ?? this.live.get(taskId)?.outputFile ?? join(this.config.dataDir, `${taskId}.output`));
-    // Missing primary output must throw so WatchLoop blind_checks can fire (#37/#68 test + CONTRACT).
-    const output = stripAnsi(readFileSync(outputFile, "utf8"));
+    // Missing primary output must throw so WatchLoop blind_checks can fire (#37/#68 + CONTRACT).
+    // stripLogControls: ANSI + bare C0 for model/watch paths (#18); streams stay distinct (#4).
+    const output = stripLogControls(readFileSync(outputFile, "utf8"));
     const { stdoutFile, stderrFile } = streamPaths(outputFile);
-    const readSide = (file: string): string => existsSync(file) ? stripAnsi(readFileSync(file, "utf8")) : "";
+    const readSide = (file: string): string => existsSync(file) ? stripLogControls(readFileSync(file, "utf8")) : "";
     return { output, stdout: readSide(stdoutFile), stderr: readSide(stderrFile) };
   }
 
@@ -251,7 +252,7 @@ export class TaskRegistry {
     const lines = outputTail.split("\n");
     if (lines.length > 200) outputTail = lines.slice(-200).join("\n");
     const bytes = Buffer.from(outputTail, "utf8");
-    if (bytes.byteLength > 8192) outputTail = bytes.subarray(bytes.byteLength - 8192).toString("utf8");
+    if (bytes.byteLength > 8192) outputTail = truncateUtf8Bytes(bytes, 8192, true);
     return {
       taskId: task.taskId, name: task.name, status: task.status, mode: task.mode,
       outputHint: `Use async_logs with taskId ${task.taskId} to inspect early output.`,
@@ -306,8 +307,9 @@ export class TaskRegistry {
     if (!existsSync(fullPath)) return { text: "", truncated: false, fullPath };
     const data = readFileSync(fullPath);
     const maxBytes = Math.min(50 * 1024, Math.max(0, opts.maxBytes ?? 50 * 1024));
-    const selected = opts.tail === false ? data.subarray(0, maxBytes) : data.subarray(Math.max(0, data.length - maxBytes));
-    return { text: stripAnsi(selected.toString("utf8")), truncated: data.length > selected.length, fullPath };
+    const truncated = data.length > maxBytes;
+    const text = stripLogControls(truncateUtf8Bytes(data, maxBytes, opts.tail !== false));
+    return { text, truncated, fullPath };
   }
 
   async kill(taskId: string, kind: KillKind): Promise<void> {
@@ -332,7 +334,13 @@ export class TaskRegistry {
     // Finalize first so async_kill can always return { taskId, status } even when the
     // confirmation probe cannot prove the group is gone (#6).
     if (!isTerminal(task.status)) this.finalize(task, "killed", undefined, kind);
-    else if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
+    else {
+      // D4 / leftover process: record kill without flipping the settled observation status (#33).
+      task.killKind = kind;
+      try { this.persist(task); } catch { /* dataDir may already be gone during teardown */ }
+      if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
+    }
+    // Finalize-first (#6): still surface confirmation failure after status is settled.
     if (!confirmed) throw new Error("Descendant processes may have leaked");
   }
   cancel(taskId: string): boolean {
@@ -388,7 +396,8 @@ export class TaskRegistry {
       for (const file of readdirSync(this.config.dataDir).filter((name) => name.endsWith(".json"))) {
         try {
           const snapshot = JSON.parse(readFileSync(join(this.config.dataDir, file), "utf8")) as TaskSnapshot;
-          if (!snapshot.taskId || this.tasks.has(snapshot.taskId)) continue;
+          // #34: skip unknown status values from disk.
+          if (!snapshot.taskId || !isTaskStatus(snapshot.status) || this.tasks.has(snapshot.taskId)) continue;
           this.tasks.set(snapshot.taskId, snapshot);
           if (snapshot.status === "pending" && snapshot.mode === "delayed") {
             const outputFile = String(snapshot.metadata.outputFile ?? join(this.config.dataDir, `${snapshot.taskId}.output`));

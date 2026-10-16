@@ -10,7 +10,14 @@ export interface NotifyPayload {
   failureKind?: FailureKind;
   summaryTruncated?: boolean;
 }
-const escapeXml = (value: unknown): string => String(value).replace(/[<&>\"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&apos;" })[char]!);
+
+/** XML 1.0 Char excludes C0 (except TAB/LF/CR), lone surrogates, and U+FFFE/FFFF (#19). */
+const ILLEGAL_XML = /[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]/g;
+
+const escapeXml = (value: unknown): string =>
+  String(value)
+    .replace(ILLEGAL_XML, "")
+    .replace(/[<&>\"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&apos;" })[char]!);
 
 export function buildNotificationXml(p: NotifyPayload): string {
   const fields: Array<[string, unknown]> = [["task-id", p.taskId], ["name", p.name], ["status", p.status]];

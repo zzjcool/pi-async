@@ -1,20 +1,32 @@
-export type TaskStatus = "pending" | "running" | "completed" | "failed" | "killed";
+export const TASK_STATUSES = ["pending", "running", "completed", "failed", "killed"] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
 export type TaskMode = "background" | "sync" | "delayed";
 export type KillKind = "user" | "timeout" | "output_cap" | "shutdown" | "watch_failure";
 export type FailureKind = "lost" | "blind_exhausted" | "watch_timeout";
 
 export const TERMINAL_STATUSES = ["completed", "failed", "killed"] as const satisfies readonly TaskStatus[];
 
+export function isTaskStatus(value: unknown): value is TaskStatus {
+  return typeof value === "string" && (TASK_STATUSES as readonly string[]).includes(value);
+}
+
 export function isTerminal(status: TaskStatus): boolean {
   return TERMINAL_STATUSES.includes(status as (typeof TERMINAL_STATUSES)[number]);
 }
 
-/** Derive a concise, single-line display name from a shell command. */
+/** Cap a task name at `limit` Unicode code points without splitting surrogate pairs (#28). */
+export function capName(name: string, limit = 48): string {
+  const characters = Array.from(name);
+  return characters.length <= limit ? name : characters.slice(0, limit - 1).join("") + "…";
+}
+
+/** Derive a concise, single-line display name from a shell command.
+ *  Uses the first non-blank line so a leading newline does not collapse to the fallback (#23). */
 export function deriveName(command: string): string {
-  const normalized = command.split(/\r?\n/, 1)[0]?.trim().replace(/\s+/g, " ") ?? "";
+  const firstContentLine = command.split(/\r?\n/).find((line) => line.trim().length > 0);
+  const normalized = firstContentLine?.trim().replace(/\s+/g, " ") ?? "";
   if (normalized.length === 0) return "async task";
-  const characters = Array.from(normalized);
-  return characters.length <= 48 ? normalized : characters.slice(0, 47).join("") + "…";
+  return capName(normalized);
 }
 
 export type Condition =
