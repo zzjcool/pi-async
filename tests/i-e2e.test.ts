@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
-import { registerPanelCommands } from "../src/tui/panel.ts";
 
 type Tool = {
   name: string;
@@ -146,7 +145,6 @@ test("TUI init registers status, rail widget, and panel commands", async () => {
   const commands: string[] = [];
   const widgets: string[] = [];
   const statuses: string[] = [];
-  const shortcuts: string[] = [];
   const pi = {
     cwd,
     pid: process.pid,
@@ -154,7 +152,6 @@ test("TUI init registers status, rail widget, and panel commands", async () => {
     sessionManager: { getSessionId: () => "i-tui-session" },
     registerTool: () => undefined,
     registerCommand: (name: string) => { commands.push(name); },
-    registerShortcut: (key: string) => { shortcuts.push(key); },
     on: (event: string, handler: Hook) => { hooks.set(event, handler); return () => hooks.delete(event); },
     ui: {
       setStatus: (key: string) => { statuses.push(key); },
@@ -165,29 +162,12 @@ test("TUI init registers status, rail widget, and panel commands", async () => {
     await init(pi as never);
     // Factory API has no mode; TUI binds from the first event context.
     hooks.get("session_start")?.({ type: "session_start" }, { mode: "tui", hasUI: true, ui: pi.ui });
-    assert.ok(statuses.includes("pi-async"));
+    assert.ok(!statuses.includes("pi-async"));
     assert.ok(widgets.includes("pi-async-rail"));
     assert.deepEqual(commands, ["async", "async-clear"]);
-    assert.deepEqual(shortcuts, ["ctrl+alt+a"]);
   } finally {
     const shutdown = hooks.get("session_shutdown");
     if (shutdown) await shutdown();
     rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("panel shortcut honors PI_ASYNC_DOCK_SHORTCUT", () => {
-  const previous = process.env.PI_ASYNC_DOCK_SHORTCUT;
-  const shortcuts: string[] = [];
-  process.env.PI_ASYNC_DOCK_SHORTCUT = "ctrl+shift+p";
-  try {
-    registerPanelCommands({
-      mode: "tui",
-      registerShortcut: (key: string) => { shortcuts.push(key); },
-    } as never, {} as never);
-    assert.deepEqual(shortcuts, ["ctrl+shift+p"]);
-  } finally {
-    if (previous === undefined) delete process.env.PI_ASYNC_DOCK_SHORTCUT;
-    else process.env.PI_ASYNC_DOCK_SHORTCUT = previous;
   }
 });

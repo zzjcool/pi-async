@@ -15,17 +15,20 @@ function setup() {
   return { calls, widget, get renders() { return renders; } };
 }
 
-test("rail opens only after press then click on the same task", () => {
+test("rail summary row is not clickable and task rows open only after press then click", () => {
   const { calls, widget } = setup();
   widget.handleMouse({ type: "press", button: "left", x: 1, y: 0 } as never);
   widget.handleMouse({ type: "click", button: "left", x: 1, y: 0 } as never);
+  assert.deepEqual(calls, []);
+  widget.handleMouse({ type: "press", button: "left", x: 1, y: 1 } as never);
+  widget.handleMouse({ type: "click", button: "left", x: 1, y: 1 } as never);
   assert.deepEqual(calls, ["a"]);
 });
 
 test("rail ignores a click on a different task than the latched press", () => {
   const { calls, widget } = setup();
-  widget.handleMouse({ type: "press", button: "left", x: 1, y: 0 } as never);
-  widget.handleMouse({ type: "click", button: "left", x: 1, y: 1 } as never);
+  widget.handleMouse({ type: "press", button: "left", x: 1, y: 1 } as never);
+  widget.handleMouse({ type: "click", button: "left", x: 1, y: 2 } as never);
   assert.deepEqual(calls, []);
 });
 
@@ -47,13 +50,18 @@ test("registered rail opens a selected task in the panel", () => {
   registerRail({} as never, registry as never);
   const widget = factory!({ requestRender() {} }, { fg: (_token: string, text: string) => text });
   widget.render(80);
-  widget.handleMouse({ type: "press", button: "left", y: 0 });
-  widget.handleMouse({ type: "click", button: "left", y: 0 });
+  widget.handleMouse({ type: "press", button: "left", y: 1 });
+  widget.handleMouse({ type: "click", button: "left", y: 1 });
   assert.ok(panelFactory!({ requestRender() {} }, {}, {}, () => {}).render(80).some((line) => line.includes("command:")));
 });
 
+test("rail does not consume wheel without overflow", () => {
+  const { widget } = setup();
+  assert.equal(widget.handleMouse({ type: "wheel", wheelDelta: 1 } as never), undefined);
+});
+
 test("rail consumes wheel to scroll overflow rows", () => {
-  const tasks = Array.from({ length: 12 }, (_, i) => makeSnapshot({ taskId: `${i}`, startedAt: Date.now() - i }));
+  const tasks = Array.from({ length: 5 }, (_, i) => makeSnapshot({ taskId: `${i}`, startedAt: Date.now() - i }));
   const registry = { list: () => tasks };
   const factory = createRailFactory({} as never, registry as never);
   let renders = 0;
@@ -64,7 +72,7 @@ test("rail consumes wheel to scroll overflow rows", () => {
 });
 
 test("rail keyboard PageDown/PageUp scrolls overflow (#13)", () => {
-  const tasks = Array.from({ length: 14 }, (_, i) => makeSnapshot({ taskId: `${i}`, name: `job-${i}`, startedAt: Date.now() - i }));
+  const tasks = Array.from({ length: 8 }, (_, i) => makeSnapshot({ taskId: `${i}`, name: `job-${i}`, startedAt: Date.now() - i }));
   const registry = { list: () => tasks };
   let renders = 0;
   const widget = createRailFactory({} as never, registry as never)({ requestRender: () => { renders++; } } as never, { fg: (_token: string, text: string) => text } as never);
@@ -82,7 +90,7 @@ test("rail keyboard PageDown/PageUp scrolls overflow (#13)", () => {
 });
 
 test("rail Ctrl+arrow scrolls by page (#13)", () => {
-  const tasks = Array.from({ length: 14 }, (_, i) => makeSnapshot({ taskId: `${i}`, name: `n${i}`, startedAt: Date.now() - i }));
+  const tasks = Array.from({ length: 8 },  (_, i) => makeSnapshot({ taskId: `${i}`, name: `n${i}`, startedAt: Date.now() - i }));
   let renders = 0;
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender: () => { renders++; } } as never, { fg: (_t: string, text: string) => text } as never);
   widget.render(80);

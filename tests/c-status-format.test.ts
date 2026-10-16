@@ -1,22 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { clearedAtMs, clearDoneStatus, disposeStatus, formatStatus, initStatus, survivesClearCutoff } from "../src/tui/status.ts";
+import { clearedAtMs, clearDoneStatus, initStatus, survivesClearCutoff } from "../src/tui/status.ts";
 import { openPanel } from "../src/tui/panel.ts";
 import { bindTuiHost, resetTuiHostForTests } from "../src/tui/host.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
-test("footer separates running from pending and counts all terminal as done", () => {
-  assert.equal(formatStatus({ running: 3, pending: 2 }, 7), " 3 running · 2 pending · 7 done ");
-  assert.equal(formatStatus({ running: 3, pending: 0 }, 7), " 3 running · 7 done ");
-  assert.equal(formatStatus({ running: 0, pending: 1 }, 0), " 0 running · 1 pending · 0 done ");
-});
-
-test("status refresh counts failed and killed toward done", () => {
+test("initStatus does not publish footer status or create a timer", () => {
   const statuses: string[] = [];
   const ui = { setStatus(_key: string, text: string | undefined) { if (text) statuses.push(text); } };
   bindTuiHost({ mode: "tui", ui });
   const originalSetInterval = globalThis.setInterval;
+  let intervalCalls = 0;
   (globalThis as unknown as { setInterval: typeof setInterval }).setInterval = (() => {
+    intervalCalls++;
     return { unref() {} } as unknown as ReturnType<typeof setInterval>;
   }) as unknown as typeof setInterval;
   try {
@@ -30,36 +26,27 @@ test("status refresh counts failed and killed toward done", () => {
       ],
     } as never;
     initStatus({} as never, registry);
-    assert.equal(statuses.at(-1), " 0 running · 3 done ");
+    assert.deepEqual(statuses, []);
+    assert.equal(intervalCalls, 0);
   } finally {
-    disposeStatus();
     resetTuiHostForTests();
     globalThis.setInterval = originalSetInterval;
   }
 });
 
-test("status init replaces its interval and dispose clears it", () => {
+test("initStatus reports activity without status text when bound", () => {
   const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const cleared: unknown[] = [];
-  let nextId = 0;
-  (globalThis as unknown as { setInterval: (callback: () => void, ms: number) => ReturnType<typeof setInterval> }).setInterval = () => ({ id: ++nextId, unref() {} } as unknown as ReturnType<typeof setInterval>);
-  (globalThis as unknown as { clearInterval: (id: ReturnType<typeof setInterval>) => void }).clearInterval = (id) => { cleared.push(id); };
+  const statuses: string[] = [];
+  let activities = 0;
+  const ui = { setStatus(_key: string, text: string | undefined) { if (text) statuses.push(text); } };
+  bindTuiHost({ mode: "tui", ui });
   try {
-    const ui = { setStatus() {} };
-    bindTuiHost({ mode: "tui", ui });
-    const pi = {} as never;
-    const registry = { activeCount: () => ({ running: 0, pending: 0 }), list: () => [] } as never;
-    initStatus(pi, registry);
-    initStatus(pi, registry);
-    assert.equal(cleared.length, 1);
-    disposeStatus();
-    assert.equal(cleared.length, 2);
+    initStatus({ ui: { setActivity() { activities++; } } } as never, { activeCount: () => ({ running: 2, pending: 1 }) } as never);
+    assert.deepEqual(statuses, []);
+    assert.equal(activities, 1);
   } finally {
-    disposeStatus();
     resetTuiHostForTests();
     globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
   }
 });
 
@@ -101,10 +88,8 @@ test("survivesClearCutoff uses finishedAt ?? createdAt (footer semantics) (#31)"
   assert.equal(survivesClearCutoff(pending, clearTime), true);
 });
 
-test("/async-clear: panel list and footer done agree on mid-flight completion (#31)", () => {
-  const statuses: string[] = [];
+test("/async-clear: panel list and clear watermark agree on mid-flight completion (#31)", () => {
   const ui = {
-    setStatus(_key: string, text: string | undefined) { if (text) statuses.push(text); },
     custom: () => Promise.resolve(),
   };
   bindTuiHost({ mode: "tui", ui });
@@ -154,8 +139,6 @@ test("/async-clear: panel list and footer done agree on mid-flight completion (#
     } as never;
 
     initStatus({} as never, registry);
-    // Footer: mid + after = 2 done (before cleared away); failed/killed still TERMINAL.
-    assert.equal(statuses.at(-1), " 0 running · 2 done ");
 
     // Panel uses the same survivesClearCutoff / clearedAtMs — mid-flight must list.
     let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => {
@@ -170,7 +153,6 @@ test("/async-clear: panel list and footer done agree on mid-flight completion (#
     assert.match(rendered, /after-clear/);
     assert.doesNotMatch(rendered, /before-clear/);
   } finally {
-    disposeStatus();
     resetTuiHostForTests();
     globalThis.setInterval = originalSetInterval;
   }
