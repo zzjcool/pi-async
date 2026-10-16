@@ -27,7 +27,9 @@ permissions:
 jobs:
   lint-build:
     name: lint + build image
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the label migrates to Ubuntu 26 on
+    # 2026-10-19 (runner-images#14748). Move to 26.04 deliberately.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
