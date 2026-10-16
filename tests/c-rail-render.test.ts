@@ -1,11 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createRailFactory, renderRailRows } from "../src/tui/rail.ts";
+import { createRailFactory, elapsed, renderRailRows } from "../src/tui/rail.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 test("rail rows are empty when there are no visible tasks", () => {
   assert.deepEqual(renderRailRows([], 80), []);
-  assert.deepEqual(renderRailRows([makeSnapshot({ status: "pending" })], 80), []);
+});
+
+test("rail shows pending rows with an em-dash elapsed", () => {
+  const now = 1_000_000;
+  const rows = renderRailRows([makeSnapshot({ status: "pending", name: "later", createdAt: now - 40_000 })], 80, now);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0], "▶ later · pending · —");
+  assert.equal(elapsed(makeSnapshot({ status: "pending", createdAt: now - 40_000 }), now), "—");
+});
+
+test("completed elapsed freezes at finishedAt", () => {
+  const started = 1_000_000_000_000;
+  const task = makeSnapshot({
+    name: "quick",
+    status: "completed",
+    createdAt: started - 3_000,
+    startedAt: started,
+    finishedAt: started + 3_000,
+  });
+  for (const dt of [0, 5_000, 60_000, 3_600_000]) {
+    assert.equal(elapsed(task, started + 3_000 + dt), "3s");
+    assert.match(renderRailRows([task], 120, started + 3_000 + dt)[0]!, /completed · 3s$/);
+  }
 });
 
 test("rail render rows strip ANSI and use the injected clock", () => {
@@ -51,6 +73,16 @@ test("rail assigns state-specific colors to each status", () => {
   assert.deepEqual(colors, ["syntaxVariable", "success", "error", "dim"]);
 });
 
+test("theme.fg undefined or throw falls back to the uncoloured row", () => {
+  const now = Date.now();
+  const tasks = [makeSnapshot({ status: "running", taskId: "run", name: "x", startedAt: now })];
+  const tui = { requestRender() {} } as never;
+  const undefinedFg = createRailFactory({} as never, { list: () => tasks } as never)(tui, { fg: () => undefined } as never);
+  assert.deepEqual(undefinedFg.render(80), ["▶ x · running · 0s"]);
+  const throwing = createRailFactory({} as never, { list: () => tasks } as never)(tui, { fg: () => { throw new Error("boom"); } } as never);
+  assert.deepEqual(throwing.render(80), ["▶ x · running · 0s"]);
+});
+
 test("terminal tasks linger briefly on the rail, then disappear", () => {
   const theme = { getFgAnsi: () => "\u001b[38;5;70m", fg: (_c: string, t: string) => t };
   const now = Date.now();
@@ -73,4 +105,17 @@ test("rail renders nothing when all tasks are stale terminal states", () => {
   const tasks = [makeSnapshot({ status: "completed", taskId: "old", finishedAt: now - 120_000, startedAt: now - 130_000 })];
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
   assert.deepEqual(widget.render(100), [], "idle session renders nothing (CONTRACT §8)");
+});
+
+test("createRailFactory keeps pending tasks visible on the rail", () => {
+  const theme = { getFgAnsi: () => "\u001b[38;5;70m", fg: (_c: string, t: string) => t };
+  const now = Date.now();
+  const tasks = [
+    makeSnapshot({ status: "running", taskId: "run", name: "runningnow", startedAt: now }),
+    makeSnapshot({ status: "pending", taskId: "wait", name: "scheduled", createdAt: now - 5_000 }),
+  ];
+  const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
+  const rows = widget.render(100);
+  assert.equal(rows.length, 2);
+  assert.ok(rows.some((row) => row.includes("scheduled") && row.includes("pending")));
 });

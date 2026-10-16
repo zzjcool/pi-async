@@ -60,9 +60,11 @@ function typeColor(theme: Theme, mode: string, used: Swatch[]): string {
 }
 
 const statePriority: Record<TaskSnapshot["status"], number> = { running: 0, pending: 1, completed: 2, failed: 3, killed: 4 };
+/** Alias for tests / callers still importing elapsed; single source is core/duration. */
+export { formatDuration as elapsed };
 /** Pure, unstyled rail rows; active tasks first and a hard ten-row limit. */
 export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = Date.now()): string[] {
-  const rows = snapshots.filter((task) => task.status !== "pending")
+  const rows = snapshots
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
     .slice(0, 10)
     .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${formatDuration(task, now)}`);
@@ -103,7 +105,11 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         if (task.status === "running") token = typeColor(theme, task.mode, used);
         else if (task.status === "completed") token = "success";
         else if (task.status === "failed") token = "error";
-        return theme.fg(token, row);
+        try {
+          return theme.fg(token, row) ?? row;
+        } catch {
+          return row;
+        }
       });
     };
     return {

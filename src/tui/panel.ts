@@ -37,12 +37,21 @@ function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: strin
 const frame = (title: string, body: string[], width: number, height: number): string[] => {
   const w = Math.max(8, Math.floor(width));
   const h = Math.max(4, Math.floor(height));
+  // Title prefix is "╭─ " (3) + "─╮" (2) => budget w-5; body "│ "/" │" (2+2) => w-4.
+  const fitTitle = (text: string): string => Array.from(text).slice(0, w - 5).join("").padEnd(w - 5);
   const fit = (text: string): string => Array.from(text).slice(0, w - 4).join("").padEnd(w - 4);
-  const content = [`╭─ ${fit(title)}─╮`, ...body.slice(0, h - 2).map((line) => `│ ${fit(line)} │`), `╰${"─".repeat(w - 2)}╯`];
+  const content = [`╭─ ${fitTitle(title)}─╮`, ...body.slice(0, h - 2).map((line) => `│ ${fit(line)} │`), `╰${"─".repeat(w - 2)}╯`];
   while (content.length < height) content.splice(content.length - 1, 0, `│${" ".repeat(w - 2)}│`);
   // The solid background masks chat rows beneath the overlay, as in legion-viz's live overlay.
   return content;
 };
+
+/** Bare Esc, Kitty CSI-u Escape (key 27), and a lone CSI introducer. */
+export function isEscapeKey(data: string): boolean {
+  if (data === "\u001b") return true;
+  if (data === "\u001b[") return true;
+  return /^\u001b\[27(?:;\d+)*u$/.test(data);
+}
 
 export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
   // Commands/shortcuts are factory-time APIs (they exist on the factory pi); TUI
@@ -156,7 +165,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         const key = data.toLowerCase();
         if (confirmKill && key !== "k") { confirmKill = false; requestRender(); return; }
         if (key === "q") { done(undefined); return; }
-        if (data === "\u001b") { if (detail) { detail = false; confirmKill = false; requestRender(); } else done(undefined); return; }
+        if (isEscapeKey(data)) { if (detail) { detail = false; confirmKill = false; requestRender(); } else done(undefined); return; }
         if (key === "h" && !detail) { history = !history; requestRender(); return; }
         if (data === "\r" || data === "\n") { detail = true; scroll = 0; follow = true; requestRender(); return; }
         if (data === "\u001b[A" || data === "k") { if (detail && key === "k") {

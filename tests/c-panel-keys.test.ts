@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openPanel, registerPanelCommands } from "../src/tui/panel.ts";
+import { isEscapeKey, openPanel, registerPanelCommands } from "../src/tui/panel.ts";
 import { bindTuiHost, resetTuiHostForTests } from "../src/tui/host.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
@@ -128,4 +128,32 @@ test("PI_ASYNC_DOCK_SHORTCUT unset or custom still registers (#30)", () => {
   withDockShortcutEnv("ctrl+shift+p", () => {
     assert.deepEqual(registerWithMockHost(), ["ctrl+shift+p"]);
   });
+});
+
+test("isEscapeKey recognises bare Esc and Kitty CSI-u variants", () => {
+  assert.equal(isEscapeKey("\u001b"), true);
+  assert.equal(isEscapeKey("\u001b["), true);
+  assert.equal(isEscapeKey("\u001b[27u"), true);
+  assert.equal(isEscapeKey("\u001b[27;1u"), true);
+  assert.equal(isEscapeKey("\u001b[A"), false);
+  assert.equal(isEscapeKey("\u001b[B"), false);
+  assert.equal(isEscapeKey("q"), false);
+});
+
+test("Kitty Escape returns from details to the list", () => {
+  const { component } = create();
+  component.handleInput("\r");
+  assert.ok(component.render(80).some((line: string) => line.includes("command:")));
+  component.handleInput("\u001b[27u");
+  assert.ok(component.render(80).some((line: string) => line.includes("Enter details")));
+});
+
+test("panel frame title/body/bottom share the same code-point width", () => {
+  const { component } = create();
+  for (const w of [120, 60, 30]) {
+    const lines = component.render(w) as string[];
+    for (const line of lines) {
+      assert.equal(Array.from(line).length, w, `w=${w} line=${JSON.stringify(line)} len=${Array.from(line).length}`);
+    }
+  }
 });
