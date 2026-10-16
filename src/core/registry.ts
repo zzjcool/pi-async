@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync
 import { join } from "node:path";
 import { killTree, spawnDetached } from "./spawn.ts";
 import { stripAnsi } from "./output.ts";
-import { deriveName, isTerminal, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
+import { deriveName, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
 import { evalConditions, validateWatchSpec, WatchLoop } from "./watch.ts";
 
 export interface RegistryEvents {
@@ -107,14 +107,16 @@ export class TaskRegistry {
       onBlindExhausted: () => {
         const current = this.tasks.get(taskId);
         if (current && !isTerminal(current.status)) {
-          this.finalize(current, "failed");
+          current.failureKind = "blind_exhausted";
+          this.finalize(current, "failed", undefined, "watch_failure");
           void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: blind-check kill failed for task ${taskId}`, error));
         }
       },
       onWatchTimeout: () => {
         const current = this.tasks.get(taskId);
         if (current && !isTerminal(current.status)) {
-          this.finalize(current, "failed");
+          current.failureKind = "watch_timeout";
+          this.finalize(current, "failed", undefined, "watch_failure");
           void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: watch-timeout kill failed for task ${taskId}`, error));
         }
       },
@@ -431,9 +433,16 @@ export class TaskRegistry {
     this.notifyClaims.delete(task.taskId);
   }
 
-  private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number; outputTail: string } {
+  private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind } {
     this.consume(task.taskId);
-    return { taskId: task.taskId, status: task.status, ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }), outputTail: this.logs(task.taskId, { maxBytes: 8192, tail: true }).text };
+    return {
+      taskId: task.taskId,
+      status: task.status,
+      ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
+      outputTail: this.logs(task.taskId, { maxBytes: 8192, tail: true }).text,
+      ...(task.killKind ? { killKind: task.killKind } : {}),
+      ...(task.failureKind ? { failureKind: task.failureKind } : {}),
+    };
   }
   private finalize(task: TaskSnapshot, status: TaskSnapshot["status"], code?: number, killKind?: KillKind): void {
     if (isTerminal(task.status)) return;
