@@ -78,9 +78,9 @@ test("theme.fg undefined or throw falls back to the uncoloured row", () => {
   const tasks = [makeSnapshot({ status: "running", taskId: "run", name: "x", startedAt: now })];
   const tui = { requestRender() {} } as never;
   const undefinedFg = createRailFactory({} as never, { list: () => tasks } as never)(tui, { fg: () => undefined } as never);
-  assert.deepEqual(undefinedFg.render(80), ["▶ 1 running · 0s · ✓0", "▶ x · running · 0s"]);
+  assert.deepEqual(undefinedFg.render(80), ["▶ 1 running · 0s", "▶ x · running · 0s"]);
   const throwing = createRailFactory({} as never, { list: () => tasks } as never)(tui, { fg: () => { throw new Error("boom"); } } as never);
-  assert.deepEqual(throwing.render(80), ["▶ 1 running · 0s · ✓0", "▶ x · running · 0s"]);
+  assert.deepEqual(throwing.render(80), ["▶ 1 running · 0s", "▶ x · running · 0s"]);
 });
 
 test("terminal tasks linger briefly on the rail, then disappear", () => {

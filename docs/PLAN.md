@@ -219,7 +219,7 @@ export type SummaryToken = "accent" | "dim" | "success" | "error";
 export interface SummarySegment { text: string; token: SummaryToken }
 export function summarySegments(c: SummaryCounts, now?: number): SummarySegment[];
 export function formatSummary(c: SummaryCounts, now?: number): string;
-// 汇总段序 ▶ N running · N pending · <elapsed> · ✓N ✗N；pending/✗N 仅非零显示；无 running 时 elapsed=—
+// 汇总段序 ▶ N running · N pending · <elapsed> · ✓N · ✗N；pending/✓N/✗N 均仅非零显示；无 running 时 elapsed=—
 // initStatus 仅通过 bus.reportActivity 上报；不再调用 setStatus。clear watermark 谓词由 panel 与 /async-clear 共用
 // panel.ts
 export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void;

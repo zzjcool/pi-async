@@ -210,8 +210,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   延迟解析 + OKLab 撞色检测）；wheel 滚动；press→latch→click 命中任务 → 打开详情。
   `renderRailRows(snapshots, width, now?)` 为纯函数，内部最多渲染 3 个任务行；没有可见任务时
   整个 widget 返回 `[]`，不显示汇总行。
-- **汇总行**：由 `summarySegments`/`formatSummary` 生成，段序为 `▶ N running · N pending · <elapsed> · ✓N ✗N`；
-  `pending` 仅在数量大于 0 时显示，`✗N` 仅在失败数大于 0 时显示；无 running 时 elapsed 为 `—`。
+- **汇总行**：由 `summarySegments`/`formatSummary` 生成，段序为 `▶ N running · N pending · <elapsed> · ✓N · ✗N`；
+  `pending` 仅在数量大于 0 时显示；`✓N` 与 `✗N` 对称，均仅在各自数量大于 0 时显示
+  （全失败场景不再出现绿色的 `✓0`）；无 running 时 elapsed 为 `—`。
   `▶` 在 running/pending 非零时为 accent、否则 dim；running 数为 accent，pending/elapsed 为 dim，
   完成数为 success，失败数为 error。宽度不足时优先移除可选段并 truncate，再上色。汇总行不可点击。
   running/pending 始终计数；完成数与 failed/killed 失败数仅统计通过 `/async-clear` 共享 watermark 的终态任务。

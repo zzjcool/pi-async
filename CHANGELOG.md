@@ -14,7 +14,7 @@
 
 ### Added
 
-- rail 首行新增汇总：running、pending（非零时）、elapsed、completed 与 failed/killed（非零时）；终态计数遵循 `/async-clear` watermark。
+- rail 首行新增汇总：running、pending（非零时）、elapsed、`✓N` 与 `✗N`（均仅在非零时显示，全失败时不出绿色的 `✓0`）；终态计数遵循 `/async-clear` watermark。
 
 ## 0.2.0 — 2026-10-16
 

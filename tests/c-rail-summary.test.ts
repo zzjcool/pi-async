@@ -15,10 +15,12 @@ test("formatElapsedMs formats seconds, minutes, and hours", () => {
 });
 
 test("formatSummary includes pending and uses the frozen strings", () => {
-  assert.equal(formatSummary({ running: 2, pending: 1, completed: 3, failed: 1, longestRunningStartedAt: NOW - 65_000 }, NOW), "▶ 2 running · 1 pending · 1m 5s · ✓3 ✗1");
+  assert.equal(formatSummary({ running: 2, pending: 1, completed: 3, failed: 1, longestRunningStartedAt: NOW - 65_000 }, NOW), "▶ 2 running · 1 pending · 1m 5s · ✓3 · ✗1");
   assert.equal(formatSummary({ running: 0, pending: 0, completed: 3, failed: 0 }, NOW), "▶ 0 running · — · ✓3");
-  assert.equal(formatSummary({ running: 0, pending: 2, completed: 0, failed: 0 }, NOW), "▶ 0 running · 2 pending · — · ✓0");
-  assert.equal(formatSummary({ running: 0, pending: 0, completed: 0, failed: 0 }, NOW), "▶ 0 running · — · ✓0");
+  // ✓ is hidden at zero, symmetric with ✗: an all-failed run must not show a green 0.
+  assert.equal(formatSummary({ running: 0, pending: 2, completed: 0, failed: 0 }, NOW), "▶ 0 running · 2 pending · —");
+  assert.equal(formatSummary({ running: 0, pending: 0, completed: 0, failed: 0 }, NOW), "▶ 0 running · —");
+  assert.equal(formatSummary({ running: 0, pending: 0, completed: 0, failed: 3 }, NOW), "▶ 0 running · — · ✗3");
 });
 
 test("summarySegments returns the frozen token sequence", () => {
@@ -28,7 +30,7 @@ test("summarySegments returns the frozen token sequence", () => {
     { text: " · 1 pending", token: "dim" },
     { text: " · 1m 5s", token: "dim" },
     { text: " · ✓3", token: "success" },
-    { text: " ✗1", token: "error" },
+    { text: " · ✗1", token: "error" },
   ]);
   assert.equal(summarySegments({ running: 0, pending: 0, completed: 0, failed: 0 }, NOW)[0]?.token, "dim");
 });
@@ -61,7 +63,7 @@ test("rail summary counts only terminal tasks surviving the clear watermark", ()
     makeSnapshot({ taskId: "new-failed", status: "killed", finishedAt: cutoff + 1 }),
   ];
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, { fg: (_token: string, text: string) => text } as never);
-  assert.match(widget.render(80)[0]!, /✓1 ✗1$/);
+  assert.match(widget.render(80)[0]!, /✓1 · ✗1$/);
   widget.dispose?.();
 });
 

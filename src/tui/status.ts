@@ -24,8 +24,9 @@ export function summarySegments(c: SummaryCounts, now = Date.now()): SummarySegm
     { text: ` ${c.running} running`, token: "accent" },
     ...(c.pending > 0 ? [{ text: ` · ${c.pending} pending`, token: "dim" as const }] : []),
     { text: ` · ${elapsed}`, token: "dim" },
-    { text: ` · ✓${c.completed}`, token: "success" },
-    ...(c.failed > 0 ? [{ text: ` ✗${c.failed}`, token: "error" as const }] : []),
+    // ✓ and ✗ are symmetric: both only appear when non-zero, so an all-failed run shows no green 0.
+    ...(c.completed > 0 ? [{ text: ` · ✓${c.completed}`, token: "success" as const }] : []),
+    ...(c.failed > 0 ? [{ text: ` · ✗${c.failed}`, token: "error" as const }] : []),
   ];
 }
 
