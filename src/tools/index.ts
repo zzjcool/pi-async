@@ -1,6 +1,6 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
-import type { WatchSpec } from "../core/task.ts";
+import { isTerminal, type WatchSpec } from "../core/task.ts";
 
 /**
  * Wrap an extension-tool return value into pi's ToolResultMessage shape.
@@ -21,7 +21,7 @@ function toolResult(payload: unknown, isError = false): { content: Array<{ type:
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], details: { payload }, isError };
 }
 
-const promptGuidelines = "Check commands must not swallow errors with || true; map unknown states to failure; prefer structured output and jq -e; anchor output_matches regexes (compiled with m: ^/$ are line boundaries) to avoid premature matches.";
+const promptGuidelines = "Check commands must not swallow errors with || true; map unknown states to failure; prefer structured output and jq -e; anchor output_matches regexes (compiled with multiline `m`: ^/$ are line boundaries) to avoid premature matches; prefer stdout_contains for simple cases and avoid nested quantifiers.";
 const MAX_LOG_BYTES = 50 * 1024;
 const schema = (properties: Record<string, unknown>, required: string[] = [], allOf: unknown[] = []) => ({ type: "object", properties, required, additionalProperties: false, ...(allOf.length ? { allOf } : {}) });
 const stringField = { type: "string" };
@@ -54,8 +54,8 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry): void {
   api.registerTool({
     name: "async_run", label: "Run async command",
     description: `Run a background, delayed, or synchronous shell command. mode=sync requires timeoutMs; mode=delayed requires delayMs. onTimeout (sync only): "promote" (default) hands the still-running task to background and returns; "abort" stops WAITING only — the command keeps running in the background and will still notify on completion (Esc semantics; does not kill). ${promptGuidelines}`,
-    // Mode-conditional required fields are enforced in execute (precise errors) rather than
-    // allOf/then (host validator emits opaque "must match then schema") — see #45.
+    // Mode-conditional required fields + mode-scoped rejects enforced in execute (#45/#42),
+    // not allOf/then (host validator emits opaque "must match then schema").
     parameters: schema({ command: stringField, name: stringField, mode: { type: "string", enum: ["background", "sync", "delayed"], default: "background" }, timeoutMs: timeoutField, delayMs: timeoutField, taskTimeoutMs: timeoutField, onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote" }, notifyOnCompletion: { type: "boolean" }, triggerOnCompletion: { type: "boolean" }, env: { type: "object", additionalProperties: { type: "string" } }, watch: watchSchema }, ["command"]),
     execute: async (_id, params, signal) => {
       const mode = String(params.mode ?? "background");
@@ -64,6 +64,8 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry): void {
       if (mode === "sync" && params.timeoutMs === undefined) throw new Error("timeoutMs is required for sync mode");
       if (mode === "delayed" && params.delayMs === undefined) throw new Error("delayMs is required for delayed mode");
       if (params.watch !== undefined && mode === "sync") throw new Error("watch is only supported for background and delayed modes");
+      if (mode !== "sync" && params.timeoutMs !== undefined) throw new Error("timeoutMs is only valid for sync mode (use taskTimeoutMs to bound background/delayed tasks)");
+      if (mode !== "delayed" && params.delayMs !== undefined) throw new Error("delayMs is only valid for delayed mode");
       const options = {
         command,
         ...(typeof params.name === "string" ? { name: params.name } : {}),
@@ -89,17 +91,41 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry): void {
     if (maxBytes > MAX_LOG_BYTES) throw new Error("maxBytes must be at most 50 KiB");
     return toolResult(registry.logs(String(params.taskId), { maxBytes, tail: params.tail !== false }));
   } });
-  api.registerTool({ name: "async_status", label: "Async task status", description: "List async tasks and current status.", parameters: schema({ includeHistory: { type: "boolean" } }), execute: async (_id, params) => toolResult(registry.list({ includeHistory: params.includeHistory !== false })) });
-  api.registerTool({ name: "async_kill", label: "Kill async task", description: "Terminate an async task and its process group.", parameters: schema({ taskId: stringField }, ["taskId"]), execute: async (_id, params) => {
-    const taskId = String(params.taskId);
-    let warning: string | undefined;
-    try {
-      await registry.kill(taskId, "user");
-    } catch (error) {
-      // Kill may still have finalized the task; surface confirmation failures as warning (#6).
-      warning = error instanceof Error ? error.message : String(error);
-    }
-    const status = registry.get(taskId)?.status;
-    return toolResult({ taskId, status, ...(warning ? { warning } : {}) }, Boolean(warning && status !== "killed"));
-  } });
+  api.registerTool({
+    name: "async_status", label: "Async task status",
+    description: "List async tasks and current status. Defaults to active (running/pending) only; pass includeHistory:true for up to 50 recent tasks.",
+    parameters: schema({ includeHistory: { type: "boolean" } }),
+    execute: async (_id, params) => {
+      const MAX_HISTORY = 50;
+      if (params.includeHistory === true) {
+        const all = registry.list({ includeHistory: true });
+        return toolResult(all.slice(-MAX_HISTORY));
+      }
+      return toolResult(registry.list({ includeHistory: false }));
+    },
+  });
+  api.registerTool({
+    name: "async_kill", label: "Kill async task", description: "Terminate an async task and its process group.",
+    parameters: schema({ taskId: stringField }, ["taskId"]),
+    execute: async (_id, params) => {
+      const taskId = String(params.taskId);
+      const before = registry.get(taskId);
+      const alreadyTerminal = before !== undefined && isTerminal(before.status);
+      let warning: string | undefined;
+      try {
+        await registry.kill(taskId, "user");
+      } catch (error) {
+        // Kill may still have finalized the task; surface confirmation failures as warning (#6).
+        warning = error instanceof Error ? error.message : String(error);
+      }
+      const after = registry.get(taskId);
+      return toolResult({
+        taskId,
+        status: after?.status,
+        ...(after?.killKind ? { killKind: after.killKind } : {}),
+        alreadyTerminal,
+        ...(warning ? { warning } : {}),
+      }, Boolean(warning && after?.status !== "killed"));
+    },
+  });
 }

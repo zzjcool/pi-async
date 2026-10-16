@@ -9,6 +9,28 @@ export interface WatchOutput {
   stderr: string;
 }
 
+/** Cap regex subject size so catastrophic patterns cannot grow without bound (#24). */
+export const MAX_OUTPUT_MATCH_BYTES = 64 * 1024;
+
+/**
+ * Classic exponential-backtracking shape: a group that itself ends with a
+ * quantifier, then another quantifier — e.g. (a+)+ / (a*)* / (a|b+)+.
+ * Conservative; does not catch every polynomial case.
+ */
+const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*]\)\s*[+*]/;
+
+function rejectDangerousRegex(regex: string): string | undefined {
+  if (NESTED_QUANTIFIER.test(regex)) {
+    return "regex has nested quantifiers (ReDoS risk); simplify or use stdout_contains";
+  }
+  return undefined;
+}
+
+function matchSubject(output: string): string {
+  if (output.length <= MAX_OUTPUT_MATCH_BYTES) return output;
+  return output.slice(-MAX_OUTPUT_MATCH_BYTES);
+}
+
 export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; error: string } {
   const invalid = (error: string) => ({ ok: false as const, error });
   if (!spec || typeof spec !== "object") return invalid("watch must be an object");
@@ -51,6 +73,10 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
           break;
         case "output_matches":
           if (typeof condition.regex !== "string") return invalid(`${location}: regex must be a string`);
+          {
+            const danger = rejectDangerousRegex(condition.regex);
+            if (danger) return invalid(`${location}: ${danger}`);
+          }
           try {
             compiledRegexes.set(condition, new RegExp(condition.regex, "m"));
           } catch {
@@ -224,7 +250,7 @@ function evaluateCondition(condition: Condition, ctx: WatchEvalContext): Conditi
       }
       // Global/sticky expressions otherwise retain lastIndex between watch polls.
       regex.lastIndex = 0;
-      return { status: "matched", matched: regex.test(ctx.output) };
+      return { status: "matched", matched: regex.test(matchSubject(ctx.output)) };
     }
     case "json_path_exists": {
       let root: unknown;

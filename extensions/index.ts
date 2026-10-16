@@ -33,9 +33,29 @@ function registryDataDir(pi: PiCtx): string {
   return join(cwd, ".pi", "async", `${safeSessionId}-${pid}`);
 }
 
+/** Previous init generation; /reload re-runs init without session_shutdown (#44). */
+let activeRegistry: TaskRegistry | undefined;
+let activeDisposeTui: (() => void) | undefined;
+
 /** Wire the task runtime to the host API, degrading optional Pi features gracefully. */
 export async function init(pi: PiCtx): Promise<void> {
+  // Reload replaces the extension runtime; retire the previous generation first so
+  // its processes, watch loops, and timers are released (pi docs: cleanup must be
+  // idempotent across reload / session replacement / exit).
+  if (activeRegistry) {
+    try {
+      activeDisposeTui?.();
+    } catch { /* best effort */ }
+    activeDisposeTui = undefined;
+    try {
+      await activeRegistry.shutdown();
+    } catch (error) {
+      console.error("pi-async: previous registry shutdown during reload failed", error);
+    }
+    activeRegistry = undefined;
+  }
   const registry = new TaskRegistry({ dataDir: registryDataDir(pi) });
+  activeRegistry = registry;
   // NOTE: pi's factory-time ExtensionAPI exposes no `mode`/`ui` — those live on
   // event-handler contexts (pi.on("session_start", (event, ctx) => ...)). TUI
   // registration must therefore bind lazily from the first event context.
@@ -97,11 +117,17 @@ export async function init(pi: PiCtx): Promise<void> {
   }
   if (typeof context.on === "function") new SettleGuard(pi, registry).register();
 
+  activeDisposeTui = () => {
+    if (tui) disposeStatus();
+  };
+
   let shutdownPromise: Promise<void> | undefined;
   if (typeof context.on === "function") {
     context.on("session_shutdown", async () => {
       if (!shutdownPromise) shutdownPromise = (async () => {
-        if (tui) disposeStatus();
+        activeDisposeTui?.();
+        activeDisposeTui = undefined;
+        if (activeRegistry === registry) activeRegistry = undefined;
         await registry.shutdown();
       })();
       await shutdownPromise;
