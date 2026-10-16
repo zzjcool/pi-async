@@ -62,3 +62,31 @@ test("rail consumes wheel to scroll overflow rows", () => {
   assert.deepEqual(widget.handleMouse({ type: "wheel", wheelDelta: 1 } as never), { handled: true });
   assert.equal(renders, 1);
 });
+
+test("rail keyboard PageDown/PageUp scrolls overflow (#13)", () => {
+  const tasks = Array.from({ length: 14 }, (_, i) => makeSnapshot({ taskId: `${i}`, name: `job-${i}`, startedAt: Date.now() - i }));
+  const registry = { list: () => tasks };
+  let renders = 0;
+  const widget = createRailFactory({} as never, registry as never)({ requestRender: () => { renders++; } } as never, { fg: (_token: string, text: string) => text } as never);
+  const before = widget.render(80).join("\n");
+  assert.ok(before.includes("more"));
+  const down = widget.handleInput?.("\u001b[6~");
+  assert.deepEqual(down, { handled: true });
+  assert.ok(renders >= 1);
+  const afterDown = widget.render(80).join("\n");
+  // After scrolling down, the first job should leave the window
+  assert.equal(afterDown.includes("job-0"), false, `after PageDown still has job-0:\n${afterDown}`);
+  widget.handleInput?.("\u001b[5~");
+  const afterUp = widget.render(80).join("\n");
+  assert.ok(afterUp.includes("job-0") || afterUp.includes("more"), `after PageUp:\n${afterUp}`);
+});
+
+test("rail Ctrl+arrow scrolls by page (#13)", () => {
+  const tasks = Array.from({ length: 14 }, (_, i) => makeSnapshot({ taskId: `${i}`, name: `n${i}`, startedAt: Date.now() - i }));
+  let renders = 0;
+  const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender: () => { renders++; } } as never, { fg: (_t: string, text: string) => text } as never);
+  widget.render(80);
+  assert.deepEqual(widget.handleInput?.("\u001b[1;5B"), { handled: true });
+  assert.ok(renders >= 1);
+  assert.equal(widget.handleInput?.("x"), undefined);
+});

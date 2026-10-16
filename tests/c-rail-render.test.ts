@@ -119,3 +119,32 @@ test("createRailFactory keeps pending tasks visible on the rail", () => {
   assert.equal(rows.length, 2);
   assert.ok(rows.some((row) => row.includes("scheduled") && row.includes("pending")));
 });
+
+test("rail row width<=0 returns empty string (#36)", () => {
+  const now = Date.now();
+  const t = makeSnapshot({ name: "mytask", startedAt: now - 5000 });
+  for (const w of [0, -1]) {
+    const row = renderRailRows([t], w, now)[0]!;
+    assert.equal(row, "", `w=${w} should be empty`);
+    assert.ok(Array.from(row).length <= Math.max(0, w));
+  }
+  for (const w of [1, 2]) {
+    const row = renderRailRows([t], w, now)[0]!;
+    assert.ok(Array.from(row).length <= w, `w=${w} len=${Array.from(row).length} row=${JSON.stringify(row)}`);
+  }
+});
+
+test("rail shows overflow indicator when more than 10 tasks (#13)", () => {
+  const theme = { getFgAnsi: () => "\u001b[38;5;70m", fg: (_c: string, t: string) => t };
+  const now = Date.now();
+  const tasks = Array.from({ length: 12 }, (_, i) => makeSnapshot({
+    taskId: `t${i}`,
+    name: `task${String(i).padStart(2, "0")}`,
+    startedAt: now - i,
+  }));
+  const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
+  const rows = widget.render(80);
+  assert.equal(rows.length, 10, "≤10 rows including overflow indicator");
+  assert.ok(rows.some((row) => row.includes("more")), `expected overflow indicator: ${rows.join(" | ")}`);
+  assert.equal(rows.filter((row) => row.startsWith("▶")).length, 9);
+});

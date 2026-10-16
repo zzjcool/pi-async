@@ -11,6 +11,7 @@ type Theme = { fg(color: string, text: string): string; getFgAnsi?(color: string
 export interface RailWidget {
   render(width?: number): string[];
   handleMouse(event: TuiMouseEvent): { handled: boolean } | undefined;
+  handleInput?(data: string): { handled?: boolean } | void;
   dispose?(): void;
 }
 
@@ -62,14 +63,22 @@ function typeColor(theme: Theme, mode: string, used: Swatch[]): string {
 const statePriority: Record<TaskSnapshot["status"], number> = { running: 0, pending: 1, completed: 2, failed: 3, killed: 4 };
 /** Alias for tests / callers still importing elapsed; single source is core/duration. */
 export { formatDuration as elapsed };
+/** Fit a row to at most `width` code points; never exceed the budget (empty when width<=0). */
+export function fitRailRow(row: string, width: number): string {
+  const limit = Math.max(0, Math.floor(width));
+  const cells = Array.from(row);
+  if (cells.length <= limit) return row;
+  if (limit <= 0) return "";
+  return `${cells.slice(0, limit - 1).join("")}…`;
+}
+
 /** Pure, unstyled rail rows; active tasks first and a hard ten-row limit. */
 export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = Date.now()): string[] {
   const rows = snapshots
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
     .slice(0, 10)
     .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${formatDuration(task, now)}`);
-  const limit = Math.max(0, Math.floor(width));
-  return rows.map((row) => Array.from(row).length > limit ? `${Array.from(row).slice(0, Math.max(0, limit - 1)).join("")}…` : row);
+  return rows.map((row) => fitRailRow(row, width));
 }
 
 /** Terminal-task linger window on the rail, overridable for tests. */
@@ -77,6 +86,8 @@ function lingerMsFromEnv(): number {
   const raw = Number(process.env.PI_ASYNC_RAIL_LINGER_MS ?? 30_000);
   return Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
 }
+
+const RAIL_PAGE = 5;
 
 export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onOpenTask?: (taskId: string) => void } = {}): (tui: TUI, theme: Theme) => RailWidget {
   // Factory signature includes the extension context for future host-specific rail integrations.
@@ -91,14 +102,31 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     const ordered = (now = Date.now()): TaskSnapshot[] => registry.list({ includeHistory: true })
       .filter((task) => task.status === "running" || task.status === "pending"
         || (now - (task.finishedAt ?? task.startedAt ?? task.createdAt)) < lingerMs)
-      .sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? b.createdAt));
+      .sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt));
+    const clampScroll = (count: number, taskSlots: number): void => {
+      scroll = Math.max(0, Math.min(scroll, Math.max(0, count - taskSlots)));
+    };
+    const applyScroll = (delta: number): boolean => {
+      const count = ordered().length;
+      if (count <= 10) return false;
+      const taskSlots = 9; // reserve one row for the overflow indicator
+      const next = Math.max(0, Math.min(count - taskSlots, scroll + delta));
+      if (next === scroll) return false;
+      scroll = next;
+      latchedId = undefined;
+      tui.requestRender();
+      return true;
+    };
     const render = (width = 120): string[] => {
       const tasks = ordered();
-      scroll = Math.max(0, Math.min(scroll, Math.max(0, tasks.length - 10)));
-      const visible = tasks.slice(scroll, scroll + 10);
+      const overflow = tasks.length > 10;
+      // Reserve one of the ≤10 rows for the overflow indicator when needed.
+      const taskSlots = overflow ? 9 : 10;
+      clampScroll(tasks.length, taskSlots);
+      const visible = tasks.slice(scroll, scroll + taskSlots);
       hitRows = visible.map((task) => task.taskId);
       const used = [swatch(theme, "error"), swatch(theme, "dim")];
-      return renderRailRows(visible, width).map((row, index) => {
+      const rows = renderRailRows(visible, width).map((row, index) => {
         const task = visible[index];
         if (!task) return row;
         let token = "dim";
@@ -111,15 +139,44 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
           return row;
         }
       });
+      if (overflow) {
+        const hidden = tasks.length - visible.length;
+        const above = scroll;
+        const below = Math.max(0, tasks.length - scroll - visible.length);
+        const label = above > 0 && below > 0
+          ? `… +${hidden} more (↑${above} ↓${below})`
+          : above > 0
+            ? `… +${above} more ↑`
+            : `… +${below} more`;
+        const indicator = fitRailRow(label, width);
+        try {
+          rows.push(theme.fg("dim", indicator) ?? indicator);
+        } catch {
+          rows.push(indicator);
+        }
+        hitRows.push(""); // overflow row is not a task hit target
+      }
+      return rows;
     };
     return {
       render,
+      handleInput(data: string): { handled?: boolean } | void {
+        // PageUp / PageDown, and Ctrl+↑ / Ctrl+↓ when the rail has focus.
+        if (data === "\u001b[5~" || data === "\u001b[1;5A") {
+          return applyScroll(-RAIL_PAGE) ? { handled: true } : undefined;
+        }
+        if (data === "\u001b[6~" || data === "\u001b[1;5B") {
+          return applyScroll(RAIL_PAGE) ? { handled: true } : undefined;
+        }
+        return undefined;
+      },
       handleMouse(event: TuiMouseEvent): { handled: boolean } | undefined {
         const mouse = event as TuiMouseEvent & { type: string; y: number; button?: string; wheelDelta?: number };
         if (mouse.type === "wheel") {
           const count = ordered().length;
           if (count <= 10) return undefined;
-          const next = Math.max(0, Math.min(count - 10, scroll + Math.trunc(mouse.wheelDelta ?? 0)));
+          const taskSlots = 9;
+          const next = Math.max(0, Math.min(count - taskSlots, scroll + Math.trunc(mouse.wheelDelta ?? 0)));
           if (next === scroll) return undefined;
           scroll = next; latchedId = undefined; tui.requestRender(); return { handled: true };
         }
