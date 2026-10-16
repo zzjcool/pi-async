@@ -60,9 +60,13 @@ export interface SyncResult extends RunReceipt {
   promoted: boolean;
 }
 
+export type WaitResultItem = { taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind };
+export type WaitNotReadyItem = { taskId: string; status: "running" | "pending"; elapsedMs: number };
+/** All-terminal → { results }; timeout-only → { notReady }; mixed timeout → { results, notReady } (REV-7 / #43 + #37 kinds). */
 export type WaitOutcome =
-  | { results: Array<{ taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind }> }
-  | { notReady: Array<{ taskId: string; status: "running" | "pending"; elapsedMs: number }> };
+  | { results: WaitResultItem[] }
+  | { notReady: WaitNotReadyItem[] }
+  | { results: WaitResultItem[]; notReady: WaitNotReadyItem[] };
 
 export interface TaskSnapshot {
   taskId: string;

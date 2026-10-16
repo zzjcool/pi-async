@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { killTree, spawnDetached } from "./spawn.ts";
+import { killTree, spawnDetached, streamPaths } from "./spawn.ts";
 import { stripAnsi } from "./output.ts";
 import { envNumber } from "./env.ts";
 import { deriveName, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type WatchSpec, type WaitOutcome } from "./task.ts";
-import { evalConditions, validateWatchSpec, WatchLoop } from "./watch.ts";
+import { evalConditions, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
 
 export interface RegistryEvents {
   onFinalize(snapshot: TaskSnapshot): void;
@@ -80,13 +80,19 @@ export class TaskRegistry {
     let promoted = false;
     try {
       const outcome = await this.wait([task.taskId], timeoutMs, signal);
-      if ("notReady" in outcome && onTimeout === "promote" && !isTerminal(task.status)) {
+      // Timeout / Esc: stop waiting. promote → background + promoted flag; abort → Esc semantics
+      // (keep process, bookkeeping mode becomes background so the receipt is not "sync+running").
+      if ("notReady" in outcome && !isTerminal(task.status)) {
         task.mode = "background";
-        promoted = true;
+        if (onTimeout === "promote") promoted = true;
         this.emitState(task);
       }
     } catch (error) {
       if (!signal?.aborted) throw error;
+      if (!isTerminal(task.status) && task.mode === "sync") {
+        task.mode = "background";
+        this.emitState(task);
+      }
     }
     return this.syncResult(task, promoted);
   }
@@ -178,9 +184,9 @@ export class TaskRegistry {
       if (task.metadata.capped || task.metadata.watchSuccess !== undefined) this.persist(task);
       if (!isTerminal(task.status) && task.watch) {
         try {
-          const output = this.readWatchOutput(task.taskId);
-          if (evalConditions(task.watch.failure_when, { output, exitCode: code })) this.finalize(task, "killed", undefined, "watch_failure");
-          else if (evalConditions(task.watch.success_when, { output, exitCode: code })) {
+          const streams = this.readWatchOutput(task.taskId);
+          if (evalConditions(task.watch.failure_when, { ...streams, exitCode: code })) this.finalize(task, "killed", undefined, "watch_failure");
+          else if (evalConditions(task.watch.success_when, { ...streams, exitCode: code })) {
             task.metadata.watchSuccess = `success_when matched after process exit: ${JSON.stringify(task.watch.success_when)}`;
             this.finalize(task, "completed", code);
           }
@@ -229,11 +235,15 @@ export class TaskRegistry {
     }, delayMs);
   }
 
-  private readWatchOutput(taskId: string): string {
+  private readWatchOutput(taskId: string): WatchOutput {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`Unknown task id: ${taskId}`);
     const outputFile = String(task.metadata.outputFile ?? this.live.get(taskId)?.outputFile ?? join(this.config.dataDir, `${taskId}.output`));
-    return stripAnsi(readFileSync(outputFile, "utf8"));
+    // Missing primary output must throw so WatchLoop blind_checks can fire (#37/#68 test + CONTRACT).
+    const output = stripAnsi(readFileSync(outputFile, "utf8"));
+    const { stdoutFile, stderrFile } = streamPaths(outputFile);
+    const readSide = (file: string): string => existsSync(file) ? stripAnsi(readFileSync(file, "utf8")) : "";
+    return { output, stdout: readSide(stdoutFile), stderr: readSide(stderrFile) };
   }
 
   private syncResult(task: TaskSnapshot, promoted: boolean): SyncResult {
@@ -253,8 +263,13 @@ export class TaskRegistry {
   get(taskId: string): TaskSnapshot | undefined { return this.tasks.get(taskId); }
   list(opts?: { includeHistory?: boolean }): TaskSnapshot[] { const all = [...this.tasks.values()]; return opts?.includeHistory === false ? all.filter((task) => !isTerminal(task.status)) : all; }
 
-  wait(taskIds: string[], timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome> {
-    const uniqueIds = [...new Set(taskIds)];
+  wait(taskIds: string[] | string, timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome> {
+    // A bare string is one id; String is iterable so `[...new Set("uuid")]` would split into characters (#40).
+    const idList = typeof taskIds === "string" ? [taskIds] : taskIds;
+    if (!Array.isArray(idList) || idList.some((id) => typeof id !== "string")) {
+      return Promise.reject(new TypeError(`taskIds must be an array of strings (got ${typeof taskIds})`));
+    }
+    const uniqueIds = [...new Set(idList)];
     const unknown = uniqueIds.filter((id) => !this.tasks.has(id));
     if (unknown.length) return Promise.reject(new Error(`Unknown task id(s): ${unknown.join(", ")}`));
     if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("Wait aborted"));
@@ -270,7 +285,12 @@ export class TaskRegistry {
       const timeout = setTimeout(() => {
         if (settled) return;
         settled = true; cleanup();
-        resolve({ notReady: pending().map((task) => ({ taskId: task.taskId, status: task.status as "running" | "pending", elapsedMs: Date.now() - task.createdAt })) });
+        const still = pending();
+        const finishedIds = uniqueIds.filter((id) => !still.some((task) => task.taskId === id));
+        const notReady = still.map((task) => ({ taskId: task.taskId, status: task.status as "running" | "pending", elapsedMs: Date.now() - task.createdAt }));
+        // REV-7: no finished → pure { notReady }; mixed → { results, notReady }.
+        if (finishedIds.length === 0) resolve({ notReady });
+        else resolve({ results: finishedIds.map((id) => this.waitResult(this.tasks.get(id)!)), notReady });
       }, Math.max(0, timeoutMs));
       const abort = () => { if (settled) return; settled = true; cleanup(); reject(signal?.reason ?? new Error("Wait aborted")); };
       const cleanup = () => { clearTimeout(timeout); signal?.removeEventListener("abort", abort); this.waiters.delete(waiter); };
@@ -304,12 +324,16 @@ export class TaskRegistry {
     }
     if (isTerminal(task.status) && live.processExited) return;
     live.killKind = kind;
+    let confirmed = true;
     if (task.pid && !live.processExited) {
       const result = await killTree(task.pid);
-      if (!result.confirmed) throw new Error("Descendant processes may have leaked");
+      confirmed = result.confirmed;
     }
+    // Finalize first so async_kill can always return { taskId, status } even when the
+    // confirmation probe cannot prove the group is gone (#6).
     if (!isTerminal(task.status)) this.finalize(task, "killed", undefined, kind);
     else if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
+    if (!confirmed) throw new Error("Descendant processes may have leaked");
   }
   cancel(taskId: string): boolean {
     const task = this.tasks.get(taskId);
@@ -330,7 +354,18 @@ export class TaskRegistry {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.closed = true;
     this.shutdownPromise = (async () => {
+      // Pending delayed tasks hold no OS resources. Clear their timers but leave snapshots
+      // as pending so same-process /reload can restore them (CONTRACT reload / #20).
+      for (const task of this.tasks.values()) {
+        if (task.status !== "pending") continue;
+        const live = this.live.get(task.taskId);
+        if (live?.delayTimer) { clearTimeout(live.delayTimer); live.delayTimer = undefined; }
+        const watch = this.watchLoops.get(task.taskId);
+        watch?.stop();
+        this.watchLoops.delete(task.taskId);
+      }
       const ids = [...this.tasks.values()].filter((task) => {
+        if (task.status === "pending") return false;
         const live = this.live.get(task.taskId);
         return !isTerminal(task.status) || (task.pid !== undefined && (live ? !live.processExited : this.pidAlive(task.pid)));
       }).map((task) => task.taskId);
@@ -454,6 +489,11 @@ export class TaskRegistry {
     if (live?.watcher) clearInterval(live.watcher);
     // D4: watch success settles the observed task but leaves the process under its task timeout.
     if (live?.timer && !(task.metadata.watchSuccess !== undefined && !live.processExited)) { clearTimeout(live.timer); live.timer = undefined; }
+    // #15: a waiter already owns this result — set the suppression latch before onFinalize
+    // can claimNotification / sendCompletionNotification.
+    if ([...this.waiters].some((waiter) => waiter.ids.has(task.taskId))) {
+      task.outputConsumed = true;
+    }
     this.persist(task); this.emitState(task); this.events.onFinalize(task);
     for (const waiter of [...this.waiters]) if (waiter.ids.has(task.taskId)) waiter.resolve();
     if (!this.reloading) this.prune();
@@ -470,8 +510,25 @@ export class TaskRegistry {
     } catch { return task.metadata.capped === true; }
   }
   private pidAlive(pid: number): boolean {
-    try { process.kill(-pid, 0); return true; }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+    // Prefer /proc so a zombie-only group is not treated as alive (#6 / reload lost detection).
+    try {
+      for (const entry of readdirSync("/proc")) {
+        if (!/^\d+$/.test(entry)) continue;
+        try {
+          const stat = readFileSync(join("/proc", entry, "stat"), "utf8");
+          const closeParen = stat.lastIndexOf(") ");
+          if (closeParen < 0) continue;
+          const rest = stat.slice(closeParen + 2).split(" ");
+          const state = rest[0];
+          const pgrp = Number(rest[2]);
+          if (pgrp === pid && state !== "Z") return true;
+        } catch { /* raced with exit */ }
+      }
+      return false;
+    } catch {
+      try { process.kill(-pid, 0); return true; }
+      catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+    }
   }
 }
 
