@@ -4,7 +4,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
-import { clearDoneStatus } from "./status.ts";
+import { clearDoneStatus, survivesClearCutoff } from "./status.ts";
 import { tuiHost } from "./host.ts";
 
 const isTui = (pi: unknown): boolean => {
@@ -15,8 +15,9 @@ const isTui = (pi: unknown): boolean => {
 
 const UI_TAIL_BYTES = 128 * 1024;
 const PANEL_ROWS = 12;
-let historyClearedAt = 0;
 const visible = visibleText;
+/** Per-line sanitizer for multiline command display — keeps LF, strips controls/tabs. */
+const visibleLine = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "").replace(/[\t]+/g, " ");
 function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: string; truncated: boolean } {
   const outputPath = task.metadata.outputFile;
   if (typeof outputPath !== "string") return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
@@ -37,12 +38,21 @@ function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: strin
 const frame = (title: string, body: string[], width: number, height: number): string[] => {
   const w = Math.max(8, Math.floor(width));
   const h = Math.max(4, Math.floor(height));
+  // Title prefix is "╭─ " (3) + "─╮" (2) => budget w-5; body "│ "/" │" (2+2) => w-4.
+  const fitTitle = (text: string): string => Array.from(text).slice(0, w - 5).join("").padEnd(w - 5);
   const fit = (text: string): string => Array.from(text).slice(0, w - 4).join("").padEnd(w - 4);
-  const content = [`╭─ ${fit(title)}─╮`, ...body.slice(0, h - 2).map((line) => `│ ${fit(line)} │`), `╰${"─".repeat(w - 2)}╯`];
+  const content = [`╭─ ${fitTitle(title)}─╮`, ...body.slice(0, h - 2).map((line) => `│ ${fit(line)} │`), `╰${"─".repeat(w - 2)}╯`];
   while (content.length < height) content.splice(content.length - 1, 0, `│${" ".repeat(w - 2)}│`);
   // The solid background masks chat rows beneath the overlay, as in legion-viz's live overlay.
   return content;
 };
+
+/** Bare Esc, Kitty CSI-u Escape (key 27), and a lone CSI introducer. */
+export function isEscapeKey(data: string): boolean {
+  if (data === "\u001b") return true;
+  if (data === "\u001b[") return true;
+  return /^\u001b\[27(?:;\d+)*u$/.test(data);
+}
 
 export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
   // Commands/shortcuts are factory-time APIs (they exist on the factory pi); TUI
@@ -58,8 +68,7 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
     description: "Clear async task history",
     handler: (_args, ctx) => {
       if (!isTui(ctx)) return;
-      historyClearedAt = Date.now();
-      clearDoneStatus();
+      clearDoneStatus(); // shared watermark in status.ts (#31)
     },
   });
   // CONTRACT: PI_ASYNC_DOCK_SHORTCUT is disableable ("可 off"). Treat
@@ -92,7 +101,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     } | undefined,
   };
   if (!isTui(pi) || typeof host.ui?.custom !== "function") return;
-  const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => task.createdAt >= historyClearedAt || task.status === "running" || task.status === "pending");
+  const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => survivesClearCutoff(task));
   const custom = host.ui.custom;
   const factory = (tui: unknown, _theme: unknown, _keybindings: unknown, done: (value?: unknown) => void) => {
     let selected = initialTaskId ?? snapshots()[0]?.taskId;
@@ -100,21 +109,37 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     let history = true;
     let confirmKill = false;
     let scroll = 0;
+    let listScroll = 0;
     let follow = true;
     let width = 100;
     let height = process.stdout.rows ?? 24;
     let lastLines: string[] = [];
+    let actionError: string | undefined;
     const requestRender = (): void => {
       (tui as { requestRender?: () => void } | undefined)?.requestRender?.();
     };
+    const filtered = (): TaskSnapshot[] => snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
     const choose = (): TaskSnapshot | undefined => snapshots().find((task) => task.taskId === selected);
+    const listBudget = (): number => Math.max(1, height - 3); // frame borders + hint row
+    const ensureListWindow = (tasks: TaskSnapshot[]): number => {
+      const budget = listBudget();
+      const selIndex = tasks.findIndex((task) => task.taskId === selected);
+      const index = selIndex < 0 ? 0 : selIndex;
+      if (index < listScroll) listScroll = index;
+      if (index >= listScroll + budget) listScroll = index - budget + 1;
+      listScroll = Math.max(0, Math.min(listScroll, Math.max(0, tasks.length - budget)));
+      return listScroll;
+    };
     const renderBody = (): string[] => {
-      const tasks = snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
+      const tasks = filtered();
       if (!detail) {
-        return ["↑/↓ select · Enter details · h history · q close", ...tasks.map((task) => {
+        const start = ensureListWindow(tasks);
+        const budget = listBudget();
+        const rows = tasks.slice(start, start + budget).map((task) => {
           const output = task.status === "running" ? registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text.split(/\r?\n/).filter(Boolean).at(-1) : undefined;
           return `${task.taskId === selected ? "▶" : " "} ${visible(task.name)} · ${task.status} · ${formatDuration(task, Date.now())}${output ? ` · ${visible(output)}` : ""}`;
-        })];
+        });
+        return ["↑/↓ select · Enter details · h history · q close", ...rows];
       }
       const task = choose();
       if (!task) return ["Task not found", "Esc return · q close"];
@@ -123,12 +148,20 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       scroll = Math.min(scroll, Math.max(0, outputLines.length - PANEL_ROWS));
       const tail = outputLines.slice(Math.max(0, outputLines.length - PANEL_ROWS - scroll), outputLines.length - scroll);
       const meta = JSON.stringify(task.metadata);
+      const commandLines = String(task.command ?? "").split(/\r?\n/);
+      const killHint = task.status === "pending"
+        ? "Cancel this pending task? press k again to confirm; any other key cancels"
+        : "Kill this task? press k again to confirm; any other key cancels";
       return [
         `${visible(task.name)} [${task.taskId}]`, `status: ${task.status} · elapsed: ${formatDuration(task, Date.now())}`,
-        `command: ${visible(task.command)}`, `metadata: ${meta}`, `output${output.truncated ? " (tail truncated)" : ""}:`,
+        "command:",
+        ...commandLines.map((line) => `  ${visibleLine(line)}`),
+        `metadata: ${meta}`, `output${output.truncated ? " (tail truncated)" : ""}:`,
         // registry.logs caps its own data at 50 KiB; the TUI intentionally reads a larger 128 KiB tail directly from the output file.
-        ...tail.map(visible), ...(confirmKill ? ["Kill this task? press k again to confirm; any other key cancels"] : []),
-        "Esc return · k kill · R rerun · c copy output path · ↑/↓ scroll",
+        ...tail.map(visible),
+        ...(actionError ? [`error: ${visible(actionError)}`] : []),
+        ...(confirmKill ? [killHint] : []),
+        "Esc return · k kill/cancel · R rerun · c copy output path · ↑/↓ scroll",
       ];
     };
     const render = (nextWidth?: number): string[] => {
@@ -141,9 +174,11 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       return frame(detail ? "Async task detail" : "Async tasks", lastLines, width, height);
     };
     const move = (delta: number): void => {
-      const tasks = snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
+      const tasks = filtered();
       const index = tasks.findIndex((task) => task.taskId === selected);
-      const next = tasks[Math.max(0, Math.min(tasks.length - 1, index + delta))];
+      // Harden dangling selection (filtered away): start from edge rather than relying on -1+delta===0 alone.
+      const base = index < 0 ? (delta > 0 ? -1 : 0) : index;
+      const next = tasks[Math.max(0, Math.min(tasks.length - 1, base + delta))];
       if (next) selected = next.taskId;
       if (detail && delta < 0) { scroll += -delta; follow = false; }
       else if (detail && delta > 0) { scroll = Math.max(0, scroll - delta); follow = scroll === 0; }
@@ -156,22 +191,37 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         const key = data.toLowerCase();
         if (confirmKill && key !== "k") { confirmKill = false; requestRender(); return; }
         if (key === "q") { done(undefined); return; }
-        if (data === "\u001b") { if (detail) { detail = false; confirmKill = false; requestRender(); } else done(undefined); return; }
-        if (key === "h" && !detail) { history = !history; requestRender(); return; }
-        if (data === "\r" || data === "\n") { detail = true; scroll = 0; follow = true; requestRender(); return; }
+        if (isEscapeKey(data)) { if (detail) { detail = false; confirmKill = false; actionError = undefined; requestRender(); } else done(undefined); return; }
+        if (key === "h" && !detail) {
+          history = !history;
+          const tasks = filtered();
+          if (!tasks.some((task) => task.taskId === selected)) selected = tasks[0]?.taskId;
+          listScroll = 0;
+          requestRender();
+          return;
+        }
+        if (data === "\r" || data === "\n") { detail = true; scroll = 0; follow = true; actionError = undefined; requestRender(); return; }
         if (data === "\u001b[A" || data === "k") { if (detail && key === "k") {
           if (!confirmKill) { confirmKill = true; requestRender(); return; }
           confirmKill = false;
           const task = choose();
-          if (task?.status === "running") void registry.kill(task.taskId, "user");
+          if (task?.status === "running" || task?.status === "pending") void registry.kill(task.taskId, "user");
           requestRender(); return;
         } move(-1); return; }
         if (data === "\u001b[B" || key === "j") { move(1); return; }
         if (data === "R" && detail) {
           const task = choose();
           if (task) {
-            try { registry.submit({ command: task.command, name: task.name, mode: "background" }); }
-            catch (error) { host.ui?.notify?.(String(error), "error"); }
+            try {
+              const created = registry.submit({ command: task.command, name: task.name, mode: "background" });
+              selected = created.taskId;
+              scroll = 0;
+              follow = true;
+              actionError = undefined;
+            } catch (error) {
+              actionError = String(error);
+              host.ui?.notify?.(actionError, "error");
+            }
           }
           requestRender(); return;
         }
@@ -195,22 +245,25 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           latchedId = undefined;
           if (detail) return undefined;
           if (event.button !== "left") return undefined;
-          const index = (event.y ?? -1) - 2;
-          const tasks = snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
+          const tasks = filtered();
+          const start = ensureListWindow(tasks);
+          const index = (event.y ?? -1) - 2 + start;
           const task = tasks[index];
           if (!task) return undefined;
           latchedId = task.taskId;
           return { handled: true };
         }
         if (event.type !== "click" || event.button !== "left" || detail) return undefined;
-        const index = (event.y ?? -1) - 2;
-        const tasks = snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
+        const tasks = filtered();
+        const start = ensureListWindow(tasks);
+        const index = (event.y ?? -1) - 2 + start;
         const task = tasks[index];
         if (!latchedId || !task || task.taskId !== latchedId) { latchedId = undefined; return undefined; }
         selected = latchedId;
         detail = true;
         scroll = 0;
         follow = true;
+        actionError = undefined;
         latchedId = undefined;
         requestRender();
         return { handled: true };

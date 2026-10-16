@@ -19,6 +19,9 @@ test("rejects malformed or unsupported JSON paths before scheduling", () => {
   for (const path of ["a.b", "$.a.", "$.a..b", "$.a[-1]", "$.a[*]", "$.a[0"]) {
     assert.deepEqual(validateWatchSpec(validSpec({ success_when: [{ type: "json_path_exists", path }] })).ok, false);
   }
+  const bare = validateWatchSpec(validSpec({ success_when: [{ type: "json_path_exists", path: "ready" }] }));
+  assert.equal(bare.ok, false);
+  if (!bare.ok) assert.match(bare.error, /must start with "\$"/);
   assert.equal(validateWatchSpec(validSpec({ success_when: [{ type: "json_path_exists", path: "$.a.b[0]" }] })).ok, true);
 });
 
