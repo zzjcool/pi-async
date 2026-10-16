@@ -66,10 +66,20 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
       clearDoneStatus();
     },
   });
-  try {
-    host.registerShortcut?.(process.env.PI_ASYNC_DOCK_SHORTCUT ?? "ctrl+alt+a", { description: "Open async task panel", handler: (ctx) => openPanel(ctx, registry) });
-  } catch {
-    // The /async command remains the fallback when Pi reserves this shortcut.
+  // CONTRACT: PI_ASYNC_DOCK_SHORTCUT is disableable ("可 off"). Treat
+  // off/none/false/empty (case-insensitive, trimmed) as skip registration —
+  // otherwise "off" would be registered as a literal key name (#30).
+  // Unset stays the default; only an explicitly set disable value skips.
+  const rawShortcut = process.env.PI_ASYNC_DOCK_SHORTCUT;
+  const normalized = rawShortcut === undefined ? undefined : rawShortcut.trim().toLowerCase();
+  const disabled = normalized !== undefined && ["off", "none", "false", ""].includes(normalized);
+  if (!disabled) {
+    const key = rawShortcut && rawShortcut.trim() ? rawShortcut.trim() : "ctrl+alt+a";
+    try {
+      host.registerShortcut?.(key, { description: "Open async task panel", handler: (ctx) => openPanel(ctx, registry) });
+    } catch {
+      // The /async command remains the fallback when Pi reserves this shortcut.
+    }
   }
 }
 

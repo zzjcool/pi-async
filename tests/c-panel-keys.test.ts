@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openPanel } from "../src/tui/panel.ts";
+import { openPanel, registerPanelCommands } from "../src/tui/panel.ts";
+import { bindTuiHost, resetTuiHostForTests } from "../src/tui/host.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 function create() {
@@ -86,4 +87,45 @@ test("panel list opens a task only after a matching press and click", () => {
   panel.component.handleMouse({ type: "press", button: "left", y: 2 });
   panel.component.handleMouse({ type: "click", button: "left", y: 2 });
   assert.ok(panel.component.render(100).some((line: string) => line.includes("command:")));
+});
+
+function withDockShortcutEnv(value: string | undefined, run: () => void): void {
+  const previous = process.env.PI_ASYNC_DOCK_SHORTCUT;
+  try {
+    if (value === undefined) delete process.env.PI_ASYNC_DOCK_SHORTCUT;
+    else process.env.PI_ASYNC_DOCK_SHORTCUT = value;
+    run();
+  } finally {
+    if (previous === undefined) delete process.env.PI_ASYNC_DOCK_SHORTCUT;
+    else process.env.PI_ASYNC_DOCK_SHORTCUT = previous;
+  }
+}
+
+function registerWithMockHost(): string[] {
+  resetTuiHostForTests();
+  bindTuiHost({ mode: "tui", ui: {} });
+  const shortcuts: string[] = [];
+  registerPanelCommands({
+    mode: "tui",
+    registerShortcut: (key: string) => { shortcuts.push(key); },
+  } as never, {} as never);
+  return shortcuts;
+}
+
+test("PI_ASYNC_DOCK_SHORTCUT=off/none/false/empty skips registerShortcut (#30)", () => {
+  for (const value of ["off", "OFF", "none", "false", "", "  off  ", "  "]) {
+    withDockShortcutEnv(value, () => {
+      const shortcuts = registerWithMockHost();
+      assert.deepEqual(shortcuts, [], `expected no registration for ${JSON.stringify(value)}`);
+    });
+  }
+});
+
+test("PI_ASYNC_DOCK_SHORTCUT unset or custom still registers (#30)", () => {
+  withDockShortcutEnv(undefined, () => {
+    assert.deepEqual(registerWithMockHost(), ["ctrl+alt+a"]);
+  });
+  withDockShortcutEnv("ctrl+shift+p", () => {
+    assert.deepEqual(registerWithMockHost(), ["ctrl+shift+p"]);
+  });
 });
