@@ -1,5 +1,6 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
+import { envNumber } from "../core/env.ts";
 
 export class SettleGuard {
   private readonly maxReminders: number;
@@ -14,7 +15,7 @@ export class SettleGuard {
     this.pi = pi;
     this.registry = registry;
     this.maxReminders = opts?.maxReminders ?? 3;
-    this.heartbeatMs = opts?.heartbeatMs ?? finiteEnvNumber("PI_ASYNC_HEARTBEAT_MS", 60_000);
+    this.heartbeatMs = opts?.heartbeatMs ?? envNumber("PI_ASYNC_HEARTBEAT_MS", 60_000, { integer: true, min: 0 });
   }
 
   register(): void {
@@ -72,7 +73,3 @@ export class SettleGuard {
   }
 }
 
-function finiteEnvNumber(name: string, fallback: number): number {
-  const parsed = Number(process.env[name] ?? fallback);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}

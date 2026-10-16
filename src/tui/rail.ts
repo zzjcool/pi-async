@@ -3,6 +3,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
+import { envNumber } from "../core/env.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
 import { tuiHost } from "./host.ts";
@@ -72,8 +73,7 @@ export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = D
 
 /** Terminal-task linger window on the rail, overridable for tests. */
 function lingerMsFromEnv(): number {
-  const raw = Number(process.env.PI_ASYNC_RAIL_LINGER_MS ?? 30_000);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+  return envNumber("PI_ASYNC_RAIL_LINGER_MS", 30_000, { integer: true, min: 0 });
 }
 
 export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onOpenTask?: (taskId: string) => void } = {}): (tui: TUI, theme: Theme) => RailWidget {
