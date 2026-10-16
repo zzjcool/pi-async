@@ -47,6 +47,7 @@
 export type TaskStatus = "pending" | "running" | "completed" | "failed" | "killed";
 export type TaskMode = "background" | "sync" | "delayed";
 export type KillKind = "user" | "timeout" | "output_cap" | "shutdown" | "watch_failure";
+export type FailureKind = "lost" | "blind_exhausted" | "watch_timeout";  // REV-11
 export const TERMINAL_STATUSES: readonly TaskStatus[];          // completed | failed | killed
 export function isTerminal(s: TaskStatus): boolean;
 export function deriveName(command: string): string;            // ≤48 chars（§3）
@@ -76,12 +77,13 @@ export interface RunReceipt { taskId: string; name: string; status: TaskStatus; 
 export interface SyncResult extends RunReceipt { exitCode?: number; outputTail: string; promoted: boolean; }
 
 export type WaitOutcome =
-  | { results: Array<{ taskId: string; status: TaskStatus; exitCode?: number; outputTail: string }> }
-  | { notReady: Array<{ taskId: string; status: "running" | "pending"; elapsedMs: number }> };
+  | { results: Array<{ taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind }> }
+  | { notReady: Array<{ taskId: string; status: "running" | "pending"; elapsedMs: number }> }
+  | { results: Array<{ taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind }>; notReady: Array<{ taskId: string; status: "running" | "pending"; elapsedMs: number }> }; // REV-7 混合；REV-11 透传 kinds
 
 export interface TaskSnapshot {
   taskId: string; name: string; command: string; mode: TaskMode; status: TaskStatus;
-  pid?: number; exitCode?: number; killKind?: KillKind; failureKind?: "lost";
+  pid?: number; exitCode?: number; killKind?: KillKind; failureKind?: FailureKind;
   createdAt: number; startedAt?: number; finishedAt?: number; dueAt?: number;   // dueAt: delayed
   taskTimeoutMs?: number; notified: boolean; outputConsumed: boolean;
   watch?: WatchSpec; metadata: Record<string, unknown>;   // notified 闩持久化于此（§2）
@@ -137,8 +139,11 @@ export class TaskRegistry {
 export interface NotifyPayload {
   taskId: string; name: string; status: TaskStatus; exitCode?: number;
   outputFile: string; summary?: string; guidance?: string;   // guidance 仅 failed（D5）
+  killKind?: KillKind;                                       // REV-11：有则透传
+  failureKind?: FailureKind;                                 // REV-11
+  summaryTruncated?: boolean;                                // REV-11：cap/tail 截断
 }
-export function buildNotificationXml(p: NotifyPayload): string;   // <async-task-notification> + guidance 等字段
+export function buildNotificationXml(p: NotifyPayload): string;   // + kill-kind/failure-kind/summary-truncated
 export async function sendCompletionNotification(
   pi: PiCtx, registry: TaskRegistry, p: NotifyPayload
 ): Promise<boolean>;  // sendMessage({customType:"async-task-notification"},{deliverAs:"followUp",triggerTurn:true})；
@@ -370,3 +375,4 @@ Step 0 ──► (A ∥ B1 ∥ C 并行开发) ──► merge A ──► B2（
 | 2026-10-15 | REV-3 | §2 output.ts 接口修订：实际输出上限由 `spawn.ts` 的流式 stdout/stderr 捕获与进程组终止实现；删除未被使用的 `OutputCapture` 类，`output.ts` 仅提供 `stripAnsi`。 | reviewer-A F6（死代码/双实现） |
 | 2026-10-15 | REV-4 | CONTRACT §4 增补（B2 reviewer critical F1 裁决）：watch 三条失败路径（failure_when 命中 / blind 耗尽 / watch timeout）finalize 时必须同步 kill 进程组；仅 success_when（D4）留活。消灭「终态任务+活进程」导致的 async_kill 静默 no-op 与 shutdown 永久挂起（探针验证 sleep infinity 场景宿主退不出）。 | reviewer-B2 critical F1（探针验证） |
 | 2026-10-15 | REV-5 | CONTRACT §10 reload 语义收窄（终审 F3 裁决）：reload 恢复仅限同进程存活期内的 /reload；跨 pid 崩溃遗留目录只读留档不恢复（与 v1 不承诺 crash-durability 一致）。另：终审 F1 裁决 triggerOnCompletion:false 走 deliverAs:followUp 不带 triggerTurn（回补 §3 断链）；F2 裁决 panel.ts 实装 PI_ASYNC_DOCK_SHORTCUT（保留 try/catch 回退 /async）。 | reviewer-final 终审 3 major |
+| 2026-10-16 | REV-11 | CONTRACT §2/§4/§6 + PLAN NotifyPayload/TaskSnapshot：完成通知必须透传 `kill-kind`/`failure-kind`/`summary-truncated`；FailureKind 扩为 `lost \| blind_exhausted \| watch_timeout`；保留 KillKind/FailureKind 双轴，不发明统一 reason。实现（onFinalize 传字段、registry 写 blind/timeout 的 failureKind、waitResult 透传）派 Drift。 | #37 Scout dogfood；Alice 同意 Loom 先契约再派实现 |

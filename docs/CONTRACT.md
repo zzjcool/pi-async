@@ -54,8 +54,13 @@ pending --(delay 到期/spawn 成功)--> running --┬-- exit 0 --> completed
 ```
 
 - 状态词汇：`pending | running | completed | failed | killed`；terminal = 后三者。
-- KillKind：`user | timeout | output_cap | shutdown | watch_failure`（watch 条件命中 failure_when →
-  主动 kill，任务记 killed，killKind=watch_failure）。
+- KillKind：`user | timeout | output_cap | shutdown | watch_failure`（进程被主动杀掉的原因）。
+- FailureKind：`lost | blind_exhausted | watch_timeout`（非「退出码失败」、需与 KillKind 并列区分的失败原因）。
+  - `lost`：reload 发现 pid 已死（§10）。
+  - `blind_exhausted`：watch blind_checks 耗尽。
+  - `watch_timeout`：watch `timeoutMs` 到期。
+- **双字段、不统一 reason（REV-11）**：KillKind 答「谁杀的/为何杀进程」；FailureKind 答「任务为何 failed」。
+  禁止发明第三套 `reason` 枚举把两者揉扁——通知与投影字段各自透传已有字段即可。
 - delayed 任务在 pending 期可 cancel（→ killed, kind=user）。
 - `notified` 持久闩（写进 metadata，reload 不重置），单次投递；发送失败回滚重试 ≤3 次。
 
@@ -118,6 +123,9 @@ type Condition =
   三条 watch 失败路径在 finalize 任务的同时**必须 kill 进程组**（与 `failure_when → killed(watch_failure)`
   同语义）；仅 `success_when`（D4）不干预进程。杀失败时响亮上报（kill 链已有 catch），
   绝不允许「终态任务 + 活进程」残留导致 async_kill 静默不杀或 shutdown 挂起。
+  - **终态标注（REV-11）**：`failure_when` → `killed` + `killKind=watch_failure`；blind 耗尽 /
+    watch timeout → `failed` + `killKind=watch_failure` + 对应 `failureKind`
+    （`blind_exhausted` / `watch_timeout`）。三条都杀进程，用 status+failureKind 区分语义。
 
 ## 5. async_wait（唤醒原语，冻结）
 
@@ -140,8 +148,20 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | legion child，跨 turn | **hold 模式**：settle 前守卫上报 busy（见 §7）；上游 #156 busy-hold 落地前，通知可能无法送达——**契约要求 agent 在 legion 环境用 async_wait 收割后再报 verdict**（守卫强制提醒，最多 3 次） |
 
 - 环境检测：`PI_LEGION_NODE_ID` 存在 → legion child 环境，settle 守卫默认开启。
-- 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/output-file/summary/guidance
+- 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/**kill-kind**/**failure-kind**/output-file/summary/**summary-truncated**/guidance
   （guidance 仅 failed 带，completed 纯信息——patty chatter 教训）。
+  - `kill-kind` / `failure-kind`：有值才输出（与 snapshot 同名语义）；模型据此区分非零退出 / output_cap / watch 失败 / lost，无需先 round-trip `async_status`（#37）。
+  - `summary-truncated`：summary 因 output_cap 或通知 tail 上限被截断时输出 `true`，避免把截断前缀误读为完整输出。
+  - **失败原因矩阵（REV-11）**：
+
+    | 原因 | status | killKind | failureKind | 通知要点 |
+    |---|---|---|---|---|
+    | 非零退出 | failed | — | — | exit-code |
+    | output cap | failed | output_cap | — | kill-kind + 常带 summary-truncated |
+    | failure_when 命中 | killed | watch_failure | — | kill-kind（status=killed 已区分） |
+    | blind 耗尽 | failed | watch_failure | blind_exhausted | kill-kind + failure-kind |
+    | watch timeout | failed | watch_failure | watch_timeout | kill-kind + failure-kind |
+    | reload lost | failed | — | lost | failure-kind |
 - 心跳：有 running/pending 任务期间，每 60s `pi.appendEntry` 一条 heartbeat（触发 legion
   `collectArtifactGrowing` 宽限续期）；session jsonl 增长由守卫的提醒消息自然产生，心跳为兜底。
 
