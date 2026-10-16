@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openPanel } from "../src/tui/panel.ts";
+import { isEscapeKey, openPanel } from "../src/tui/panel.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 function create() {
@@ -86,4 +86,32 @@ test("panel list opens a task only after a matching press and click", () => {
   panel.component.handleMouse({ type: "press", button: "left", y: 2 });
   panel.component.handleMouse({ type: "click", button: "left", y: 2 });
   assert.ok(panel.component.render(100).some((line: string) => line.includes("command:")));
+});
+
+test("isEscapeKey recognises bare Esc and Kitty CSI-u variants", () => {
+  assert.equal(isEscapeKey("\u001b"), true);
+  assert.equal(isEscapeKey("\u001b["), true);
+  assert.equal(isEscapeKey("\u001b[27u"), true);
+  assert.equal(isEscapeKey("\u001b[27;1u"), true);
+  assert.equal(isEscapeKey("\u001b[A"), false);
+  assert.equal(isEscapeKey("\u001b[B"), false);
+  assert.equal(isEscapeKey("q"), false);
+});
+
+test("Kitty Escape returns from details to the list", () => {
+  const { component } = create();
+  component.handleInput("\r");
+  assert.ok(component.render(80).some((line: string) => line.includes("command:")));
+  component.handleInput("\u001b[27u");
+  assert.ok(component.render(80).some((line: string) => line.includes("Enter details")));
+});
+
+test("panel frame title/body/bottom share the same code-point width", () => {
+  const { component } = create();
+  for (const w of [120, 60, 30]) {
+    const lines = component.render(w) as string[];
+    for (const line of lines) {
+      assert.equal(Array.from(line).length, w, `w=${w} line=${JSON.stringify(line)} len=${Array.from(line).length}`);
+    }
+  }
 });

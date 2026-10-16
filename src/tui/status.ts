@@ -3,8 +3,12 @@ import type { TaskRegistry } from "../core/registry.ts";
 import { reportActivity } from "../core/bus.ts";
 import { tuiHost } from "./host.ts";
 
+const TERMINAL = new Set(["completed", "failed", "killed"]);
+
+/** Footer: running excludes pending; pending segment only when > 0; done = all terminal. */
 export function formatStatus(active: { running: number; pending: number }, done: number): string {
-  return ` ${active.running + active.pending} running · ${done} done `;
+  const pending = active.pending > 0 ? ` · ${active.pending} pending` : "";
+  return ` ${active.running} running${pending} · ${done} done `;
 }
 
 let clearedAt = 0;
@@ -30,7 +34,7 @@ export function initStatus(pi: PiCtx, registry: TaskRegistry): void {
   const setStatus = bound.ui["setStatus"] as ((key: string, text: string | undefined) => void) | undefined;
   const refresh = (): void => {
     const active = registry.activeCount();
-    const done = registry.list({ includeHistory: true }).filter((task) => task.status === "completed" && (task.finishedAt ?? task.createdAt) >= clearedAt).length;
+    const done = registry.list({ includeHistory: true }).filter((task) => TERMINAL.has(task.status) && (task.finishedAt ?? task.createdAt) >= clearedAt).length;
     setStatus?.("pi-async", formatStatus(active, done));
     reportActivity(pi, active);
   };

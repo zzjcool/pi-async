@@ -62,8 +62,11 @@ function stripAnsi(value: string): string {
   return value.replace(/\u001b(?:\][\s\S]*?(?:\u0007|\u001b\\|\u009c)|\[[0-?]*[ -/]*[@-~]|[PX^_][\s\S]*?\u001b\\|[ -/]*[0-~])|\u009b[0-?]*[ -/]*[@-~]|\u009d[\s\S]*?(?:\u0007|\u001b\\|\u009c)/g, "");
 }
 
-function elapsed(snapshot: TaskSnapshot, now: number): string {
-  const seconds = Math.floor(Math.max(0, now - (snapshot.startedAt ?? snapshot.createdAt)) / 1000);
+/** Pure elapsed label. Terminal states freeze at finishedAt; pending shows an em dash. */
+export function elapsed(snapshot: TaskSnapshot, now: number): string {
+  if (snapshot.status === "pending") return "—";
+  const end = snapshot.finishedAt ?? now;
+  const seconds = Math.floor(Math.max(0, end - (snapshot.startedAt ?? snapshot.createdAt)) / 1000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
   return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
@@ -71,7 +74,7 @@ function elapsed(snapshot: TaskSnapshot, now: number): string {
 
 /** Pure, unstyled rail rows; active tasks first and a hard ten-row limit. */
 export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = Date.now()): string[] {
-  const rows = snapshots.filter((task) => task.status !== "pending")
+  const rows = snapshots
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
     .slice(0, 10)
     .map((task) => `▶ ${stripAnsi(task.name).replace(/[\r\n]+/g, " ")} · ${task.status} · ${elapsed(task, now)}`);
@@ -112,7 +115,11 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         if (task.status === "running") token = typeColor(theme, task.mode, used);
         else if (task.status === "completed") token = "success";
         else if (task.status === "failed") token = "error";
-        return theme.fg(token, row);
+        try {
+          return theme.fg(token, row) ?? row;
+        } catch {
+          return row;
+        }
       });
     };
     return {
