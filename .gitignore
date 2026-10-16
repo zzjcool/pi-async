@@ -3,3 +3,5 @@ node_modules/
 .pi-subagents/
 *.log
 core
+core.*
+*.core
