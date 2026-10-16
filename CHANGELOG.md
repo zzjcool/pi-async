@@ -2,6 +2,20 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## Unreleased
+
+### Breaking / 行为变更
+
+- **footer 状态栏已下架**：不再设置 `pi-async` footer 状态；任务汇总移至 rail 首行。
+- **删除 `ctrl+alt+a` 快捷键**：打开任务面板请使用 `/async` 命令。
+- **删除 `PI_ASYNC_DOCK_SHORTCUT` 环境变量**：升级后此前配置的该变量不再生效。
+- **rail 行数上限从 ≤10 行收紧为 ≤4 行**（含汇总行与溢出指示）。
+- **面板从全屏改为居中百分比尺寸**：列表 80%×70%，从 rail 直入的详情 85%×80%。
+
+### Added
+
+- rail 首行新增汇总：running、pending（非零时）、elapsed、completed 与 failed/killed（非零时）；终态计数遵循 `/async-clear` watermark。
+
 ## 0.2.0 — 2026-10-16
 
 自 0.1.0 起的 16 个提交，主体是 Wave1/Wave2 缺陷修复，附带少量新能力与若干
@@ -47,7 +61,7 @@
 ### 未变更
 
 - 5 个工具（`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill`）
-  的注册面与参数名集合不变；没有删除任何工具、参数或环境变量。
+  的注册面与参数名集合不变；没有删除任何工具或工具参数。`PI_ASYNC_DOCK_SHORTCUT` 属于环境配置而非工具注册面，已在 Unreleased Breaking 节单独记录其删除。
 
 ## 0.1.0 — 2026-10-15
 

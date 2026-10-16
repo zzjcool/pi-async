@@ -60,6 +60,25 @@ test("rail does not consume wheel without overflow", () => {
   assert.equal(widget.handleMouse({ type: "wheel", wheelDelta: 1 } as never), undefined);
 });
 
+test("wheel stays unhandled at the 3-task no-overflow boundary and engages at 4 (#REV-12)", () => {
+  const build = (count: number) => {
+    const tasks = Array.from({ length: count }, (_, i) => makeSnapshot({ taskId: `${i}`, startedAt: Date.now() - i }));
+    const widget = createRailFactory({} as never, { list: () => tasks } as never)(
+      { requestRender() {} } as never,
+      { fg: (_token: string, text: string) => text } as never,
+    );
+    return widget;
+  };
+  // Exactly RAIL_TASK_SLOTS: everything fits, nothing to scroll.
+  const three = build(3);
+  three.render(80);
+  assert.equal(three.handleMouse({ type: "wheel", wheelDelta: 1 } as never), undefined);
+  // One past the slots: the overflow row appears and wheel must take over.
+  const four = build(4);
+  four.render(80);
+  assert.deepEqual(four.handleMouse({ type: "wheel", wheelDelta: 1 } as never), { handled: true });
+});
+
 test("rail consumes wheel to scroll overflow rows", () => {
   const tasks = Array.from({ length: 5 }, (_, i) => makeSnapshot({ taskId: `${i}`, startedAt: Date.now() - i }));
   const registry = { list: () => tasks };

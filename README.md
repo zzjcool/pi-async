@@ -34,16 +34,16 @@ The extension registers five tools:
 |---|---|
 | `/async` | Open the task panel. |
 | `/async-clear` | Clear completed-task history badges. |
-| `Ctrl+Alt+A` | Open the task panel (when the host allows the shortcut; `/async` remains available as fallback). |
 | `↑` / `↓` / `j` / `k` | Select tasks; in task details, scroll output. |
 | `Enter` | Open selected task details. |
 | `h` | Toggle history in the task list. |
 | `k` | Kill a running task (press again to confirm). |
 | `R` | Rerun the selected task command. |
 | `c` | Copy the captured output file path. |
-| `Esc` / `q` | Return from details / close the panel. |
+| `Esc` | Close rail-clicked details; return from list-opened details to the list. |
+| `q` | Close the panel. |
 
-The panel and rail are only enabled in the main Pi TUI session; RPC, print, and child contexts retain the tool surface without TUI entrypoints.
+The rail's first row summarizes running, pending, elapsed, completed, and failed/killed task counts; pending and failed/killed counts are shown only when nonzero. The panel and rail are only enabled in the main Pi TUI session; RPC, print, and child contexts retain the tool surface without TUI entrypoints.
 
 ## Configuration
 
@@ -52,7 +52,6 @@ The panel and rail are only enabled in the main Pi TUI session; RPC, print, and 
 | `PI_ASYNC_MAX_OUTPUT_BYTES` | `20971520` (20 MiB) | Maximum captured output per task; exceeding it terminates the task with `output_cap`. |
 | `PI_ASYNC_MAX_TASKS` | `32` | Maximum concurrent running and pending tasks. |
 | `PI_ASYNC_HEARTBEAT_MS` | `60000` | Settle-guard heartbeat interval in milliseconds. |
-| `PI_ASYNC_DOCK_SHORTCUT` | `ctrl+alt+a` | Configured panel shortcut; the command remains available as fallback. |
 | `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
 | `PI_ASYNC_RAIL_LINGER_MS` | `30000` | How long completed/failed/killed tasks stay on the rail before disappearing. |

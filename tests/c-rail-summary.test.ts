@@ -69,9 +69,15 @@ test("two rail registrations keep one ticker and dispose clears it", () => {
   const originalSetInterval = globalThis.setInterval;
   const originalClearInterval = globalThis.clearInterval;
   const active = new Set<unknown>();
+  const scheduled: Array<{ ms: number; cb: () => void; unref: boolean }> = [];
   let nextId = 0;
-  (globalThis as unknown as { setInterval: typeof setInterval }).setInterval = (() => {
-    const timer = { id: ++nextId, unref() {} } as unknown as ReturnType<typeof setInterval>;
+  (globalThis as unknown as { setInterval: typeof setInterval }).setInterval = ((cb: () => void, ms?: number) => {
+    const meta = { ms: ms ?? 0, cb, unref: false };
+    const timer = {
+      id: ++nextId,
+      unref() { meta.unref = true; return this; },
+    } as unknown as ReturnType<typeof setInterval>;
+    scheduled.push(meta);
     active.add(timer);
     return timer;
   }) as unknown as typeof setInterval;
@@ -90,11 +96,20 @@ test("two rail registrations keep one ticker and dispose clears it", () => {
     const registry = { list: () => [makeSnapshot({ taskId: "run", status: "running" })] };
     registerRail({} as never, registry as never);
     registerRail({} as never, registry as never);
-    const tui = { requestRender() {} };
+    let renders = 0;
+    const tui = { requestRender() { renders += 1; } };
     const theme = { fg: (_token: string, text: string) => text };
     firstFactory!(tui, theme);
     const secondWidget = secondFactory!(tui, theme);
+    // Idempotence: each widget builds a ticker but clears the previous one, so only one stays live.
     assert.equal(active.size, 1);
+    assert.ok(scheduled.length >= 1, "expected the rail to own a ticker");
+    // The live ticker is what keeps elapsed ticking after the footer was retired: pin period, callback and unref.
+    const live = scheduled.at(-1)!;
+    assert.equal(live.ms, 1_000);
+    assert.equal(live.unref, true);
+    live.cb();
+    assert.equal(renders, 1);
     secondWidget.dispose?.();
     assert.equal(active.size, 0);
   } finally {

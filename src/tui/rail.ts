@@ -210,6 +210,11 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         }
         hitRows.push(""); // overflow row is not a task hit target
       }
+      // Bind the ≤4 invariant to RAIL_MAX_LINES so retuning the slot constants cannot silently break it.
+      if (rows.length > RAIL_MAX_LINES) {
+        rows.length = RAIL_MAX_LINES;
+        hitRows.length = RAIL_MAX_LINES;
+      }
       return rows;
     };
     return {

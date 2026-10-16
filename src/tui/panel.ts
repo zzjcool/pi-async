@@ -156,7 +156,10 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     };
     const render = (nextWidth?: number): string[] => {
       width = nextWidth ?? Math.max(20, Math.floor((process.stdout.columns ?? 120) * ratio.w));
-      height = Math.max(6, Math.floor((process.stdout.rows ?? 24) * ratio.h));
+      // Cap by the overlay's own percentage budget too: on very short terminals a fixed floor of 6
+      // exceeds what the host will render and the bottom border gets sliced off.
+      const rows = process.stdout.rows ?? 24;
+      height = Math.min(Math.max(6, Math.floor(rows * ratio.h)), Math.max(4, rows - 2));
       lastLines = renderBody();
       const maxScroll = Math.max(0, lastLines.length - PANEL_ROWS);
       if (follow) scroll = 0;

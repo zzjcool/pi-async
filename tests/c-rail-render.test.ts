@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createRailFactory, elapsed, renderRailRows } from "../src/tui/rail.ts";
+import { createRailFactory, elapsed, renderRailRows, RAIL_MAX_LINES } from "../src/tui/rail.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 test("rail rows are empty when there are no visible tasks", () => {
@@ -147,4 +147,23 @@ test("rail shows overflow indicator when more than 3 tasks (#13)", () => {
   assert.equal(rows.length, 4, "≤4 rows including summary and overflow indicator");
   assert.ok(rows.some((row) => row.includes("more")), `expected overflow indicator: ${rows.join(" | ")}`);
   assert.equal(rows.filter((row) => row.startsWith("▶")).length, 3);
+});
+
+test("rail never exceeds RAIL_MAX_LINES, with or without overflow (#REV-12)", () => {
+  const now = Date.now();
+  for (const count of [1, 2, 3, 4, 9, 14]) {
+    const tasks = Array.from({ length: count }, (_, i) => makeSnapshot({
+      taskId: `t${i}`,
+      name: `task${String(i).padStart(2, "0")}`,
+      startedAt: now - i,
+    }));
+    const widget = createRailFactory({} as never, { list: () => tasks } as never)(
+      { requestRender() {} } as never,
+      { getFgAnsi: () => "\u001b[38;5;70m", fg: (_c: string, t: string) => t } as never,
+    );
+    const rows = widget.render(80);
+    assert.ok(rows.length <= RAIL_MAX_LINES, `${count} tasks produced ${rows.length} rows (max ${RAIL_MAX_LINES})`);
+    // Summary row first, then task rows; hit targets must stay aligned with what was rendered.
+    assert.ok(rows.length >= 2, `expected summary + at least one task row for ${count} tasks`);
+  }
 });

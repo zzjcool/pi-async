@@ -10,7 +10,7 @@
 ## 0. 目标与不做的事
 
 **目标**：按契约交付 pi-async v1 —— 任务注册表 + background/sync/delayed 三模式 + watch 条件引擎 +
-完成唤醒链路 + settle 守卫/OSC 上报 + 主会话 TUI（轨道图/面板/footer）。
+完成唤醒链路 + settle 守卫/OSC 上报 + 主会话 TUI（轨道图汇总行/百分比尺寸面板）。
 
 **Non-goals**（除契约 §0 刻意不做清单外，本计划额外声明）：
 - 不改 `vendor/reference/`（只读参考）；不改 pi-legion / pi 本体（D8）。
@@ -199,8 +199,9 @@ export class WatchLoop {
 ```ts
 // ===== src/tui/*（Line C；所有入口自检 pi.mode === "tui"，D6；custom() 返回 undefined 即 return）=====
 // rail.ts（REV-1 修订：渲染纯函数与可交互 widget 工厂拆开，事件与注册归 registerRail）
-export function renderRailRows(snapshots: TaskSnapshot[], width: number): string[];
-// 纯渲染：每行 '▶ name · state · elapsed'；≤10 行；空闲返回 []（单测锚点）
+export function renderRailRows(snapshots: TaskSnapshot[], width: number, now?: number): string[];
+// RAIL_MAX_LINES=4（含汇总），RAIL_TASK_SLOTS=3，RAIL_TASK_SLOTS_OVERFLOW=2
+// 纯渲染：每行 '▶ name · state · elapsed'；任务行内部上限 3；空闲返回 []（widget 可见空时不渲染）
 export interface RailWidget {
   render: (width?: number) => string[];
   handleMouse: (event: TuiMouseEvent) => { handled: boolean } | undefined;  // wheel 滚动；press→latch→click 同任务才触发 onOpenTask
@@ -213,13 +214,20 @@ export function registerRail(pi: PiCtx, registry: TaskRegistry): void;
 // 工厂捕获 tui/theme（legion status.ts 同款），dispose 清 ticker
 // status.ts
 export function initStatus(pi: PiCtx, registry: TaskRegistry): void;
-// setStatus("pi-async", " N running · M done ") + 经 bus.reportActivity 上报
+export interface SummaryCounts { running: number; pending: number; completed: number; failed: number; longestRunningStartedAt?: number }
+export type SummaryToken = "accent" | "dim" | "success" | "error";
+export interface SummarySegment { text: string; token: SummaryToken }
+export function summarySegments(c: SummaryCounts, now?: number): SummarySegment[];
+export function formatSummary(c: SummaryCounts, now?: number): string;
+// 汇总段序 ▶ N running · N pending · <elapsed> · ✓N ✗N；pending/✗N 仅非零显示；无 running 时 elapsed=—
+// initStatus 仅通过 bus.reportActivity 上报；不再调用 setStatus。clear watermark 谓词由 panel 与 /async-clear 共用
 // panel.ts
 export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void;
-// /async、/async-clear、Ctrl+Alt+A（registerShortcut 冲突→回退 /async，不硬抢）
+// /async、/async-clear（无键盘快捷键）
 export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: string): void;
-// ctx.ui.custom({overlay:true, overlayOptions:{width:"100%",maxHeight:"100%",anchor:"top-left",row:0,col:0}})
-// 自绘 mask+frame（改造 vendor/reference/legion-viz，保留 MIT attribution 注释，§12）
+// ctx.ui.custom(factory, {overlay:true, overlayOptions:{width:"80%",maxHeight:"70%",anchor:"center"}})
+// rail 点击直入详情使用 width:"85%", maxHeight:"80%"；固定百分比尺寸
+// Esc：rail 来源详情关闭；列表来源详情回落列表。自绘 mask+frame（保留 MIT attribution 注释，§12）
 ```
 
 ```ts
@@ -302,14 +310,17 @@ export async function init(pi: PiCtx): Promise<void> {
 - verify：`["npm run typecheck", "npm test"]`。
 
 ### Line C — TUI（与 A/B1 并行）
-**C1 轨道图 + footer + 全屏面板**
+**C1 轨道图汇总行 + 面板**
 - 文件：`src/tui/rail.ts`、`src/tui/status.ts`、`src/tui/panel.ts`、
   `tests/c-rail-render.test.ts`、`tests/c-panel-keys.test.ts`、`tests/c-status-format.test.ts`。
-- 要点：§8 全部冻结项——rail ≤10 行（单测断言行数）、空闲不渲染、palette 延迟解析+OKLab 撞色回退、
-  press→latch→click、wheel；footer 格式串；面板 overlay 参数冻结值、自绘 mask+frame（改造 legion-viz，
-  **保留 MIT attribution 注释**）、h 历史切换、详情+tail（128KiB UI 缓冲/12 行跟随/上滚暂停）、k/R/c/Esc、
-  running 最新输出行 pill（复用 `core/output.stripAnsi`）；所有入口 `pi.mode === "tui"` guard +
-  `custom()` 返回 undefined 兜底（D6）；shortcut 冲突回退 `/async`。
+- 要点：§8 全部冻结项——rail 最多 4 行（汇总 1 + 任务最多 3；溢出时汇总 1 + 任务 2 + 指示 1），
+  空闲不渲染、palette 延迟解析+OKLab 撞色回退、press→latch→click、wheel；汇总段序/条件显示/着色与
+  clear watermark 计数；1Hz ticker 归 rail widget；footer 已弃用，`initStatus` 仅 `reportActivity`；
+  面板 overlay 参数冻结值（列表 80%×70%，rail 详情 85%×80%，均 `anchor:"center"`）、自绘 mask+frame
+  （**保留 MIT attribution 注释**）、h 历史切换、详情+tail（128KiB UI 缓冲/12 行跟随/上滚暂停）、
+  k/R/c/Esc（rail 来源详情 Esc 关闭，列表来源详情 Esc 回落列表）；running 最新输出行 pill（复用
+  `core/output.stripAnsi`）；所有入口 `pi.mode === "tui"` guard + `custom()` 返回 undefined 兜底（D6）。
+  无 `Ctrl+Alt+A` 快捷键，不配置快捷键环境变量。
 - 依赖：仅 Step 0（fake snapshot 流驱动渲染单测）；真 registry 联动留给 Step I。
 - verify：`["npm run typecheck", "npm test"]`。
 
@@ -381,3 +392,4 @@ Step 0 ──► (A ∥ B1 ∥ C 并行开发) ──► merge A ──► B2（
 | 2026-10-16 | REV-9 | CONTRACT §1 模块图与 §6：notify **不合并**——v1 每任务一条通知；去掉「合并」假承诺。真 debounce 合并另开后续 REV。 | Loom Wave2（#47） |
 | 2026-10-16 | REV-10 | CONTRACT §4 / watch：`output_matches` 固定 `m` 编译，使契约推荐的行锚定（`^READY$`）在多行输出上可用。 | Loom Wave2（#48） |
 | 2026-10-16 | REV-11 | CONTRACT §2/§4/§6 + PLAN NotifyPayload/TaskSnapshot：完成通知必须透传 `kill-kind`/`failure-kind`/`summary-truncated`；FailureKind 扩为 `lost \| blind_exhausted \| watch_timeout`；保留 KillKind/FailureKind 双轴，不发明统一 reason。实现（onFinalize 传字段、registry 写 blind/timeout 的 failureKind、waitResult 透传）派 Drift。 | #37 Scout dogfood；Alice 同意 Loom 先契约再派实现 |
+| 2026-10-16 | REV-12 | CONTRACT §8 + PLAN Line C：①弃用 footer，不再 setStatus，汇总并入 rail 首行；initStatus 仅 reportActivity。原 status.ts 的 1Hz interval 是全局唯一周期 tick，故移至 rail widget，避免删 footer 后 elapsed 冻结，保留 clearedAtMs/survivesClearCutoff/clearDoneStatus 供 panel 与 /async-clear 共用。② rail 限为 ≤4 行（含汇总），renderRailRows 内部任务上限 3；溢出为汇总+2 任务+指示，不溢出最多汇总+3 任务；空闲 widget 仍返回 []。③面板改固定百分比居中尺寸：列表 80%×70%，rail 详情 85%×80%，不设环境变量。④ openPanel 按来源分叉 Esc：rail 详情关闭，列表详情回列表。⑤删除 ctrl+alt+a shortcut 与 PI_ASYNC_DOCK_SHORTCUT 环境变量，保留 /async 和 /async-clear。 | TUI 实际实现及测试冻结口径；用户拍板不需要快捷键 |
