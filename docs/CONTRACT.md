@@ -131,13 +131,18 @@ type Condition =
 
 ```ts
 async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（schema enforce）
-// → 全部到达终态：{ results: Array<{taskId, status, exitCode?, outputTail}> }
-// → 超时：{ notReady: Array<{taskId, status: "running"|"pending", elapsedMs}> }（不杀任务）
+// 返回三态（REV-7）：
+// → 全终态：{ results: Array<{taskId, status, exitCode?, outputTail}> }
+// → 超时且无已完成：{ notReady: Array<{taskId, status: "running"|"pending", elapsedMs}> }（不杀任务）
+// → 混合超时：{ results, notReady }（已完成走 waitResult/consume，抑制通知 chatter；未就绪不杀）
 ```
 
 - 事件驱动：await 内部 waiter（任务 finalize 时 resolve），**禁止 sleep 轮询**（patty 教训）。
 - 支持 AbortSignal（Esc）；中断等待不中断任务。
 - 消费即抑制：async_wait 取回结果的任务，完成通知被 `outputConsumed` 闩抑制（防 chatter）。
+- **REV-7 裁决（#43）**：原契约只写「全终态 → results」与「超时 → notReady」两极，导致混合超时
+  路径丢弃已完成结果、且无法对已完成侧置 `outputConsumed`（通知抑制失效）。正式登记超集三态：
+  判据仍是「有 notReady ⇒ 超时分支」；`results` 可选并存。实现见 #56，本 REV 只改契约。
 
 ## 6. 唤醒链路与 legion 兼容（冻结）
 
@@ -268,7 +273,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 4. delayed：delayMs 后启动；pending 期 cancel；reload 后恢复
 5. watch：stdout_contains/output_matches 命中 completed；failure_when 命中 killed(watch_failure)；
    非法 regex 启动前拒绝
-6. async_wait：多任务等待全部终态；timeout 返回 notReady 且任务存活；Esc 中断不杀任务
+6. async_wait：多任务等待全部终态；timeout 返回 notReady 且任务存活；混合超时同时含 results+notReady（已完成侧已 consume）；Esc 中断不杀任务
 7. 输出安全：注入 ANSI 转义的任务输出，async_logs 返回已剥离
 8. kill：进程组全灭（子进程不残留）；20MiB 超限 kill(output_cap)
 9. settle 守卫：有未决任务时 agent_before_settle 注入提醒并 continue；3 次后放行
