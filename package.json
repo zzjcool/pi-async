@@ -1,6 +1,6 @@
 {
   "name": "pi-async",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension for async shell tasks: background/delayed/sync modes, output-matching watches, event-driven waiting, settle guard for legion children, and a TUI task rail — completion notifications wake your session.",
   "type": "module",
   "license": "MIT",
@@ -39,7 +39,8 @@
     "src/",
     "README.md",
     "LICENSE",
-    "docs/CONTRACT.md"
+    "docs/CONTRACT.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",

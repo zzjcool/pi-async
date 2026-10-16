@@ -88,8 +88,9 @@ make qa-up && make qa-tui SCENARIO=s1   # deterministic TUI scenario
 
 `make run` reuses an already-running container, so it never tears down your session.
 
-See [test/docker/README.md](test/docker/README.md) for the two containers, the
-required mounts, and why L3 must not be skipped.
+The container QA setup itself lives in `test/docker/` (not shipped in the npm
+package). See its README in the repository for the two containers, the required
+mounts, and why L3 must not be skipped.
 
 ## Known upstream issue (print mode)
 
