@@ -88,7 +88,10 @@ async_run({
 ```
 
 **返回（receipt）**：`{ taskId, name, status, mode, outputHint }`；sync 模式返回
-`{ ...receipt, exitCode, outputTail }`。所有任务启动 ≤30s admission 预检，shutdown 先 drain 再退出。
+`{ ...receipt, exitCode, outputTail }`。所有任务**同步启动**：spawn 成功即返回 `running`；
+spawn 失败立即抛错，无重试等待。admission 检查为 closed / maxTasks / 空命令，均同步完成。
+shutdown 先 drain 再退出。
+（**REV-6 裁决**：原「≤30s admission 预检」从未实现且与同步 spawn 设计冲突，改为描述现状；见 #29。）
 
 **工具集（5 个）**：`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill`。
 命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。
@@ -101,22 +104,24 @@ interface WatchSpec {
   timeoutMs: number;                  // watch 必填：watch 期限（schema enforce）
   success_when: Condition[];          // 任一命中 → 任务完成语义（不干预进程，见下）
   failure_when: Condition[];          // 任一命中 → kill(kind=watch_failure)
-  blind_checks?: number;              // 默认 3：连续 N 次无法求值 → failed
+  blind_checks?: number;              // 默认 3：连续 N 次「检查基础设施失败」(readOutput 抛错等)
+                                      // → failed；「尚未可判定」为 pending，不累计（见下方 REV-2）
 }
 type Condition =
   | { type: "exit_code"; equals: number }
   | { type: "stdout_contains"; value: string }
   | { type: "stderr_contains"; value: string }
-  | { type: "json_path_exists"; path: string }        // $.a.b[0] 形式，启动前校验
-  | { type: "output_matches"; regex: string }         // 合并输出流匹配；编译带 m（^/$ 按行）
+  | { type: "json_path_exists"; path: string }        // 必须以 $ 开头，如 $.a.b[0]；启动前校验；tool schema 含 pattern/description（#12）
+  | { type: "output_matches"; regex: string }         // 合并输出流匹配（设备码等）；编译带 m（^/$ 按行）
 ```
 
 - `success_when` 命中 → **不杀进程**：任务标 completed，通知带命中详情；进程按 taskTimeoutMs/kill 自然管理。
   （区别于 better-bg 的 check 命令模式：我们 watch 的是**已存在任务**的输出/退出。）
 - 条件在 async_run 时**启动前校验**，非法 regex/JSON path 直接拒绝（不产生 pending 任务）。
-- **blind_checks 语义（REV-2 澄清）**：仅计「检查基础设施失败」（readOutput 抐错等）；
+- **blind_checks 语义（REV-2 澄清）**：仅计「检查基础设施失败」（readOutput 抛错等）；
   「尚未可判定」（exit_code 未退出 / json_path 输出尚非 JSON）为 **pending 态，不累计 blind、照常
-  继续轮询**。两者是不同语义，禁止合并。
+  继续轮询**。两者是不同语义，禁止合并。条件持续 pending 时**不**触发 blind 兜底，仅由
+  `timeoutMs` 结束 watch（WatchSpec 字段注释已与本条对齐，见 #27）。
 - promptGuidelines（写进工具 description）：check 不要 `|| true` 自吞错误；未知态映射失败；
   结构化输出优先 jq -e；`output_matches` 的 regex 须加锚定防止过早匹配（编译固定带 `m`，
   `^`/`$` 按行边界，故 `^READY$` 可命中多行输出中的某一行）。
