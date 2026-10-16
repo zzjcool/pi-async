@@ -2,28 +2,43 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isEscapeKey, openPanel } from "../src/tui/panel.ts";
 import { makeSnapshot } from "./helpers/index.ts";
+import type { TaskSnapshot } from "../src/core/task.ts";
 
-function create() {
+function create(opts: {
+  tasks?: TaskSnapshot[];
+  submit?: (options: unknown) => TaskSnapshot;
+  notify?: (message: string, level?: string) => void;
+} = {}) {
   let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => any) | undefined;
   let closed = false;
   const killed: string[] = [];
   const submitted: unknown[] = [];
   const copied: string[] = [];
-  const task = makeSnapshot({ metadata: { outputFile: "/tmp/task.log" } });
+  const notified: { message: string; level?: string }[] = [];
+  const task = opts.tasks?.[0] ?? makeSnapshot({ metadata: { outputFile: "/tmp/task.log" } });
+  const tasks = opts.tasks ?? [task];
   const registry = {
-    list: () => [task],
-    get: (id: string) => id === task.taskId ? task : undefined,
+    list: () => tasks,
+    get: (id: string) => tasks.find((t) => t.taskId === id),
     logs: () => ({ text: "\u001b]0;pwned\u0007line\n", truncated: false, fullPath: "/tmp/task.log" }),
     kill: async (id: string) => { killed.push(id); },
-    submit: (options: unknown) => { submitted.push(options); return task; },
+    submit: (options: unknown) => {
+      submitted.push(options);
+      if (opts.submit) return opts.submit(options);
+      return task;
+    },
   };
   const ui = {
     custom: (f: typeof factory, options: unknown) => { factory = f; assert.deepEqual(options, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 } }); return Promise.resolve(); },
     copyToClipboard: (value: string) => copied.push(value),
+    notify: (message: string, level?: string) => {
+      notified.push({ message, level });
+      opts.notify?.(message, level);
+    },
   };
   openPanel({ mode: "tui", ui } as never, registry as never);
   const component = factory!({ requestRender() {} }, {}, {}, () => { closed = true; });
-  return { component, task, killed, submitted, copied, get closed() { return closed; } };
+  return { component, task, tasks, killed, submitted, copied, notified, get closed() { return closed; } };
 }
 
 test("Enter opens task details and Escape returns to the list", () => {
@@ -44,6 +59,19 @@ test("kill requires a second confirmation key", async () => {
   assert.deepEqual(killed, ["task-1"]);
 });
 
+test("k can cancel a pending task (#11)", async () => {
+  const pending = makeSnapshot({ taskId: "pend-1", name: "sched", status: "pending", mode: "delayed" });
+  const { component, killed } = create({ tasks: [pending] });
+  component.handleInput("\r");
+  const confirm = component.render(100).join("\n");
+  component.handleInput("k");
+  assert.match(component.render(100).join("\n"), /Cancel this pending task/);
+  component.handleInput("k");
+  await Promise.resolve();
+  assert.deepEqual(killed, ["pend-1"]);
+  void confirm;
+});
+
 test("h toggles historical tasks and q closes the panel", () => {
   const panel = create();
   panel.component.handleInput("h");
@@ -51,11 +79,35 @@ test("h toggles historical tasks and q closes the panel", () => {
   assert.equal(panel.closed, true);
 });
 
-test("detail R reruns the original command", () => {
-  const panel = create();
+test("detail R reruns and follows the new task (#9)", () => {
+  const original = makeSnapshot({ taskId: "old", name: "victim", command: "sleep 1", metadata: { outputFile: "/tmp/old.log" } });
+  const created = makeSnapshot({ taskId: "new", name: "victim", command: "sleep 1", metadata: { outputFile: "/tmp/new.log" } });
+  const tasks = [original];
+  const panel = create({
+    tasks,
+    submit: (options) => {
+      tasks.push(created);
+      return created;
+    },
+  });
+  panel.component.handleInput("\r");
+  assert.ok(panel.component.render(100).some((line: string) => line.includes("[old]")));
+  panel.component.handleInput("R");
+  assert.deepEqual(panel.submitted, [{ command: "sleep 1", name: "victim", mode: "background" }]);
+  const detail = panel.component.render(100).join("\n");
+  assert.ok(detail.includes("[new]"), `expected detail to follow new task, got:\n${detail}`);
+  assert.equal(detail.includes("[old]"), false);
+});
+
+test("detail R surfaces submit failure in the panel (#9)", () => {
+  const panel = create({
+    submit: () => { throw new Error("admission denied"); },
+  });
   panel.component.handleInput("\r");
   panel.component.handleInput("R");
-  assert.deepEqual(panel.submitted, [{ command: panel.task.command, name: panel.task.name, mode: "background" }]);
+  const detail = panel.component.render(100).join("\n");
+  assert.match(detail, /error:.*admission denied/);
+  assert.ok(panel.notified.some((n) => n.message.includes("admission denied")));
 });
 
 test("detail c copies the output path", () => {
@@ -73,6 +125,23 @@ test("detail sanitizes ANSI and bare control characters in task fields and outpu
   const rendered = panel.component.render(100).join("\\n");
   assert.equal(rendered.includes("\u001b"), false);
   assert.equal(rendered.includes("\u0007"), false);
+});
+
+test("detail shows multiline command without folding newlines (#14)", () => {
+  const task = makeSnapshot({
+    taskId: "ml",
+    name: "multi",
+    command: "echo one\necho two\nsleep 5",
+    metadata: { outputFile: "/tmp/ml.log" },
+  });
+  const { component } = create({ tasks: [task] });
+  component.handleInput("\r");
+  const lines = component.render(100) as string[];
+  assert.ok(lines.some((line) => line.includes("command:")));
+  assert.ok(lines.some((line) => /  echo one/.test(line)));
+  assert.ok(lines.some((line) => /  echo two/.test(line)));
+  assert.ok(lines.some((line) => /  sleep 5/.test(line)));
+  assert.equal(lines.some((line) => line.includes("echo one echo two")), false);
 });
 
 test("RPC mode does not call custom UI", () => {
@@ -114,4 +183,45 @@ test("panel frame title/body/bottom share the same code-point width", () => {
       assert.equal(Array.from(line).length, w, `w=${w} line=${JSON.stringify(line)} len=${Array.from(line).length}`);
     }
   }
+});
+
+test("list scrolls so selection stays visible (#38)", () => {
+  const tasks = Array.from({ length: 40 }, (_, i) => makeSnapshot({
+    taskId: `t${String(i).padStart(2, "0")}`,
+    name: `task${String(i).padStart(2, "0")}`,
+    status: "running",
+    startedAt: Date.now() - i,
+  }));
+  const { component } = create({ tasks });
+  const prevRows = process.stdout.rows;
+  Object.defineProperty(process.stdout, "rows", { value: 14, configurable: true });
+  try {
+    for (let i = 0; i < 25; i++) component.handleInput("\u001b[B");
+    const lines = component.render(80) as string[];
+    const body = lines.join("\n");
+    assert.ok(body.includes("▶"), `selection marker missing after scroll:\n${body}`);
+    assert.ok(/▶\s+task2[0-9]/.test(body) || /▶\s+task3[0-9]/.test(body), `expected selected row in view:\n${body}`);
+  } finally {
+    Object.defineProperty(process.stdout, "rows", { value: prevRows, configurable: true });
+  }
+});
+
+test("toggling history keeps a visible selection (#39)", () => {
+  const tasks = [
+    makeSnapshot({ taskId: "run0", name: "run0", status: "running", startedAt: 1 }),
+    makeSnapshot({ taskId: "run1", name: "run1", status: "running", startedAt: 2 }),
+    makeSnapshot({ taskId: "run2", name: "run2", status: "running", startedAt: 3 }),
+    makeSnapshot({ taskId: "done0", name: "done0", status: "completed", finishedAt: 10, startedAt: 5 }),
+    makeSnapshot({ taskId: "done1", name: "done1", status: "completed", finishedAt: 11, startedAt: 6 }),
+    makeSnapshot({ taskId: "done2", name: "done2", status: "completed", finishedAt: 12, startedAt: 7 }),
+  ];
+  const { component } = create({ tasks });
+  // history defaults on; move to last terminal task
+  for (let i = 0; i < 5; i++) component.handleInput("\u001b[B");
+  let body = component.render(100).join("\n");
+  assert.ok(body.includes("▶"), "precondition: selection visible with history on");
+  component.handleInput("h"); // history off → terminal tasks filtered
+  body = component.render(100).join("\n");
+  assert.ok(body.includes("▶"), `selection should remain after history off:\n${body}`);
+  assert.ok(/▶\s+run/.test(body), `expected a running task selected:\n${body}`);
 });
