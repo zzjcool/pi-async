@@ -1,0 +1,30 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN",
+            "mode": "background",
+            "command": "sleep 120"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称中文名称",
+            "mode": "background",
+            "command": "sleep 120"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Named long."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

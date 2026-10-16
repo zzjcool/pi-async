@@ -1,0 +1,6 @@
+start a long task
+~5
+#before
+/reload
+~4
+#after-reload

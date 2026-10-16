@@ -1,0 +1,25 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo ERR_OUTPUT && exit 3",
+            "name": "fail",
+            "mode": "background"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    }
+  ]
+}

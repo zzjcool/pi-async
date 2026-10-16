@@ -5,3 +5,7 @@ node_modules/
 /core
 core.*
 *.core
+
+# container QA artifacts (test/docker, see test/docker/README.md)
+test/tui/artifacts/
+__pycache__/

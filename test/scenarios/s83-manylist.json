@@ -1,0 +1,126 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t00",
+            "mode": "background",
+            "command": "sleep 100"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t01",
+            "mode": "background",
+            "command": "sleep 101"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t02",
+            "mode": "background",
+            "command": "sleep 102"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t03",
+            "mode": "background",
+            "command": "sleep 103"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t04",
+            "mode": "background",
+            "command": "sleep 104"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t05",
+            "mode": "background",
+            "command": "sleep 105"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t06",
+            "mode": "background",
+            "command": "sleep 106"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t07",
+            "mode": "background",
+            "command": "sleep 107"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t08",
+            "mode": "background",
+            "command": "sleep 108"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t09",
+            "mode": "background",
+            "command": "sleep 109"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t10",
+            "mode": "background",
+            "command": "sleep 110"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t11",
+            "mode": "background",
+            "command": "sleep 111"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t12",
+            "mode": "background",
+            "command": "sleep 112"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t13",
+            "mode": "background",
+            "command": "sleep 113"
+          }
+        }
+      ]
+    },
+    {
+      "text": "14 tasks."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "mode": "background",
+            "command": "printf 'EVIL\u0007\f\bNAME' && sleep 60"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

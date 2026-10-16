@@ -1,0 +1,7 @@
+run a task whose output contains raw control characters
+~8
+/async
+~3
+!C-m
+~3
+#panel-raw-c0

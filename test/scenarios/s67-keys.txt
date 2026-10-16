@@ -1,0 +1,3 @@
+run two tasks each with its own watch
+~10
+#both-watches-fired

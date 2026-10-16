@@ -1,0 +1,3 @@
+start three tasks that finish together
+~14
+#after-all-complete

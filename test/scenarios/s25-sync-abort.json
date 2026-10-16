@@ -1,0 +1,24 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "aborted",
+            "mode": "sync",
+            "timeoutMs": 5000,
+            "onTimeout": "abort",
+            "command": "sleep 30 && echo NEVER_PRINTED"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Sync aborted."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

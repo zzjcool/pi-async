@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "inline",
+            "mode": "background",
+            "command": "echo \"\u6b63\u5728\u5904\u7406\u7b2c1234567890\u4e2a\u6587\u4ef6\u7684\u4e2d\u6587\u8f93\u51fa\u5185\u5bb9\u6d4b\u8bd5\"; sleep 300"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

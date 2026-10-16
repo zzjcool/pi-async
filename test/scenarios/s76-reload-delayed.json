@@ -1,0 +1,29 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "sched",
+            "mode": "delayed",
+            "delayMs": 30000,
+            "command": "echo FIRED_AFTER_RELOAD"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Scheduled."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    },
+    {
+      "text": "c"
+    }
+  ]
+}

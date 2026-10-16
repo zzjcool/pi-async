@@ -1,0 +1,3 @@
+run a task and watch for a failure string
+~8
+#failure-watch-result

@@ -1,0 +1,6 @@
+start three tasks with the same name and one with odd characters
+~5
+#dupe-names
+/async
+~3
+#panel-dupes

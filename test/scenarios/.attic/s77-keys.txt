@@ -1,0 +1,6 @@
+run three tasks: one ok, one failing, one long
+~6
+#mixed-at-narrow
+/async
+~3
+#panel-at-narrow

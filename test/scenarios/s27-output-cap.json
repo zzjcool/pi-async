@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "flood",
+            "mode": "background",
+            "command": "yes AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA | head -c 25000000"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Flooding."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

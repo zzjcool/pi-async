@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "dev",
+            "mode": "background",
+            "command": "echo \"DEVICECODE_ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ01-2345-6789\"; sleep 300"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

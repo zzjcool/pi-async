@@ -1,0 +1,3 @@
+try sync mode with a watch
+~6
+#sync-watch-rejected

@@ -1,0 +1,3 @@
+run three tasks that finish at the same time
+~10
+#simultaneous-notify

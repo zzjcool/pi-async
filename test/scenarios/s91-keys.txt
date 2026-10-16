@@ -1,0 +1,3 @@
+start three tasks in three modes
+~8
+#receipt-modes

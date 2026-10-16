@@ -1,0 +1,38 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo ok",
+            "name": "ok",
+            "mode": "background"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_wait",
+          "arguments": {
+            "taskIds": [
+              "$LAST_TASK_ID"
+            ],
+            "timeoutMs": 15000
+          }
+        }
+      ]
+    },
+    {
+      "text": "Waited."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+start two long tasks
+~6
+/async
+~3
+!C-m
+~2
+#detail
+!Escape
+~2
+#after-esc-1
+!Escape
+~3
+#after-esc-2

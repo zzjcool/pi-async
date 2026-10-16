@@ -1,0 +1,28 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo x",
+            "mode": "sync",
+            "timeoutMs": 5000,
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 5000,
+              "success_when": [],
+              "failure_when": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+run a task with big output, then read logs with small and oversized maxBytes
+~10
+#logs-read

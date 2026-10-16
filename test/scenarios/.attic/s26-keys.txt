@@ -1,0 +1,5 @@
+run a slow sync command with abort on timeout
+~14
+#sync-abort-result
+~4
+#task-still-running

@@ -1,0 +1,34 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "jsonwatch",
+            "mode": "background",
+            "command": "sleep 3 && echo '{\"ready\": true, \"code\": 42}' && sleep 60",
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 20000,
+              "success_when": [
+                {
+                  "type": "json_path_exists",
+                  "path": "$.ready"
+                }
+              ],
+              "failure_when": [],
+              "blind_checks": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "text": "Json watching."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

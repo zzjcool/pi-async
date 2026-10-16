@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "devicecode",
+            "mode": "background",
+            "command": "echo \"Please visit https://example.com/device and enter code: WDJB-MJHT\"; sleep 300"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

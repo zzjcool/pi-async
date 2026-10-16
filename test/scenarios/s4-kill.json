@@ -1,0 +1,13 @@
+{
+  "turns": [
+    {
+      "tools": [
+        { "name": "async_run", "arguments": { "name": "victim", "mode": "background", "command": "sleep 300 && echo NEVER" } }
+      ]
+    },
+    { "text": "Started victim." },
+    { "tools": [{ "name": "async_kill", "arguments": { "taskId": "$LAST_TASK_ID" } }] },
+    { "text": "Killed it." },
+    { "text": "ack" }
+  ]
+}

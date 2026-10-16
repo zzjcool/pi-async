@@ -1,0 +1,10 @@
+start a long task
+~5
+#before-reload-with-task
+/reload
+~3
+#reload-immediate
+~5
+#reload-5s
+~8
+#reload-13s

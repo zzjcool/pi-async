@@ -1,0 +1,31 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "exactcap",
+            "mode": "background",
+            "command": "head -c 20971520 /dev/zero | tr \"\\0\" \"x\""
+          }
+        }
+      ]
+    },
+    {
+      "text": "Exact cap test."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    },
+    {
+      "text": "c"
+    },
+    {
+      "text": "d"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+start a long task
+~3
+/async
+~5
+!C-m
+~4
+#in-detail
+!R
+~2
+#right-after-R
+~5
+#later-after-R

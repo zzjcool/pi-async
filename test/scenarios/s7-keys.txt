@@ -1,0 +1,3 @@
+run a task that writes to stderr but watch stdout
+~8
+#watch-result

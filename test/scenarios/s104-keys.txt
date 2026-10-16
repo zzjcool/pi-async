@@ -1,0 +1,3 @@
+run a task then check status with no arguments
+~8
+#status-default

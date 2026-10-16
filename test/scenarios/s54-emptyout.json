@@ -1,0 +1,30 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "nooutput",
+            "mode": "background",
+            "command": "sleep 5"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "multiline",
+            "mode": "background",
+            "command": "echo one\necho two\nsleep 5"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

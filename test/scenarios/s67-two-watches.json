@@ -1,0 +1,60 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "w1",
+            "mode": "background",
+            "command": "sleep 2 && echo READY1 && sleep 60",
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 30000,
+              "success_when": [
+                {
+                  "type": "stdout_contains",
+                  "value": "READY1"
+                }
+              ],
+              "failure_when": [],
+              "blind_checks": 3
+            }
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "w2",
+            "mode": "background",
+            "command": "sleep 4 && echo READY2 && sleep 60",
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 30000,
+              "success_when": [
+                {
+                  "type": "stdout_contains",
+                  "value": "READY2"
+                }
+              ],
+              "failure_when": [],
+              "blind_checks": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "text": "Two watches."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    },
+    {
+      "text": "c"
+    }
+  ]
+}

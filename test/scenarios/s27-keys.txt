@@ -1,0 +1,5 @@
+run a task that floods stdout
+~6
+#during-flood
+~10
+#after-cap

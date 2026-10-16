@@ -1,0 +1,8 @@
+start three tasks
+~4
+/async
+~3
+#panel-tiny
+!C-m
+~3
+#detail-tiny

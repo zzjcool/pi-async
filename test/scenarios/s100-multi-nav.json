@@ -1,0 +1,54 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "n0",
+            "mode": "background",
+            "command": "echo out0 && sleep 200"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "n1",
+            "mode": "background",
+            "command": "echo out1 && sleep 201"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "n2",
+            "mode": "background",
+            "command": "echo out2 && sleep 202"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "n3",
+            "mode": "background",
+            "command": "echo out3 && sleep 203"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "n4",
+            "mode": "background",
+            "command": "echo out4 && sleep 204"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Five."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

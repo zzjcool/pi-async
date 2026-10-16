@@ -1,0 +1,13 @@
+run two quick tasks
+~10
+/async
+~3
+#panel-history-on
+!h
+~3
+#panel-history-off
+!Escape
+~2
+!Escape
+~3
+#back-to-session

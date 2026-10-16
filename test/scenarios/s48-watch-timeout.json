@@ -1,0 +1,34 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "watchtimeout",
+            "mode": "background",
+            "command": "echo started && sleep 300",
+            "watch": {
+              "intervalMs": 2000,
+              "timeoutMs": 12000,
+              "success_when": [
+                {
+                  "type": "stdout_contains",
+                  "value": "NEVER_APPEARS"
+                }
+              ],
+              "failure_when": [],
+              "blind_checks": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "text": "Watching."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

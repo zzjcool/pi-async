@@ -1,0 +1,3 @@
+run a failing task
+~8
+#fail-notify

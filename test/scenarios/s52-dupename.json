@@ -1,0 +1,46 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "same",
+            "mode": "background",
+            "command": "sleep 60"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "same",
+            "mode": "background",
+            "command": "sleep 61"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "same",
+            "mode": "background",
+            "command": "sleep 62"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "a b/c\\d",
+            "mode": "background",
+            "command": "sleep 63"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

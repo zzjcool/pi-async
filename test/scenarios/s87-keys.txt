@@ -1,0 +1,3 @@
+call a tool that does not exist
+~6
+#after-badtool

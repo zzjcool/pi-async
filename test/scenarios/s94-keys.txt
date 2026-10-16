@@ -1,0 +1,3 @@
+run, log, then kill a task
+~10
+#logs-kill-real

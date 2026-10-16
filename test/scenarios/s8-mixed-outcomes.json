@@ -1,0 +1,15 @@
+{
+  "turns": [
+    {
+      "tools": [
+        { "name": "async_run", "arguments": { "name": "ok1", "mode": "background", "command": "echo fine" } },
+        { "name": "async_run", "arguments": { "name": "bad1", "mode": "background", "command": "exit 7" } },
+        { "name": "async_run", "arguments": { "name": "killme", "mode": "background", "command": "sleep 300" } }
+      ]
+    },
+    { "text": "Ran three: one ok, one failing, one long." },
+    { "tools": [{ "name": "async_kill", "arguments": { "taskId": "$LAST_TASK_ID" } }] },
+    { "text": "Killed the long one." },
+    { "text": "ack" }
+  ]
+}

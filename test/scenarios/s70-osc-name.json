@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "link\u001b]8;;http://evil\u001b\\click\u001b]8;;\u001b\\red\u001b[31mX",
+            "mode": "background",
+            "command": "sleep 60"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

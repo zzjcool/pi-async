@@ -1,0 +1,6 @@
+run two quick tasks
+~10
+#after-tasks
+status with includeHistory false
+~6
+#after-status

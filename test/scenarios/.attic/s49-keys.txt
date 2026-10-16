@@ -1,0 +1,5 @@
+run three tasks: one ok, one failing, one long
+~4
+/async
+~4
+#panel-colors

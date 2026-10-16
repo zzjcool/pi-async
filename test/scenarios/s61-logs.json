@@ -1,0 +1,57 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "big",
+            "mode": "background",
+            "command": "seq 1 200000 && sleep 60"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Big output started."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_logs",
+          "arguments": {
+            "taskId": "$LAST_TASK_ID",
+            "maxBytes": 1024,
+            "tail": true
+          }
+        }
+      ]
+    },
+    {
+      "text": "Logs 1KiB returned."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_logs",
+          "arguments": {
+            "taskId": "$LAST_TASK_ID",
+            "maxBytes": 999999
+          }
+        }
+      ]
+    },
+    {
+      "text": "Oversized attempted."
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

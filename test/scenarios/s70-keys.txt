@@ -1,0 +1,10 @@
+start a task whose name contains an OSC 8 hyperlink
+~5
+/async
+~3
+#panel-osc-name
+!Escape
+~2
+!Escape
+~3
+#rail-osc-name

@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "chatter",
+            "mode": "background",
+            "command": "for i in $(seq 1 40); do echo LINE_$i; sleep 0.3; done; sleep 120"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Chattering."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+run a 5 second sync command
+~2
+#during-sync
+~2
+#still-during
+~7
+#after-sync

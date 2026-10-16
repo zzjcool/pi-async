@@ -1,0 +1,46 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t0",
+            "mode": "background",
+            "command": "sleep 100"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t1",
+            "mode": "background",
+            "command": "sleep 101"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t2",
+            "mode": "background",
+            "command": "sleep 102"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "t3",
+            "mode": "background",
+            "command": "sleep 103"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Tried four."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

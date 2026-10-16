@@ -1,0 +1,3 @@
+run a sync command with lots of chinese output
+~15
+#sync-cjk-result

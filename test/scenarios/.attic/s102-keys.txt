@@ -1,0 +1,17 @@
+start three long tasks
+~6
+/async
+~3
+!C-m
+~2
+#detail-n0
+!k
+~1
+!k
+~3
+#after-kill-stay
+!Escape
+~2
+#list-after-kill
+!Esc
+~1

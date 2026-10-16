@@ -1,0 +1,3 @@
+run a task emitting exactly 20MiB
+~20
+#exact-cap-result

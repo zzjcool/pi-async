@@ -1,0 +1,18 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "quick",
+            "mode": "background",
+            "command": "sleep 3 && echo QUICK_DONE"
+          }
+        }
+      ]
+    },
+    { "text": "Started it." },
+    { "text": "ack" }
+  ]
+}

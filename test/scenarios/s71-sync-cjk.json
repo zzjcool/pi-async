@@ -1,0 +1,23 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "cjkbig",
+            "mode": "sync",
+            "timeoutMs": 30000,
+            "command": "python3 -c \"print(chr(20013)*3000)\""
+          }
+        }
+      ]
+    },
+    {
+      "text": "Sync done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

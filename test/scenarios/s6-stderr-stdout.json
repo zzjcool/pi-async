@@ -1,0 +1,25 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "streamtest",
+            "mode": "background",
+            "command": "echo THIS_IS_ON_STDOUT && sleep 60",
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 15000,
+              "success_when": [{ "type": "stderr_contains", "value": "THIS_IS_ON_STDOUT" }],
+              "failure_when": [],
+              "blind_checks": 3
+            }
+          }
+        }
+      ]
+    },
+    { "text": "Watching." },
+    { "text": "ack" }
+  ]
+}

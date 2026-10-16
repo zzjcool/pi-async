@@ -1,0 +1,70 @@
+name: container-qa
+
+# 保证 test/docker 这套容器化测试不会腐化：
+#   - 镜像能构建出来（Dockerfile 没坏）
+#   - 脚本语法没坏
+#   - Makefile 的目标与 README 里写的对得上（防止文档漂移）
+#
+# 不跑真模型（CI 无宿主接入点），只做离线可验证的部分。
+
+on:
+  pull_request:
+    paths:
+      - "test/docker/**"
+      - "test/scenarios/**"
+      - ".github/workflows/container-qa.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "test/docker/**"
+      - ".github/workflows/container-qa.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-build:
+    name: lint + build image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell syntax check
+        run: |
+          set -euo pipefail
+          for f in test/docker/tools/*.sh; do
+            bash -n "$f" && echo "OK  $f"
+          done
+
+      - name: Python syntax check
+        run: |
+          set -euo pipefail
+          python3 -m py_compile test/docker/tools/*.py && echo "OK  python"
+
+      - name: Makefile targets parse
+        run: |
+          set -euo pipefail
+          cd test/docker
+          make -n help
+          # 打印所有目标，作为 PR 里的可见证据
+          make help
+
+      - name: Build image
+        run: |
+          docker build -t pi-async-test:ci \
+            -f test/docker/tools/Dockerfile test/docker/tools
+
+      - name: Smoke inside the built image (no model required)
+        run: |
+          set -euo pipefail
+          # 只验证镜像自检层：pi 在、包能挂上、rg/fd 走 PATH 不下载
+          docker run --rm --network=none pi-async-test:ci bash -lc '
+            pi --version
+            which rg fd
+            rg --version | head -1
+            fd --version | head -1
+            test ! -e "$HOME/.pi/agent/bin" && echo "OK  no tool download dir"
+          '

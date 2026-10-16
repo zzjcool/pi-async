@@ -1,0 +1,38 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "alpha",
+            "mode": "background",
+            "command": "sleep 200 && echo A"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "beta",
+            "mode": "background",
+            "command": "echo B && exit 3"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "gamma",
+            "mode": "background",
+            "command": "sleep 150 && echo G"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Three tasks."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}
