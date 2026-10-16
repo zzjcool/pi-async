@@ -3,6 +3,7 @@ import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
+import { formatDuration } from "../core/duration.ts";
 import { clearDoneStatus } from "./status.ts";
 import { tuiHost } from "./host.ts";
 
@@ -33,11 +34,6 @@ function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: strin
   }
 }
 
-const duration = (task: TaskSnapshot, now: number): string => {
-  const end = task.finishedAt ?? now;
-  const seconds = Math.floor(Math.max(0, end - (task.startedAt ?? task.createdAt)) / 1000);
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-};
 const frame = (title: string, body: string[], width: number, height: number): string[] => {
   const w = Math.max(8, Math.floor(width));
   const h = Math.max(4, Math.floor(height));
@@ -117,7 +113,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       if (!detail) {
         return ["↑/↓ select · Enter details · h history · q close", ...tasks.map((task) => {
           const output = task.status === "running" ? registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text.split(/\r?\n/).filter(Boolean).at(-1) : undefined;
-          return `${task.taskId === selected ? "▶" : " "} ${visible(task.name)} · ${task.status} · ${duration(task, Date.now())}${output ? ` · ${visible(output)}` : ""}`;
+          return `${task.taskId === selected ? "▶" : " "} ${visible(task.name)} · ${task.status} · ${formatDuration(task, Date.now())}${output ? ` · ${visible(output)}` : ""}`;
         })];
       }
       const task = choose();
@@ -128,7 +124,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       const tail = outputLines.slice(Math.max(0, outputLines.length - PANEL_ROWS - scroll), outputLines.length - scroll);
       const meta = JSON.stringify(task.metadata);
       return [
-        `${visible(task.name)} [${task.taskId}]`, `status: ${task.status} · elapsed: ${duration(task, Date.now())}`,
+        `${visible(task.name)} [${task.taskId}]`, `status: ${task.status} · elapsed: ${formatDuration(task, Date.now())}`,
         `command: ${visible(task.command)}`, `metadata: ${meta}`, `output${output.truncated ? " (tail truncated)" : ""}:`,
         // registry.logs caps its own data at 50 KiB; the TUI intentionally reads a larger 128 KiB tail directly from the output file.
         ...tail.map(visible), ...(confirmKill ? ["Kill this task? press k again to confirm; any other key cancels"] : []),

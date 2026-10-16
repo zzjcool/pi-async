@@ -2,6 +2,7 @@ import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
+import { formatDuration } from "../core/duration.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
 import { tuiHost } from "./host.ts";
@@ -59,19 +60,12 @@ function typeColor(theme: Theme, mode: string, used: Swatch[]): string {
 }
 
 const statePriority: Record<TaskSnapshot["status"], number> = { running: 0, pending: 1, completed: 2, failed: 3, killed: 4 };
-function elapsed(snapshot: TaskSnapshot, now: number): string {
-  const seconds = Math.floor(Math.max(0, now - (snapshot.startedAt ?? snapshot.createdAt)) / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}
-
 /** Pure, unstyled rail rows; active tasks first and a hard ten-row limit. */
 export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = Date.now()): string[] {
   const rows = snapshots.filter((task) => task.status !== "pending")
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
     .slice(0, 10)
-    .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${elapsed(task, now)}`);
+    .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${formatDuration(task, now)}`);
   const limit = Math.max(0, Math.floor(width));
   return rows.map((row) => Array.from(row).length > limit ? `${Array.from(row).slice(0, Math.max(0, limit - 1)).join("")}…` : row);
 }
