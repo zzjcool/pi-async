@@ -1,0 +1,18 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "pwn\u0007\u0008\u000cEVIL",
+            "mode": "background",
+            "command": "sleep 120 && echo X"
+          }
+        }
+      ]
+    },
+    { "text": "Started." },
+    { "text": "ack" }
+  ]
+}

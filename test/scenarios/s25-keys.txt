@@ -1,0 +1,5 @@
+run a slow command with abort on timeout
+~12
+#after-abort
+~5
+#rail-after-abort

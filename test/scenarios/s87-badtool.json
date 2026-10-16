@@ -1,0 +1,20 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_nonexistent",
+          "arguments": {
+            "foo": "bar"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

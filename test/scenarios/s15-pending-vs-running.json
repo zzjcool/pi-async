@@ -1,0 +1,31 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "runningnow",
+            "mode": "background",
+            "command": "sleep 300"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "scheduled",
+            "mode": "delayed",
+            "delayMs": 40000,
+            "command": "echo LATER"
+          }
+        }
+      ]
+    },
+    {
+      "text": "One running, one scheduled."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

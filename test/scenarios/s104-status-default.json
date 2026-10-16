@@ -1,0 +1,33 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo a",
+            "name": "a",
+            "mode": "background"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_status",
+          "arguments": {}
+        }
+      ]
+    },
+    {
+      "text": "Checked."
+    },
+    {
+      "text": "x"
+    }
+  ]
+}

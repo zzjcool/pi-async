@@ -1,0 +1,7 @@
+run the output injection test
+~6
+/async
+~3
+!C-m
+~3
+#panel-detail-inject

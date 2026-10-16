@@ -1,0 +1,44 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "s1",
+            "mode": "background",
+            "command": "sleep 5 && echo A"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "s2",
+            "mode": "background",
+            "command": "sleep 5 && echo B"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "s3",
+            "mode": "background",
+            "command": "sleep 5 && echo C"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Three."
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

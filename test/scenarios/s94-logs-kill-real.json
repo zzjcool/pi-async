@@ -1,0 +1,49 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo hello",
+            "name": "x",
+            "mode": "background"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_logs",
+          "arguments": {
+            "taskId": "$LAST_TASK_ID",
+            "maxBytes": 1000
+          }
+        }
+      ]
+    },
+    {
+      "text": "Logged."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_kill",
+          "arguments": {
+            "taskId": "$LAST_TASK_ID"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Killed."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

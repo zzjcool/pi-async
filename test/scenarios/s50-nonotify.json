@@ -1,0 +1,23 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "quiet",
+            "mode": "background",
+            "command": "sleep 4 && echo DONE",
+            "notifyOnCompletion": false
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started quietly."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

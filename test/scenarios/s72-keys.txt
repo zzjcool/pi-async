@@ -1,0 +1,3 @@
+run a task without a name, whose command starts with control characters
+~6
+#derived-name-in-rail

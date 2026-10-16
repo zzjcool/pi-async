@@ -1,0 +1,11 @@
+run two quick tasks
+~10
+/async
+~3
+#panel-default-history
+!h
+~3
+#after-h-toggle
+!h
+~3
+#after-h-again

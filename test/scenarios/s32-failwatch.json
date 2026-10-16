@@ -1,0 +1,34 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "failwatch",
+            "mode": "background",
+            "command": "sleep 2 && echo FATAL_ERROR_DETECTED && sleep 120",
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 30000,
+              "success_when": [],
+              "failure_when": [
+                {
+                  "type": "stdout_contains",
+                  "value": "FATAL_ERROR_DETECTED"
+                }
+              ],
+              "blind_checks": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "text": "Watching for failure."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

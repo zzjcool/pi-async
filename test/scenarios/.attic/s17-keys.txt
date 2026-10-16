@@ -1,0 +1,14 @@
+start a long task
+~3
+/async
+~3
+#panel-list
+!C-m
+~3
+#detail
+!k
+~3
+#kill-confirm-prompt
+!k
+~4
+#after-kill

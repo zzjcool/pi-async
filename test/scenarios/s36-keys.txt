@@ -1,0 +1,13 @@
+run a task that prints many lines slowly
+~8
+/async
+~3
+!C-m
+~4
+#detail-following
+!Up
+~2
+#after-up-scroll
+!Up
+~2
+#scrolled-more

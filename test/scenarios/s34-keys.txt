@@ -1,0 +1,7 @@
+run a quick task
+~4
+#task-visible
+~14
+#linger-period
+~20
+#after-linger-default-30s

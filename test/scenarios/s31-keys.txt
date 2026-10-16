@@ -1,0 +1,3 @@
+run a command that emits json later, watch for a json path
+~8
+#json-watch-result

@@ -1,0 +1,17 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "one",
+            "mode": "background",
+            "command": "sleep 3 && echo TASK_ONE_DONE"
+          }
+        }
+      ]
+    },
+    { "text": "Started the background task." }
+  ]
+}

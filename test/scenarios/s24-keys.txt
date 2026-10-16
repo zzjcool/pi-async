@@ -1,0 +1,5 @@
+run a slow command synchronously with promote
+~12
+#after-sync-promote
+~5
+#rail-check

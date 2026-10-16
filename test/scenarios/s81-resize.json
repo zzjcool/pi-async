@@ -1,0 +1,38 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "a1",
+            "mode": "background",
+            "command": "sleep 100"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "a2",
+            "mode": "background",
+            "command": "sleep 110"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "a3",
+            "mode": "background",
+            "command": "sleep 120"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Three."
+    },
+    {
+      "text": "x"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+run a task whose output contains control bytes
+~8
+#c0-notify

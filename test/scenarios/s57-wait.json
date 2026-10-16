@@ -1,0 +1,35 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "waited",
+            "mode": "background",
+            "command": "sleep 8 && echo WAITED_DONE"
+          }
+        }
+      ]
+    },
+    {
+      "tools": [
+        {
+          "name": "async_wait",
+          "arguments": {
+            "taskIds": [
+              "$LAST_TASK_ID"
+            ],
+            "timeoutMs": 20000
+          }
+        }
+      ]
+    },
+    {
+      "text": "Wait returned."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

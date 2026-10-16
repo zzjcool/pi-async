@@ -1,0 +1,5 @@
+run three tasks: one ok, one failing, one long
+~4
+#three-visible
+~40
+#after-linger

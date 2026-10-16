@@ -1,0 +1,7 @@
+start a task that finishes in a few seconds
+~4
+/async
+~3
+#panel-open-task-running
+~8
+#panel-open-task-completed

@@ -1,0 +1,25 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "refreshtest",
+            "mode": "background",
+            "command": "sleep 6 && echo FINISHED"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    }
+  ]
+}

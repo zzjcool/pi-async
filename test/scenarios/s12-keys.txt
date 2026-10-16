@@ -1,0 +1,9 @@
+start three tasks
+~3
+#rail
+/async
+~4
+#panel-open
+!C-o
+~2
+#panel-ctrl-o

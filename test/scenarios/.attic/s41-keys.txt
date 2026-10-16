@@ -1,0 +1,7 @@
+start a long task
+~4
+/reload
+~6
+!C-o
+~3
+#after-reload-expanded

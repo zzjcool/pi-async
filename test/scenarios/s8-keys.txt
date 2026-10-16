@@ -1,0 +1,10 @@
+run three tasks: one ok, one failing, one long
+~3
+#three-started
+~8
+#outcomes-settling
+now kill the long one
+~4
+#after-kill
+~4
+#final-state

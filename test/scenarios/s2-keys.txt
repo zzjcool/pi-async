@@ -1,0 +1,9 @@
+start three long background tasks
+~3
+#three-running
+~5
+#still-running
+~5
+#stability
+!C-o
+#tools-expanded

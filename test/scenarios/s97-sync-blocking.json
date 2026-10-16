@@ -1,0 +1,23 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "sleep 5 && echo SYNC_DONE",
+            "name": "sy",
+            "mode": "sync",
+            "timeoutMs": 20000
+          }
+        }
+      ]
+    },
+    {
+      "text": "Sync done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

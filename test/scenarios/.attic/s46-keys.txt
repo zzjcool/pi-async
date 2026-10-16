@@ -1,0 +1,5 @@
+start a task with a long chinese name
+~4
+/async
+~4
+#panel-narrow-cjk

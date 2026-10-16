@@ -1,0 +1,3 @@
+run a task that prints a long chinese line then waits
+~7
+#rail-inline-cjk

@@ -1,0 +1,3 @@
+start a long task with a control-character name
+~4
+#rail-after-inject

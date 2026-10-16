@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "inject",
+            "mode": "background",
+            "command": "printf 'safe-before\\n'; printf '\\033]0;PWNED_TITLE\\007'; printf '\\033]8;;http://evil.example\\033\\\\click-me\\033]8;;\\033\\\\\\n'; printf '\\033[2J\\033[H'; printf 'after-osc\\n'; printf '\\033[31mRED\\033[0m\\n'; printf 'safe-after\\n'; sleep 5"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Ran injection test."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+run a task printing chinese output
+~6
+/async
+~3
+!C-m
+~3
+#cjk-output-detail

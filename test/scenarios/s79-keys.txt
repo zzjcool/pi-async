@@ -1,0 +1,7 @@
+run a task with one very long output line
+~6
+/async
+~3
+!C-m
+~3
+#detail-oneline

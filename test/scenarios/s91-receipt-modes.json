@@ -1,0 +1,40 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo bg",
+            "name": "bg",
+            "mode": "background"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo dl",
+            "name": "dl",
+            "mode": "delayed",
+            "delayMs": 5000
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo sy",
+            "name": "sy",
+            "mode": "sync",
+            "timeoutMs": 5000
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

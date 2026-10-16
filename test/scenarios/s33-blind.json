@@ -1,0 +1,34 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "blind",
+            "mode": "background",
+            "command": "echo not-json-at-all && sleep 120",
+            "watch": {
+              "intervalMs": 1000,
+              "timeoutMs": 30000,
+              "success_when": [
+                {
+                  "type": "json_path_exists",
+                  "path": "$.ready"
+                }
+              ],
+              "failure_when": [],
+              "blind_checks": 2
+            }
+          }
+        }
+      ]
+    },
+    {
+      "text": "Blind test."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "rawc0",
+            "mode": "background",
+            "command": "printf 'before\\007after\\n'; printf 'x\\010Y\\n'; printf 'p\\014q\\n'; printf 'v\\013w\\n'; sleep 3"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    }
+  ]
+}

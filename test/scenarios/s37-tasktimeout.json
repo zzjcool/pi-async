@@ -1,0 +1,23 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "timeouttask",
+            "mode": "background",
+            "taskTimeoutMs": 5000,
+            "command": "sleep 300"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Timed."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

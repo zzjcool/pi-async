@@ -1,0 +1,10 @@
+start a long task
+~3
+/async
+~3
+!C-m
+~3
+#detail-before-c
+!c
+~3
+#after-c-copy

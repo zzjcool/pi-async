@@ -1,0 +1,5 @@
+start three long tasks
+~5
+#before-resize
+!C-b
+~1

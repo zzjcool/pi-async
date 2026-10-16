@@ -1,0 +1,3 @@
+run tasks with notification options off
+~8
+#notify-combo

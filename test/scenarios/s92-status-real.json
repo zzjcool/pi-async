@@ -1,0 +1,28 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo ok",
+            "name": "ok",
+            "mode": "background"
+          }
+        },
+        {
+          "name": "async_status",
+          "arguments": {
+            "includeHistory": true
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

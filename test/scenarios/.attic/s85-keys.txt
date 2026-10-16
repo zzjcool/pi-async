@@ -1,0 +1,12 @@
+start a long task
+~3
+/async
+~3
+!C-m
+~2
+#detail-running
+!k
+~2
+!k
+~4
+#detail-after-kill

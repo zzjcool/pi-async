@@ -1,0 +1,12 @@
+run a silent task and a multiline one
+~8
+/async
+~3
+!C-m
+~3
+#detail-nooutput
+!Down
+~2
+!C-m
+~3
+#detail-multiline

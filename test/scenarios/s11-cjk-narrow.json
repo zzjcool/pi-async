@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "中文任务名",
+            "mode": "background",
+            "command": "sleep 120"
+          }
+        }
+      ]
+    },
+    {
+      "text": "ok"
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

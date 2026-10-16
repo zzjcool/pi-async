@@ -1,0 +1,110 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task00",
+            "mode": "background",
+            "command": "sleep 200"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task01",
+            "mode": "background",
+            "command": "sleep 210"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task02",
+            "mode": "background",
+            "command": "sleep 220"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task03",
+            "mode": "background",
+            "command": "sleep 230"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task04",
+            "mode": "background",
+            "command": "sleep 240"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task05",
+            "mode": "background",
+            "command": "sleep 250"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task06",
+            "mode": "background",
+            "command": "sleep 260"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task07",
+            "mode": "background",
+            "command": "sleep 270"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task08",
+            "mode": "background",
+            "command": "sleep 280"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task09",
+            "mode": "background",
+            "command": "sleep 290"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task10",
+            "mode": "background",
+            "command": "sleep 300"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "task11",
+            "mode": "background",
+            "command": "sleep 310"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started twelve tasks."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

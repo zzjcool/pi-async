@@ -75,6 +75,22 @@ npm run typecheck
 npm test
 ```
 
+## Container QA
+
+Run the plugin inside a clean container against the local model endpoint:
+
+```sh
+cd test/docker
+make run     # start container + drop into pi (default: workbuddy/hy4-preview-ioa)
+make smoke   # L1 model reachable -> L2 tools advertised -> L3 a tool really runs
+make qa-up && make qa-tui SCENARIO=s1   # deterministic TUI scenario
+```
+
+`make run` reuses an already-running container, so it never tears down your session.
+
+See [test/docker/README.md](test/docker/README.md) for the two containers, the
+required mounts, and why L3 must not be skipped.
+
 ## Known upstream issue (print mode)
 
 `pi --print` + background task completing **after** the agent settles: the wake happens but the woken

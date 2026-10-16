@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "oneline",
+            "mode": "background",
+            "command": "python3 -c \"print(chr(65)*500)\""
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

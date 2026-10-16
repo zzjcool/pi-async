@@ -1,0 +1,23 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "later",
+            "mode": "delayed",
+            "delayMs": 25000,
+            "command": "echo DELAYED_RAN"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Scheduled for later."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+run a task that prints a device code then waits
+~8
+/async
+~3
+#device-code-in-list

@@ -1,0 +1,60 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "medium",
+            "mode": "background",
+            "command": "seq 1 5000"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Medium output started."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_logs",
+          "arguments": {
+            "taskId": "$LAST_TASK_ID",
+            "maxBytes": 1024,
+            "tail": true
+          }
+        }
+      ]
+    },
+    {
+      "text": "Logs returned."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_logs",
+          "arguments": {
+            "taskId": "$LAST_TASK_ID",
+            "maxBytes": 999999
+          }
+        }
+      ]
+    },
+    {
+      "text": "Oversized returned."
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

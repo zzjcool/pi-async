@@ -1,0 +1,12 @@
+start three tasks with the same name and one with odd characters
+~5
+/async
+~3
+!C-m
+~3
+#detail-first-same
+!Down
+~2
+!C-m
+~3
+#detail-second-same

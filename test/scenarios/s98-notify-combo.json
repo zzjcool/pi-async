@@ -1,0 +1,36 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo A",
+            "name": "both-off",
+            "mode": "background",
+            "notifyOnCompletion": false,
+            "triggerOnCompletion": false
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo B",
+            "name": "notify-off",
+            "mode": "background",
+            "notifyOnCompletion": false
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    }
+  ]
+}

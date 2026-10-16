@@ -1,0 +1,15 @@
+start a long task
+~3
+/async
+~5
+!h
+~3
+#history-on
+!C-m
+~4
+#detail
+!k
+~2
+!k
+~6
+#killed-still-in-detail

@@ -1,0 +1,28 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo x",
+            "mode": "sync"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "echo x",
+            "mode": "delayed"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

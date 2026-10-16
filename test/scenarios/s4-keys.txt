@@ -1,0 +1,10 @@
+start a very long task
+~3
+#started-running
+~4
+#still-running
+now kill that task
+~4
+#after-kill
+~4
+#kill-settled

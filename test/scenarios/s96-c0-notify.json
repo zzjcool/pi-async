@@ -1,0 +1,25 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "command": "printf 'A\\000B\\007C\\n'",
+            "name": "c0",
+            "mode": "background"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    },
+    {
+      "text": "b"
+    }
+  ]
+}

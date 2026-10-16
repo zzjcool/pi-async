@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "这是一个非常长的中文任务名称用来测试宽度截断是否按显示宽度计算",
+            "mode": "background",
+            "command": "sleep 120"
+          }
+        }
+      ]
+    },
+    {
+      "text": "已启动。"
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

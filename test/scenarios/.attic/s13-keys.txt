@@ -1,0 +1,14 @@
+start three tasks
+~3
+/async
+~4
+#panel-list
+!C-m
+~3
+#panel-detail
+!Down
+~2
+#after-down
+!Escape
+~3
+#after-esc

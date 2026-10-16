@@ -1,0 +1,43 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "h1",
+            "mode": "background",
+            "command": "echo done1"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "h2",
+            "mode": "background",
+            "command": "exit 5"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Two done."
+    },
+    {
+      "tools": [
+        {
+          "name": "async_status",
+          "arguments": {
+            "includeHistory": false
+          }
+        }
+      ]
+    },
+    {
+      "text": "Status returned."
+    },
+    {
+      "text": "ack"
+    }
+  ]
+}

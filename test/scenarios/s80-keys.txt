@@ -1,0 +1,9 @@
+start a quick task
+~2
+/async
+~3
+!C-m
+~2
+#detail-while-running
+~8
+#detail-after-complete

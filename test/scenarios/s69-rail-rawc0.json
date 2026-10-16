@@ -1,0 +1,22 @@
+{
+  "turns": [
+    {
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "bell\u0007bs\bff\fname",
+            "mode": "background",
+            "command": "sleep 60"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Started."
+    },
+    {
+      "text": "a"
+    }
+  ]
+}

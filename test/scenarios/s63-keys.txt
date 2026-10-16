@@ -1,0 +1,3 @@
+run a task with medium output then read logs twice
+~12
+#logs-done
