@@ -3,8 +3,9 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
+import { summarySegments, survivesClearCutoff, type SummaryCounts } from "./status.ts";
 import { envNumber } from "../core/env.ts";
-import { truncateToWidth } from "./width.ts";
+import { displayWidth, truncateToWidth } from "./width.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
 import { tuiHost } from "./host.ts";
@@ -71,11 +72,15 @@ export function fitRailRow(row: string, width: number): string {
   return truncateToWidth(row, Math.max(0, Math.floor(width)));
 }
 
-/** Pure, unstyled rail rows; active tasks first and a hard ten-row limit. */
+export const RAIL_MAX_LINES = 4;
+export const RAIL_TASK_SLOTS = 3;
+export const RAIL_TASK_SLOTS_OVERFLOW = 2;
+
+/** Pure, unstyled rail rows; active tasks first and a hard three-row limit. */
 export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = Date.now()): string[] {
   const rows = snapshots
     .slice().sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt))
-    .slice(0, 10)
+    .slice(0, RAIL_TASK_SLOTS)
     .map((task) => `▶ ${visibleText(task.name)} · ${task.status} · ${formatDuration(task, now)}`);
   const limit = Math.max(0, Math.floor(width));
   return rows.map((row) => truncateToWidth(row, limit));
@@ -86,12 +91,60 @@ function lingerMsFromEnv(): number {
   return envNumber("PI_ASYNC_RAIL_LINGER_MS", 30_000, { integer: true, min: 0 });
 }
 
-const RAIL_PAGE = 5;
+const RAIL_PAGE = 2;
+let railTicker: ReturnType<typeof setInterval> | undefined;
+
+function summaryCounts(registry: TaskRegistry): SummaryCounts {
+  const all = registry.list({ includeHistory: true });
+  const running = all.filter((task) => task.status === "running");
+  const pending = all.filter((task) => task.status === "pending").length;
+  const visibleTerminal = all.filter((task) => TERMINAL.has(task.status) && survivesClearCutoff(task));
+  return {
+    running: running.length,
+    pending,
+    completed: visibleTerminal.filter((task) => task.status === "completed").length,
+    failed: visibleTerminal.filter((task) => task.status === "failed" || task.status === "killed").length,
+    ...(running.length ? { longestRunningStartedAt: Math.min(...running.map((task) => task.startedAt ?? task.createdAt)) } : {}),
+  };
+}
+
+const TERMINAL = new Set(["completed", "failed", "killed"]);
+
+function coloredSummary(counts: SummaryCounts, now: number, width: number, theme: Theme): string {
+  const plainSegments = summarySegments(counts, now);
+  let kept = plainSegments.map((segment) => ({ ...segment }));
+  const plain = () => kept.map((segment) => segment.text).join("");
+  const removableSegments = [
+    (segment: SummarySegmentLike) => segment.token === "error",
+    (segment: SummarySegmentLike) => segment.token === "success",
+    (segment: SummarySegmentLike) => segment.text.startsWith(" · ") && segment.token === "dim" && !segment.text.includes("pending"),
+    (segment: SummarySegmentLike) => segment.text.includes(" pending"),
+  ];
+  while (displayWidth(plain()) > Math.max(0, Math.floor(width))) {
+    const predicate = removableSegments.find((remove) => kept.some(remove));
+    if (!predicate) break;
+    kept = kept.filter((segment) => !predicate(segment));
+  }
+  const truncated = truncateToWidth(plain(), Math.max(0, Math.floor(width)));
+  let offset = 0;
+  return kept.map((segment) => {
+    const text = truncated.slice(offset, offset + segment.text.length);
+    offset += segment.text.length;
+    if (!text) return "";
+    try { return theme.fg(segment.token, text) ?? text; } catch { return text; }
+  }).join("");
+}
+
+type SummarySegmentLike = { text: string; token: string };
 
 export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onOpenTask?: (taskId: string) => void } = {}): (tui: TUI, theme: Theme) => RailWidget {
   // Factory signature includes the extension context for future host-specific rail integrations.
   void pi;
   return (tui, theme) => {
+    if (railTicker) clearInterval(railTicker);
+    const ticker = setInterval(() => tui.requestRender(), 1_000);
+    railTicker = ticker;
+    ticker.unref?.();
     let scroll = 0;
     let hitRows: string[] = [];
     let latchedId: string | undefined;
@@ -107,8 +160,8 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     };
     const applyScroll = (delta: number): boolean => {
       const count = ordered().length;
-      if (count <= 10) return false;
-      const taskSlots = 9; // reserve one row for the overflow indicator
+      if (count <= RAIL_TASK_SLOTS) return false;
+      const taskSlots = RAIL_TASK_SLOTS_OVERFLOW;
       const next = Math.max(0, Math.min(count - taskSlots, scroll + delta));
       if (next === scroll) return false;
       scroll = next;
@@ -117,15 +170,17 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
       return true;
     };
     const render = (width = 120): string[] => {
-      const tasks = ordered();
-      const overflow = tasks.length > 10;
-      // Reserve one of the ≤10 rows for the overflow indicator when needed.
-      const taskSlots = overflow ? 9 : 10;
+      const now = Date.now();
+      const tasks = ordered(now);
+      if (tasks.length === 0) { hitRows = []; return []; }
+      const overflow = tasks.length > RAIL_TASK_SLOTS;
+      const taskSlots = overflow ? RAIL_TASK_SLOTS_OVERFLOW : RAIL_TASK_SLOTS;
       clampScroll(tasks.length, taskSlots);
       const visible = tasks.slice(scroll, scroll + taskSlots);
-      hitRows = visible.map((task) => task.taskId);
+      const counts = summaryCounts(registry);
+      hitRows = ["", ...visible.map((task) => task.taskId)];
       const used = [swatch(theme, "error"), swatch(theme, "dim")];
-      const rows = renderRailRows(visible, width).map((row, index) => {
+      const rows = [coloredSummary(counts, now, width, theme), ...renderRailRows(visible, width).map((row, index) => {
         const task = visible[index];
         if (!task) return row;
         let token = "dim";
@@ -137,7 +192,7 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         } catch {
           return row;
         }
-      });
+      })];
       if (overflow) {
         const hidden = tasks.length - visible.length;
         const above = scroll;
@@ -173,8 +228,8 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         const mouse = event as TuiMouseEvent & { type: string; y: number; button?: string; wheelDelta?: number };
         if (mouse.type === "wheel") {
           const count = ordered().length;
-          if (count <= 10) return undefined;
-          const taskSlots = 9;
+          if (count <= RAIL_TASK_SLOTS) return undefined;
+          const taskSlots = RAIL_TASK_SLOTS_OVERFLOW;
           const next = Math.max(0, Math.min(count - taskSlots, scroll + Math.trunc(mouse.wheelDelta ?? 0)));
           if (next === scroll) return undefined;
           scroll = next; latchedId = undefined; tui.requestRender(); return { handled: true };
@@ -191,7 +246,13 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         if (!latchedId || id !== latchedId) { latchedId = undefined; return undefined; }
         const clicked = latchedId; latchedId = undefined; opts.onOpenTask?.(clicked); return { handled: true };
       },
-      dispose(): void { latchedId = undefined; },
+      dispose(): void {
+        latchedId = undefined;
+        if (railTicker === ticker) {
+          clearInterval(ticker);
+          railTicker = undefined;
+        }
+      },
     };
   };
 }

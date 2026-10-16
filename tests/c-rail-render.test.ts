@@ -35,11 +35,11 @@ test("rail render rows strip ANSI and use the injected clock", () => {
   assert.equal(rows[0], "▶ job · running · 2s");
 });
 
-test("rail renders task identity, status and elapsed and caps rows at ten", () => {
+test("rail renders task identity, status and elapsed and caps task rows at three", () => {
   const startedAt = Date.now() - 2_000;
   const snapshots = Array.from({ length: 14 }, (_, i) => makeSnapshot({ taskId: `task-${i}`, name: `job-${i}`, startedAt }));
   const rows = renderRailRows(snapshots, 100);
-  assert.equal(rows.length, 10);
+  assert.equal(rows.length, 3);
   assert.match(rows[0]!, /▶ job-0 · running · 2s/);
   assert.ok(rows.every((row) => row.length <= 100));
 });
@@ -70,7 +70,7 @@ test("rail assigns state-specific colors to each status", () => {
   ];
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
   widget.render(100);
-  assert.deepEqual(colors, ["syntaxVariable", "success", "error", "dim"]);
+  assert.deepEqual(colors, ["accent", "accent", "dim", "success", "error", "syntaxVariable", "success", "dim"]);
 });
 
 test("theme.fg undefined or throw falls back to the uncoloured row", () => {
@@ -78,9 +78,9 @@ test("theme.fg undefined or throw falls back to the uncoloured row", () => {
   const tasks = [makeSnapshot({ status: "running", taskId: "run", name: "x", startedAt: now })];
   const tui = { requestRender() {} } as never;
   const undefinedFg = createRailFactory({} as never, { list: () => tasks } as never)(tui, { fg: () => undefined } as never);
-  assert.deepEqual(undefinedFg.render(80), ["▶ x · running · 0s"]);
+  assert.deepEqual(undefinedFg.render(80), ["▶ 1 running · 0s · ✓0", "▶ x · running · 0s"]);
   const throwing = createRailFactory({} as never, { list: () => tasks } as never)(tui, { fg: () => { throw new Error("boom"); } } as never);
-  assert.deepEqual(throwing.render(80), ["▶ x · running · 0s"]);
+  assert.deepEqual(throwing.render(80), ["▶ 1 running · 0s · ✓0", "▶ x · running · 0s"]);
 });
 
 test("terminal tasks linger briefly on the rail, then disappear", () => {
@@ -93,7 +93,7 @@ test("terminal tasks linger briefly on the rail, then disappear", () => {
   ];
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
   const rows = widget.render(100).map((row) => row.replace(/\u001b\[[0-9;]*m/g, ""));
-  assert.equal(rows.length, 2, "recent terminal + live task remain; stale terminal drops");
+  assert.equal(rows.length, 3, "summary + recent terminal + live task remain; stale terminal drops");
   assert.ok(rows.some((row) => row.includes("recent-job")), "recently-finished task still visible");
   assert.ok(rows.some((row) => row.includes("live-job")), "running task always visible");
   assert.ok(!rows.some((row) => row.includes("stale-job")), "long-finished task disappears from the rail");
@@ -116,7 +116,7 @@ test("createRailFactory keeps pending tasks visible on the rail", () => {
   ];
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
   const rows = widget.render(100);
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   assert.ok(rows.some((row) => row.includes("scheduled") && row.includes("pending")));
 });
 
@@ -134,7 +134,7 @@ test("rail row width<=0 returns empty string (#36)", () => {
   }
 });
 
-test("rail shows overflow indicator when more than 10 tasks (#13)", () => {
+test("rail shows overflow indicator when more than 3 tasks (#13)", () => {
   const theme = { getFgAnsi: () => "\u001b[38;5;70m", fg: (_c: string, t: string) => t };
   const now = Date.now();
   const tasks = Array.from({ length: 12 }, (_, i) => makeSnapshot({
@@ -144,7 +144,7 @@ test("rail shows overflow indicator when more than 10 tasks (#13)", () => {
   }));
   const widget = createRailFactory({} as never, { list: () => tasks } as never)({ requestRender() {} } as never, theme as never);
   const rows = widget.render(80);
-  assert.equal(rows.length, 10, "≤10 rows including overflow indicator");
+  assert.equal(rows.length, 4, "≤4 rows including summary and overflow indicator");
   assert.ok(rows.some((row) => row.includes("more")), `expected overflow indicator: ${rows.join(" | ")}`);
-  assert.equal(rows.filter((row) => row.startsWith("▶")).length, 9);
+  assert.equal(rows.filter((row) => row.startsWith("▶")).length, 3);
 });

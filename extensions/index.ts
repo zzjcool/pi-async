@@ -6,7 +6,7 @@ import { TaskRegistry } from "../src/core/registry.ts";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
 import { registerTools } from "../src/tools/index.ts";
 import { registerRail } from "../src/tui/rail.ts";
-import { disposeStatus, initStatus } from "../src/tui/status.ts";
+import { initStatus } from "../src/tui/status.ts";
 import { registerPanelCommands } from "../src/tui/panel.ts";
 import { bindTuiHost } from "../src/tui/host.ts";
 import { isTerminal } from "../src/core/task.ts";
@@ -35,7 +35,6 @@ function registryDataDir(pi: PiCtx): string {
 
 /** Previous init generation; /reload re-runs init without session_shutdown (#44). */
 let activeRegistry: TaskRegistry | undefined;
-let activeDisposeTui: (() => void) | undefined;
 
 /** Wire the task runtime to the host API, degrading optional Pi features gracefully. */
 export async function init(pi: PiCtx): Promise<void> {
@@ -43,10 +42,6 @@ export async function init(pi: PiCtx): Promise<void> {
   // its processes, watch loops, and timers are released (pi docs: cleanup must be
   // idempotent across reload / session replacement / exit).
   if (activeRegistry) {
-    try {
-      activeDisposeTui?.();
-    } catch { /* best effort */ }
-    activeDisposeTui = undefined;
     try {
       await activeRegistry.shutdown();
     } catch (error) {
@@ -117,16 +112,10 @@ export async function init(pi: PiCtx): Promise<void> {
   }
   if (typeof context.on === "function") new SettleGuard(pi, registry).register();
 
-  activeDisposeTui = () => {
-    if (tui) disposeStatus();
-  };
-
   let shutdownPromise: Promise<void> | undefined;
   if (typeof context.on === "function") {
     context.on("session_shutdown", async () => {
       if (!shutdownPromise) shutdownPromise = (async () => {
-        activeDisposeTui?.();
-        activeDisposeTui = undefined;
         if (activeRegistry === registry) activeRegistry = undefined;
         await registry.shutdown();
       })();

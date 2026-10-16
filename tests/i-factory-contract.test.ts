@@ -80,7 +80,7 @@ test("init tolerates a factory API without mode/ui (the real pi 1.2.0 surface)",
     hooks.get("session_start")?.({ type: "session_start", reason: "new" }, { mode: "tui", hasUI: true, ui: ctxUi });
     hooks.get("message_start")?.({ type: "message_start" }, { mode: "tui", hasUI: true, ui: ctxUi });
     assert.ok(widgets.includes("pi-async-rail"), "tui session_start ctx binds the rail widget");
-    assert.ok(statuses.includes("pi-async"), "tui session_start ctx binds footer status");
+    assert.ok(!statuses.includes("pi-async"), "footer status is retired");
   } finally {
     rmSync(dir, { recursive: true, force: true });
     resetTuiHostForTests();
