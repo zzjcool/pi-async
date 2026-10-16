@@ -60,9 +60,9 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
   // Commands/shortcuts are factory-time APIs (they exist on the factory pi); TUI
   // gating comes from the bound event context. Handlers receive a rich ctx with ui.
   const bound = tuiHost();
+  // SAFETY: the factory host may omit registration methods; optional chaining is intentional.
   const host = pi as unknown as {
     registerCommand?: (name: string, spec: { description: string; handler: (args: unknown, ctx: PiCtx) => void }) => void;
-    registerShortcut?: (key: string, spec: { description: string; handler: (ctx: PiCtx) => void }) => void;
   };
   if (!bound) return;
   host.registerCommand?.("async", { description: "Open async task panel", handler: (_args, ctx) => openPanel(ctx, registry) });
@@ -73,21 +73,6 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
       clearDoneStatus(); // shared watermark in status.ts (#31)
     },
   });
-  // CONTRACT: PI_ASYNC_DOCK_SHORTCUT is disableable ("可 off"). Treat
-  // off/none/false/empty (case-insensitive, trimmed) as skip registration —
-  // otherwise "off" would be registered as a literal key name (#30).
-  // Unset stays the default; only an explicitly set disable value skips.
-  const rawShortcut = process.env.PI_ASYNC_DOCK_SHORTCUT;
-  const normalized = rawShortcut === undefined ? undefined : rawShortcut.trim().toLowerCase();
-  const disabled = normalized !== undefined && ["off", "none", "false", ""].includes(normalized);
-  if (!disabled) {
-    const key = rawShortcut && rawShortcut.trim() ? rawShortcut.trim() : "ctrl+alt+a";
-    try {
-      host.registerShortcut?.(key, { description: "Open async task panel", handler: (ctx) => openPanel(ctx, registry) });
-    } catch {
-      // The /async command remains the fallback when Pi reserves this shortcut.
-    }
-  }
 }
 
 export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: string): void {
@@ -105,9 +90,12 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
   if (!isTui(pi) || typeof host.ui?.custom !== "function") return;
   const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => survivesClearCutoff(task));
   const custom = host.ui.custom;
+  const kind = initialTaskId ? "detail" : "list";
+  const ratio = kind === "detail" ? { w: 0.85, h: 0.8 } : { w: 0.8, h: 0.7 };
   const factory = (tui: unknown, _theme: unknown, _keybindings: unknown, done: (value?: unknown) => void) => {
     let selected = initialTaskId ?? snapshots()[0]?.taskId;
     let detail = Boolean(initialTaskId);
+    const origin: "rail" | "list" = initialTaskId ? "rail" : "list";
     let history = true;
     let confirmKill = false;
     let scroll = 0;
@@ -144,7 +132,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         return ["↑/↓ select · Enter details · h history · q close", ...rows];
       }
       const task = choose();
-      if (!task) return ["Task not found", "Esc return · q close"];
+      if (!task) return ["Task not found", `${origin === "rail" ? "Esc close" : "Esc return"} · q close`];
       const output = readUiOutput(task, registry);
       const outputLines = output.text.split(/\r?\n/).filter((line) => line.length > 0);
       scroll = Math.min(scroll, Math.max(0, outputLines.length - PANEL_ROWS));
@@ -163,12 +151,15 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         ...tail.map(visible),
         ...(actionError ? [`error: ${visible(actionError)}`] : []),
         ...(confirmKill ? [killHint] : []),
-        "Esc return · k kill/cancel · R rerun · c copy output path · ↑/↓ scroll",
+        `${origin === "rail" ? "Esc close" : "Esc return"} · k kill/cancel · R rerun · c copy output path · ↑/↓ scroll`,
       ];
     };
     const render = (nextWidth?: number): string[] => {
-      width = nextWidth ?? width;
-      height = process.stdout.rows ?? height;
+      width = nextWidth ?? Math.max(20, Math.floor((process.stdout.columns ?? 120) * ratio.w));
+      // Cap by the overlay's own percentage budget too: on very short terminals a fixed floor of 6
+      // exceeds what the host will render and the bottom border gets sliced off.
+      const rows = process.stdout.rows ?? 24;
+      height = Math.min(Math.max(6, Math.floor(rows * ratio.h)), Math.max(4, rows - 2));
       lastLines = renderBody();
       const maxScroll = Math.max(0, lastLines.length - PANEL_ROWS);
       if (follow) scroll = 0;
@@ -193,7 +184,11 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         const key = data.toLowerCase();
         if (confirmKill && key !== "k") { confirmKill = false; requestRender(); return; }
         if (key === "q") { done(undefined); return; }
-        if (isEscapeKey(data)) { if (detail) { detail = false; confirmKill = false; actionError = undefined; requestRender(); } else done(undefined); return; }
+        if (isEscapeKey(data)) {
+          if (detail && origin === "list") { detail = false; confirmKill = false; actionError = undefined; requestRender(); }
+          else done(undefined);
+          return;
+        }
         if (key === "h" && !detail) {
           history = !history;
           const tasks = filtered();
@@ -273,7 +268,14 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       dispose(): void { void width; },
     };
   };
-  // Required full-screen overlay geometry. custom() resolves undefined outside supported TUI contexts.
-  // The RPC peer's custom() returns a Promise even though the overlay is unavailable there; mode guards above prevent invocation.
-  void custom(factory, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 } }).catch(() => undefined);
+  // custom() resolves undefined outside supported TUI contexts. The RPC peer's
+  // custom() returns a Promise even though mode guards prevent invocation there.
+  void custom(factory, {
+    overlay: true,
+    overlayOptions: {
+      width: kind === "detail" ? "85%" : "80%",
+      maxHeight: kind === "detail" ? "80%" : "70%",
+      anchor: "center",
+    },
+  }).catch(() => undefined);
 }

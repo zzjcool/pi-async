@@ -6,7 +6,7 @@
 ## 0. 定位与范围
 
 pi-async 是 pi 的异步任务运行时扩展：任务注册表 + 四种任务模式 + 完成唤醒 +
-主会话 TUI（轨道图 + 全屏面板）+ OSC 7501 busy 契约对齐（zzjcool/pi-legion#156）。
+主会话 TUI（轨道图 + 百分比尺寸面板）+ OSC 7501 busy 契约对齐（zzjcool/pi-legion#156）。
 
 **刻意不做**（禁止 worker 越界）：
 - 不做 delegate/attested/Fusion 子 agent（pi-background-tasks 已覆盖，我们只管 shell 任务）
@@ -33,9 +33,9 @@ pi-async/
 │   ├── tools/
 │   │   └── index.ts        # 5 个工具的注册与 schema
 │   ├── tui/
-│   │   ├── rail.ts         # 任务轨道图 widget（≤10 行）
-│   │   ├── panel.ts        # 全屏面板（列表+详情）
-│   │   └── status.ts       # footer setStatus + setActivity
+│   │   ├── rail.ts         # 任务轨道图 widget（≤4 行，含汇总行）
+│   │   ├── panel.ts        # 百分比尺寸面板（列表+详情）
+│   │   └── status.ts       # 汇总格式与共享 clear watermark 谓词；initStatus 仅 reportActivity
 │   └── guard/
 │       └── settle-guard.ts # agent_before_settle 守卫 + 心跳
 ├── vendor/reference/       # 已就位（只读参考，不编译）
@@ -201,20 +201,34 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 
 ## 8. TUI（冻结，仅主会话）
 
-- guard：所有 TUI 路径 `ctx.mode === "tui"`（hasUI 陷阱）；widget/面板/shortcut 全部跳过 rpc/json/print。
+- guard：所有 TUI 路径 `ctx.mode === "tui"`（hasUI 陷阱）；rail/面板跳过 rpc/json/print。
 - **轨道图 widget**（`setWidget("pi-async-rail", factory, {placement:"aboveEditor"})`）：
-  ≤10 行；每行一个 live 任务 `▶ name · state · elapsed`（running=类型色 / completed=settled 色 /
-  failed=error / killed=dim；配色走 legion palette 延迟解析 + OKLab 撞色检测）；wheel 滚动；
-  press→latch→click 命中任务 → 打开详情。空闲无任务时不渲染。
-- **footer**：`setStatus("pi-async", " N running · M done ")`。
-- **全屏面板**（`/async` 或 `Ctrl+Alt+A`）：`ctx.ui.custom({overlay:true, overlayOptions:
-  {width:"100%", maxHeight:"100%", anchor:"top-left", row:0, col:0}})` 自绘 mask+frame
-  （legion live-overlay 模式）；左列任务列表（含历史，`h` 切换），点击/Enter 进详情：
+  整体最多 4 行（`RAIL_MAX_LINES=4`），含首行汇总；任务槽位为 `RAIL_TASK_SLOTS=3`，溢出时为
+  `RAIL_TASK_SLOTS_OVERFLOW=2`。无溢出时为汇总 1 行 + 最多 3 行任务；
+  有溢出时为汇总 1 行 + 2 行任务 + 1 行溢出指示。任务行格式 `▶ name · state · elapsed`
+  （running=类型色 / completed=settled 色 / failed=error / killed=dim；配色走 legion palette
+  延迟解析 + OKLab 撞色检测）；wheel 滚动；press→latch→click 命中任务 → 打开详情。
+  `renderRailRows(snapshots, width, now?)` 为纯函数，内部最多渲染 3 个任务行；没有可见任务时
+  整个 widget 返回 `[]`，不显示汇总行。
+- **汇总行**：由 `summarySegments`/`formatSummary` 生成，段序为 `▶ N running · N pending · <elapsed> · ✓N · ✗N`；
+  `pending` 仅在数量大于 0 时显示；`✓N` 与 `✗N` 对称，均仅在各自数量大于 0 时显示
+  （全失败场景不再出现绿色的 `✓0`）；无 running 时 elapsed 为 `—`。
+  `▶` 在 running/pending 非零时为 accent、否则 dim；running 数为 accent，pending/elapsed 为 dim，
+  完成数为 success，失败数为 error。宽度不足时优先移除可选段并 truncate，再上色。汇总行不可点击。
+  running/pending 始终计数；完成数与 failed/killed 失败数仅统计通过 `/async-clear` 共享 watermark 的终态任务。
+  1Hz 重绘 ticker 归 rail widget 所有，保证 elapsed 持续跳秒。
+- **footer 已弃用（REV-12）**：不再调用 `setStatus("pi-async", …)`；汇总信息并入 rail 首行。
+  `initStatus` 退化为只做 `reportActivity`。`clearedAtMs`/`survivesClearCutoff`/`clearDoneStatus`
+  保留，由 `panel.ts` 与 `/async-clear` 共享。
+- **面板**（仅 `/async`）：`ctx.ui.custom({overlay:true, overlayOptions:
+  {width:"80%", maxHeight:"70%", anchor:"center"}})`；从 rail 点击直入详情时为
+  `{width:"85%", maxHeight:"80%", anchor:"center"}`。固定百分比尺寸，不提供环境变量开关。
+  自绘 mask+frame（legion live-overlay 模式）；左列任务列表（含历史，`h` 切换），点击/Enter 进详情：
   identity/status/elapsed/command/metadata + 输出 tail（128KiB UI 缓冲，12 行跟随滚动，上滚暂停）；
-  键位 `k` kill（二次确认）/`R` rerun/`c` 复制输出路径/`Esc q` 关闭。
+  键位 `k` kill（二次确认）/`R` rerun/`c` 复制输出路径/`q` 关闭。Esc 层级：rail 点击直入详情后 Esc 关闭；
+  列表内进入详情后 Esc 回落列表。
 - **running 任务在列表直接显示最新输出行**（footer pill 模式，ANSI 剥离）——设备码场景用户无需
   agent 中转即可看到输出。
-- shortcut 注册冲突处理：被保留键位占用则回退 `/async` 命令，不硬抢。
 - **早期输出 peek**：`async_logs` 对 running 任务即时可读；`async_run` 返回的 receipt 带
   `outputHint` 提示 agent 设备码等早期输出可直接 peek。
 
@@ -253,7 +267,6 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_MAX_OUTPUT_BYTES` | 20 MiB | 写盘 cap |
 | `PI_ASYNC_MAX_TASKS` | 32 | 注册表上限，超了拒绝新任务 |
 | `PI_ASYNC_HEARTBEAT_MS` | 60_000 | settle 守卫心跳 |
-| `PI_ASYNC_DOCK_SHORTCUT` | "ctrl+alt+a" | 可 off |
 | `PI_ASYNC_RETENTION_MS` | 604_800_000（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | 100 | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
 
@@ -293,7 +306,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 7. 输出安全：注入 ANSI 转义的任务输出，async_logs 返回已剥离
 8. kill：进程组全灭（子进程不残留）；20MiB 超限 kill(output_cap)
 9. settle 守卫：有未决任务时 agent_before_settle 注入提醒并 continue；3 次后放行
-10. TUI（人工）：widget 轨道图渲染 + 点击进面板详情 + 输出 tail 跟随；RPC 下无 TUI 路径执行
+10. TUI（人工）：rail 最多 4 行（含汇总）且汇总行按 token 着色；elapsed 每秒跳变；点击任务进详情；
+    Esc 按 rail/list 来源正确关闭或回落；面板按列表 80%×70%、详情 85%×80% 居中显示；
+    极窄终端不溢出；输出 tail 跟随；RPC 下无 TUI 路径执行
 
 ## 15. 加固层（2026-10-15 事故后追加）
 
