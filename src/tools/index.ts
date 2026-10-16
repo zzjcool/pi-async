@@ -30,7 +30,10 @@ const conditionSchema = {
   oneOf: [
     { type: "object", properties: { type: { const: "exit_code" }, equals: { type: "number" } }, required: ["type", "equals"], additionalProperties: false },
     ...["stdout_contains", "stderr_contains"].map((type) => ({ type: "object", properties: { type: { const: type }, value: stringField }, required: ["type", "value"], additionalProperties: false })),
-    { type: "object", properties: { type: { const: "json_path_exists" }, path: stringField }, required: ["type", "path"], additionalProperties: false },
+    { type: "object", properties: {
+      type: { const: "json_path_exists" },
+      path: { type: "string", pattern: "^\\$", description: "JSONPath rooted at $; e.g. $.ready or $.items[0].state (bare names like \"ready\" are rejected)" },
+    }, required: ["type", "path"], additionalProperties: false },
     { type: "object", properties: { type: { const: "output_matches" }, regex: stringField }, required: ["type", "regex"], additionalProperties: false },
   ],
 };
