@@ -4,9 +4,38 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
-import { fitWidth } from "./width.ts";
+import { displayWidth, fitWidth, truncateToWidth } from "./width.ts";
 import { clearDoneStatus, survivesClearCutoff } from "./status.ts";
 import { tuiHost } from "./host.ts";
+
+type Theme = { fg?(color: string, text: string): string };
+
+/** Paint with host theme; missing/throwing fg falls back to plain text (#41 / #75). */
+export function paint(theme: Theme | null | undefined, token: string, text: string): string {
+  try {
+    const fg = theme?.fg;
+    if (typeof fg !== "function") return text;
+    return fg.call(theme, token, text) ?? text;
+  } catch {
+    return text;
+  }
+}
+
+function statusToken(status: string): string {
+  if (status === "completed") return "success";
+  if (status === "failed" || status === "killed") return "error";
+  return "accent";
+}
+
+function stringifyMetaValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function sectionDivider(theme: Theme | null | undefined, budget: number): string {
+  const bar = "─".repeat(Math.max(0, Math.min(budget, 64)));
+  return paint(theme, "dim", bar);
+}
 
 const isTui = (pi: unknown): boolean => {
   // Event/command contexts carry mode; the factory API does not. Both paths must resolve.
@@ -19,6 +48,51 @@ const PANEL_ROWS = 12;
 const visible = visibleText;
 /** Per-line sanitizer for multiline command display — keeps LF, strips controls/tabs. */
 const visibleLine = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "").replace(/[\t]+/g, " ");
+
+/** Known keys first (outputFile), then remaining keys sorted; each line truncated to budget. */
+export function formatMetadataLines(metadata: Record<string, unknown>, budget: number): string[] {
+  const keys = Object.keys(metadata);
+  const ordered = [
+    ...(["outputFile"] as const).filter((key) => Object.prototype.hasOwnProperty.call(metadata, key)),
+    ...keys.filter((key) => key !== "outputFile").sort(),
+  ];
+  return ordered.map((key) => truncateToWidth(`${key}: ${stringifyMetaValue(metadata[key])}`, Math.max(0, budget)));
+}
+
+export function detailTitleLines(task: { name: string; taskId: string }, theme: Theme | null | undefined): string[] {
+  const name = visibleText(task.name);
+  const id = `[${task.taskId}]`;
+  return [`${paint(theme, "accent", name)} ${paint(theme, "dim", id)}`];
+}
+
+export function detailStatusLines(task: TaskSnapshot, theme: Theme | null | undefined, now: number): string[] {
+  const status = paint(theme, statusToken(task.status), task.status);
+  const elapsed = paint(theme, "dim", formatDuration(task, now));
+  return [`${paint(theme, "dim", "status:")} ${status} · ${paint(theme, "dim", "elapsed:")} ${elapsed}`];
+}
+
+export function commandSection(command: unknown, theme: Theme | null | undefined, budget: number): string[] {
+  const label = paint(theme, "dim", "command:");
+  const lines = String(command ?? "").split(/\r?\n/);
+  const body = lines.map((line) => {
+    const plain = `  ${visibleLine(line)}`;
+    return paint(theme, "text", truncateToWidth(plain, Math.max(0, budget)));
+  });
+  return [label, ...body];
+}
+
+export function metadataSection(metadata: Record<string, unknown>, theme: Theme | null | undefined, budget: number): string[] {
+  const label = paint(theme, "dim", "metadata:");
+  const rows = formatMetadataLines(metadata, Math.max(0, budget - 2)).map((row) => paint(theme, "dim", `  ${row}`));
+  return [label, ...rows];
+}
+
+export function outputSection(tail: string[], truncated: boolean, theme: Theme | null | undefined, budget: number): string[] {
+  const label = paint(theme, "dim", `output${truncated ? " (tail truncated)" : ""}:`);
+  const rows = tail.map((line) => paint(theme, "dim", truncateToWidth(visible(line), Math.max(0, budget))));
+  return [label, ...rows];
+}
+
 function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: string; truncated: boolean } {
   const outputPath = task.metadata.outputFile;
   if (typeof outputPath !== "string") return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
@@ -36,13 +110,23 @@ function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: strin
   }
 }
 
+/** Fit a possibly-ANSI line to a cell budget without counting escape bytes (#75). */
+function fitAnsiLine(text: string, budget: number): string {
+  const plain = stripAnsi(text);
+  if (plain === text) return fitWidth(text, budget);
+  const used = displayWidth(plain);
+  if (used > budget) return fitWidth(plain, budget);
+  return text + " ".repeat(budget - used);
+}
+
 const frame = (title: string, body: string[], width: number, height: number): string[] => {
   const w = Math.max(8, Math.floor(width));
   const h = Math.max(4, Math.floor(height));
   // Title prefix is "╭─ " (3) + "─╮" (2) => budget w-5; body "│ "/" │" (2+2) => w-4.
   // #55 keeps fitTitle(w-5); #7/#62 routes both through fitWidth (cell-aware).
+  // #75: body lines may carry theme ANSI — fit by visible cells, not raw code points.
   const fitTitle = (text: string): string => fitWidth(text, w - 5);
-  const fit = (text: string): string => fitWidth(text, w - 4);
+  const fit = (text: string): string => fitAnsiLine(text, w - 4);
   const content = [`╭─ ${fitTitle(title)}─╮`, ...body.slice(0, h - 2).map((line) => `│ ${fit(line)} │`), `╰${"─".repeat(w - 2)}╯`];
   while (content.length < height) content.splice(content.length - 1, 0, `│${" ".repeat(w - 2)}│`);
   // The solid background masks chat rows beneath the overlay, as in legion-viz's live overlay.
@@ -92,7 +176,8 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
   const custom = host.ui.custom;
   const kind = initialTaskId ? "detail" : "list";
   const ratio = kind === "detail" ? { w: 0.85, h: 0.8 } : { w: 0.8, h: 0.7 };
-  const factory = (tui: unknown, _theme: unknown, _keybindings: unknown, done: (value?: unknown) => void) => {
+  const factory = (tui: unknown, themeArg: unknown, _keybindings: unknown, done: (value?: unknown) => void) => {
+    const theme = (themeArg ?? {}) as Theme;
     let selected = initialTaskId ?? snapshots()[0]?.taskId;
     let detail = Boolean(initialTaskId);
     const origin: "rail" | "list" = initialTaskId ? "rail" : "list";
@@ -137,21 +222,24 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       const outputLines = output.text.split(/\r?\n/).filter((line) => line.length > 0);
       scroll = Math.min(scroll, Math.max(0, outputLines.length - PANEL_ROWS));
       const tail = outputLines.slice(Math.max(0, outputLines.length - PANEL_ROWS - scroll), outputLines.length - scroll);
-      const meta = JSON.stringify(task.metadata);
-      const commandLines = String(task.command ?? "").split(/\r?\n/);
+      const budget = Math.max(1, Math.floor(width) - 4);
       const killHint = task.status === "pending"
         ? "Cancel this pending task? press k again to confirm; any other key cancels"
         : "Kill this task? press k again to confirm; any other key cancels";
+      const divider = sectionDivider(theme, budget);
+      // registry.logs caps its own data at 50 KiB; the TUI intentionally reads a larger 128 KiB tail directly from the output file.
       return [
-        `${visible(task.name)} [${task.taskId}]`, `status: ${task.status} · elapsed: ${formatDuration(task, Date.now())}`,
-        "command:",
-        ...commandLines.map((line) => `  ${visibleLine(line)}`),
-        `metadata: ${meta}`, `output${output.truncated ? " (tail truncated)" : ""}:`,
-        // registry.logs caps its own data at 50 KiB; the TUI intentionally reads a larger 128 KiB tail directly from the output file.
-        ...tail.map(visible),
-        ...(actionError ? [`error: ${visible(actionError)}`] : []),
-        ...(confirmKill ? [killHint] : []),
-        `${origin === "rail" ? "Esc close" : "Esc return"} · k kill/cancel · R rerun · c copy output path · ↑/↓ scroll`,
+        ...detailTitleLines(task, theme),
+        ...detailStatusLines(task, theme, Date.now()),
+        divider,
+        ...commandSection(task.command, theme, budget),
+        divider,
+        ...metadataSection(task.metadata as Record<string, unknown>, theme, budget),
+        divider,
+        ...outputSection(tail, output.truncated, theme, budget),
+        ...(actionError ? [paint(theme, "error", `error: ${visible(actionError)}`)] : []),
+        ...(confirmKill ? [paint(theme, "warning", killHint)] : []),
+        paint(theme, "dim", `${origin === "rail" ? "Esc close" : "Esc return"} · k kill/cancel · R rerun · c copy output path · ↑/↓ scroll`),
       ];
     };
     const render = (nextWidth?: number): string[] => {
