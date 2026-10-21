@@ -33,8 +33,21 @@ function registryDataDir(pi: PiCtx): string {
   return join(cwd, ".pi", "async", `${safeSessionId}-${pid}`);
 }
 
-/** Previous init generation; /reload re-runs init without session_shutdown (#44). */
+/**
+ * Previous init generation. pi 1.3.0 does emit `session_shutdown` on /reload and session
+ * replacement, but the guard must not depend on that event arriving before `init()` runs
+ * again: a timer that outlives the invalidated ctx crashes the whole process (#44 legacy
+ * comment corrected — see the crash regression test in tests/i-factory-contract.test.ts).
+ */
 let activeRegistry: TaskRegistry | undefined;
+
+/**
+ * Previous generation's settle guard. `init()` can run again for a fresh generation
+ * (/reload, session replacement), and the old heartbeat timer must not survive into a
+ * runtime whose API pi has already invalidated (crash 2026-10-21). Release it up front
+ * instead of relying on a teardown event having fired first.
+ */
+let activeGuard: SettleGuard | undefined;
 
 /** Wire the task runtime to the host API, degrading optional Pi features gracefully. */
 export async function init(pi: PiCtx): Promise<void> {
@@ -42,6 +55,12 @@ export async function init(pi: PiCtx): Promise<void> {
   // its processes, watch loops, and timers are released (pi docs: cleanup must be
   // idempotent across reload / session replacement / exit).
   if (activeRegistry) {
+    try {
+      activeGuard?.dispose();
+    } catch (error) {
+      console.error("pi-async: previous settle guard disposal during reload failed", error);
+    }
+    activeGuard = undefined;
     try {
       await activeRegistry.shutdown();
     } catch (error) {
@@ -110,7 +129,11 @@ export async function init(pi: PiCtx): Promise<void> {
     context.on("session_start", (_event: unknown, ctx: unknown) => bindTui(ctx));
     context.on("message_start", (_event: unknown, ctx: unknown) => bindTui(ctx));
   }
-  if (typeof context.on === "function") new SettleGuard(pi, registry).register();
+  if (typeof context.on === "function") {
+    activeGuard?.dispose();
+    activeGuard = new SettleGuard(pi, registry);
+    activeGuard.register();
+  }
 
   let shutdownPromise: Promise<void> | undefined;
   if (typeof context.on === "function") {

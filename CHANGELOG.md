@@ -16,6 +16,21 @@
 
 - rail 首行新增汇总：running、pending（非零时）、elapsed、`✓N` 与 `✗N`（均仅在非零时显示，全失败时不出绿色的 `✓0`）；终态计数遵循 `/async-clear` watermark。
 
+### Fixed
+
+- **settle 守卫心跳会在 ctx 失效后杀死整个 pi 进程**（崩溃 2026-10-21，`pi` 1.3.0）。
+  宿主一旦使捕获的 factory ctx 失效（会话替换或 reload），`pi.appendEntry` 就会抛
+  "This extension ctx is stale"；而心跳跑在 `setInterval` 回调里，**不在 pi 事件循环的
+  try/catch 内**，异常逃逸成 `uncaughtException`，pi 直接退出。
+  现在不论哪条 teardown 没跑到，守卫都能自愈：
+  - 心跳与 `agent_before_settle` 的 `appendEntry` 捕获 stale ctx 后**自我销毁**（清 timer +
+    解绑 hook），不再重试已死的 API；
+  - `init()` 在生成新一代时先 `dispose()` 上一代守卫（`activeGuard`），不依赖某个 teardown
+    事件已先抵达；
+  - 钩子释放改用 `pi.on()` 返回的退订函数 —— 真实宿主**没有** `pi.off()`，此前的
+    `hooks.off?.()` 恒为空操作，等同于从不解绑；
+  - `reportActivity` 读取 `pi.ui` 时同样捕获 stale ctx（`ui` getter 也走 `assertActive`）。
+
 ## 0.2.0 — 2026-10-16
 
 自 0.1.0 起的 16 个提交，主体是 Wave1/Wave2 缺陷修复，附带少量新能力与若干

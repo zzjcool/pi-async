@@ -98,3 +98,55 @@ test("init never throws when the factory API is missing optional methods entirel
     resetTuiHostForTests();
   }
 });
+
+/**
+ * Regression: 2026-10-21 crash. A generation's heartbeat timer must never
+ * outlive the ctx it captured: once pi invalidates that API (session
+ * replacement / reload), `appendEntry` throws "This extension ctx is stale",
+ * and a throw from a timer callback is not caught by pi's event loop —
+ * it escapes as uncaughtException and kills pi. `init()` therefore releases the
+ * previous generation up front rather than trusting a teardown event to land
+ * first (pi emits `session_shutdown` on reload, but the ordering is not ours to
+ * assume).
+ */
+test("a second init() releases the previous generation's heartbeat timer", async () => {
+  resetTuiHostForTests();
+  const dir = mkdtempSync(join(tmpdir(), "pi-async-reload-guard-"));
+  const created: Array<ReturnType<typeof setInterval>> = [];
+  const cleared = new Set<ReturnType<typeof setInterval>>();
+  const realSet = globalThis.setInterval;
+  const realClear = globalThis.clearInterval;
+  // SAFETY: the test swaps only the two timer functions for the duration of one init pair.
+  globalThis.setInterval = ((handler: never, ms?: number) => {
+    const handle = realSet(handler, ms);
+    created.push(handle);
+    return handle;
+  }) as unknown as typeof globalThis.setInterval;
+  globalThis.clearInterval = ((handle: never) => {
+    cleared.add(handle);
+    return realClear(handle);
+  }) as unknown as typeof globalThis.clearInterval;
+  const generation = (): Record<string, unknown> => ({
+    cwd: dir,
+    pid: process.pid,
+    sessionManager: { getSessionId: () => "reload-guard-session" },
+    registerTool: () => undefined,
+    on: () => () => undefined,
+    appendEntry: () => undefined,
+  });
+  const prev = process.env.PI_ASYNC_HEARTBEAT_MS;
+  process.env.PI_ASYNC_HEARTBEAT_MS = "5";
+  try {
+    await init(generation() as never);
+    assert.equal(created.length, 1, "the first generation starts one heartbeat timer");
+    await init(generation() as never);
+    assert.ok(cleared.has(created[0]!), "init() must clear the reloaded generation's timer");
+  } finally {
+    globalThis.setInterval = realSet;
+    globalThis.clearInterval = realClear;
+    if (prev === undefined) delete process.env.PI_ASYNC_HEARTBEAT_MS;
+    else process.env.PI_ASYNC_HEARTBEAT_MS = prev;
+    rmSync(dir, { recursive: true, force: true });
+    resetTuiHostForTests();
+  }
+});
