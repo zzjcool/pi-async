@@ -80,3 +80,22 @@ jobs:
 
       - name: Package contents
         run: npm pack --dry-run
+
+  # Branch protection on main requires a status check named exactly "ci".
+  # The matrix job above reports "ci (node 22)" / "ci (node 24)", so this
+  # aggregation job carries the required name and fails if either lane failed.
+  ci-gate:
+    name: ci
+    needs: [ci, pi-1-5]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify required jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "matrix ci: ${{ needs.ci.result }}"
+          echo "pi 1.5.0 compat: ${{ needs['pi-1-5'].result }}"
+          test "${{ needs.ci.result }}" = "success"
+          test "${{ needs['pi-1-5'].result }}" = "success"
