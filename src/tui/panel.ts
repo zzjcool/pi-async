@@ -1,4 +1,3 @@
-import { openSync, closeSync, fstatSync, readSync } from "node:fs";
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
@@ -44,10 +43,32 @@ const isTui = (pi: unknown): boolean => {
 };
 
 const UI_TAIL_BYTES = 128 * 1024;
+/** The list shows one live output line per task — a small tail window is enough (§2.9). */
+const LIST_TAIL_BYTES = 16 * 1024;
 const PANEL_ROWS = 12;
+/** PageUp/PageDown step for the detail body. */
+const PAGE_SCROLL = PANEL_ROWS;
+/** Identity lines kept above the `… (+K lines)` marker when the detail body overflows. */
+const DETAIL_HEADER_LINES = 2;
+/** 0.3.0 §2.9: kill moved off `k` (which now scrolls up) onto `x`/`X`/`K`. */
+const KILL_KEYS = new Set(["x", "X", "K"]);
 const visible = visibleText;
 /** Per-line sanitizer for multiline command display — keeps LF, strips controls/tabs. */
 const visibleLine = (value: unknown): string => stripAnsi(String(value ?? "")).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "").replace(/[\t]+/g, " ");
+
+/**
+ * Mask a delayed task's env values but keep the keys: they are credentials-in-waiting,
+ * exactly like the async_status redaction (D-08). Kept local so the panel never imports src/tools.
+ */
+function maskDelayedEnv(value: unknown): string {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return "***";
+  const keys = Object.keys(value as Record<string, unknown>);
+  return keys.length === 0 ? "***" : `{ ${keys.map((key) => `${key}: "***"`).join(", ")} }`;
+}
+
+function metadataText(key: string, value: unknown): string {
+  return key === "delayedEnv" ? maskDelayedEnv(value) : stringifyMetaValue(value);
+}
 
 /** Known keys first (outputFile), then remaining keys sorted; each line truncated to budget. */
 export function formatMetadataLines(metadata: Record<string, unknown>, budget: number): string[] {
@@ -56,7 +77,7 @@ export function formatMetadataLines(metadata: Record<string, unknown>, budget: n
     ...(["outputFile"] as const).filter((key) => Object.prototype.hasOwnProperty.call(metadata, key)),
     ...keys.filter((key) => key !== "outputFile").sort(),
   ];
-  return ordered.map((key) => truncateToWidth(`${key}: ${stringifyMetaValue(metadata[key])}`, Math.max(0, budget)));
+  return ordered.map((key) => truncateToWidth(`${key}: ${metadataText(key, metadata[key])}`, Math.max(0, budget)));
 }
 
 export function detailTitleLines(task: { name: string; taskId: string }, theme: Theme | null | undefined): string[] {
@@ -93,21 +114,28 @@ export function outputSection(tail: string[], truncated: boolean, theme: Theme |
   return [label, ...rows];
 }
 
-function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: string; truncated: boolean } {
-  const outputPath = task.metadata.outputFile;
-  if (typeof outputPath !== "string") return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
+/**
+ * Bounded output tail, always asked of the registry: it enforces the dataDir boundary
+ * (D-11) and the task may already be pruned, so a throw means "show nothing".
+ */
+function logsTail(registry: TaskRegistry, taskId: string, maxBytes: number): { text: string; truncated: boolean } {
   try {
-    const fd = openSync(outputPath, "r");
-    try {
-      const size = fstatSync(fd).size;
-      const start = Math.max(0, size - UI_TAIL_BYTES);
-      const buffer = Buffer.alloc(Math.min(size, UI_TAIL_BYTES));
-      readSync(fd, buffer, 0, buffer.length, start);
-      return { text: stripAnsi(buffer.toString("utf8")), truncated: start > 0 };
-    } finally { closeSync(fd); }
+    const slice = registry.logs(taskId, { maxBytes, tail: true });
+    return { text: stripAnsi(slice.text), truncated: slice.truncated };
   } catch {
-    return { text: registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text, truncated: false };
+    // Unknown/pruned task or an outputFile outside the data dir — never read it, never throw.
+    return { text: "", truncated: false };
   }
+}
+
+function readUiOutput(task: TaskSnapshot, registry: TaskRegistry): { text: string; truncated: boolean } {
+  return logsTail(registry, task.taskId, UI_TAIL_BYTES);
+}
+
+/** Newest non-empty output line for the list row (bounded tail, never a whole-file read). */
+function latestOutputLine(task: TaskSnapshot, registry: TaskRegistry): string | undefined {
+  const text = logsTail(registry, task.taskId, LIST_TAIL_BYTES).text;
+  return text.split(/\r?\n/).filter(Boolean).at(-1);
 }
 
 /** Fit a possibly-ANSI line to a cell budget without counting escape bytes (#75). */
@@ -159,19 +187,39 @@ export function registerPanelCommands(pi: PiCtx, registry: TaskRegistry): void {
   });
 }
 
+/**
+ * D-14: the overlay is a module-level singleton. A second `/async` (or a rail click
+ * while the panel is open) must not stack another overlay.
+ */
+let panelOpen: symbol | undefined;
+
+/** @internal Test-only: forget an open panel so isolated unit tests can re-open one. */
+export function resetPanelForTests(): void {
+  panelOpen = undefined;
+}
+
 export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: string): void {
   // Event/command contexts carry a working ui; rail-click paths pass the factory
   // pi, whose ui is undefined — fall back to the bound TUI host in that case.
   const ctxUi = (pi as { ui?: Record<string, unknown> }).ui ?? tuiHost()?.ui;
   const host = {
     ui: ctxUi as {
-      copyToClipboard?: (text: string) => void;
       custom?: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => unknown, options: unknown) => Promise<unknown>;
       notify?: (message: string, level?: string) => void;
       setStatus?: (key: string, text: string | undefined) => void;
     } | undefined,
   };
   if (!isTui(pi) || typeof host.ui?.custom !== "function") return;
+  if (panelOpen !== undefined) {
+    host.ui.notify?.("Async panel is already open", "info");
+    return;
+  }
+  // Set before custom(): the host may render synchronously, and a reject must not leak the flag.
+  const token = Symbol("pi-async-panel");
+  panelOpen = token;
+  const release = (): void => {
+    if (panelOpen === token) panelOpen = undefined;
+  };
   const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => survivesClearCutoff(task));
   const custom = host.ui.custom;
   const kind = initialTaskId ? "detail" : "list";
@@ -190,9 +238,45 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     let height = process.stdout.rows ?? 24;
     let lastLines: string[] = [];
     let actionError: string | undefined;
+    let closed = false;
+    let unsubscribe: (() => void) | undefined;
     const requestRender = (): void => {
-      (tui as { requestRender?: () => void } | undefined)?.requestRender?.();
+      // A stale subscription (registry still holding our listener) must not render.
+      if (closed) return;
+      try {
+        (tui as { requestRender?: () => void } | undefined)?.requestRender?.();
+      } catch {
+        // A dead overlay host must not break the render loop.
+      }
     };
+    /** Single teardown path for done / dispose / custom() failure — keeps the subscription leak-free. */
+    const teardown = (): void => {
+      if (closed) return;
+      closed = true;
+      release();
+      const off = unsubscribe;
+      unsubscribe = undefined;
+      if (!off) return;
+      try {
+        off();
+      } catch {
+        // Registry may already be torn down (reload/quit); unsubscribing is best-effort.
+      }
+    };
+    const close = (value?: unknown): void => {
+      teardown();
+      done(value);
+    };
+    // W1a adds `subscribe`; older/mock registries (0.2.x hosts) do not have it.
+    const subscribe = (registry as unknown as { subscribe?: (listener: () => void) => () => void }).subscribe;
+    if (typeof subscribe === "function") {
+      try {
+        const off = subscribe.call(registry, () => requestRender());
+        if (typeof off === "function") unsubscribe = off;
+      } catch {
+        // A registry that cannot publish events simply never refreshes us.
+      }
+    }
     const filtered = (): TaskSnapshot[] => snapshots().filter((task) => history || task.status === "running" || task.status === "pending");
     const choose = (): TaskSnapshot | undefined => snapshots().find((task) => task.taskId === selected);
     const listBudget = (): number => Math.max(1, height - 3); // frame borders + hint row
@@ -205,13 +289,36 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       listScroll = Math.max(0, Math.min(listScroll, Math.max(0, tasks.length - budget)));
       return listScroll;
     };
-    const renderBody = (): string[] => {
+    const footerLine = (): string => paint(
+      theme,
+      "dim",
+      `${origin === "rail" ? "Esc close" : "Esc return"} · x kill/cancel · R rerun · c show output path · ↑/↓ scroll`,
+    );
+    /**
+     * Keep the header and the footer visible; collapse the middle into `… (+K lines)`.
+     * The footer is always the last emitted line, so `frame` can never silently cut it.
+     */
+    const withBodyBudget = (lines: string[], budget: number): string[] => {
+      const limit = Math.max(1, Math.floor(budget));
+      if (lines.length <= limit) return lines;
+      const headerCount = Math.min(DETAIL_HEADER_LINES, Math.max(0, limit - 1));
+      const tailCount = limit - headerCount - 1;
+      const last = lines[lines.length - 1]!;
+      // Degenerate viewport: the key hints outrank every other line.
+      if (tailCount <= 0) return [last];
+      const hidden = lines.length - headerCount - tailCount;
+      return [
+        ...lines.slice(0, headerCount),
+        paint(theme, "dim", `… (+${hidden} lines)`),
+        ...lines.slice(lines.length - tailCount),
+      ];
+    };
+    const renderBody = (budget: number): string[] => {
       const tasks = filtered();
       if (!detail) {
         const start = ensureListWindow(tasks);
-        const budget = listBudget();
-        const rows = tasks.slice(start, start + budget).map((task) => {
-          const output = task.status === "running" ? registry.logs(task.taskId, { maxBytes: UI_TAIL_BYTES, tail: true }).text.split(/\r?\n/).filter(Boolean).at(-1) : undefined;
+        const rows = tasks.slice(start, start + Math.max(1, budget - 1)).map((task) => {
+          const output = task.status === "running" ? latestOutputLine(task, registry) : undefined;
           return `${task.taskId === selected ? "▶" : " "} ${visible(task.name)} · ${task.status} · ${formatDuration(task, Date.now())}${output ? ` · ${visible(output)}` : ""}`;
         });
         return ["↑/↓ select · Enter details · h history · q close", ...rows];
@@ -222,25 +329,24 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       const outputLines = output.text.split(/\r?\n/).filter((line) => line.length > 0);
       scroll = Math.min(scroll, Math.max(0, outputLines.length - PANEL_ROWS));
       const tail = outputLines.slice(Math.max(0, outputLines.length - PANEL_ROWS - scroll), outputLines.length - scroll);
-      const budget = Math.max(1, Math.floor(width) - 4);
+      const lineBudget = Math.max(1, Math.floor(width) - 4);
       const killHint = task.status === "pending"
-        ? "Cancel this pending task? press k again to confirm; any other key cancels"
-        : "Kill this task? press k again to confirm; any other key cancels";
-      const divider = sectionDivider(theme, budget);
-      // registry.logs caps its own data at 50 KiB; the TUI intentionally reads a larger 128 KiB tail directly from the output file.
-      return [
+        ? "Cancel this pending task? press x again to confirm; any other key cancels"
+        : "Kill this task? press x again to confirm; any other key cancels";
+      const divider = sectionDivider(theme, lineBudget);
+      return withBodyBudget([
         ...detailTitleLines(task, theme),
         ...detailStatusLines(task, theme, Date.now()),
         divider,
-        ...commandSection(task.command, theme, budget),
+        ...commandSection(task.command, theme, lineBudget),
         divider,
-        ...metadataSection(task.metadata as Record<string, unknown>, theme, budget),
+        ...metadataSection(task.metadata as Record<string, unknown>, theme, lineBudget),
         divider,
-        ...outputSection(tail, output.truncated, theme, budget),
+        ...outputSection(tail, output.truncated, theme, lineBudget),
         ...(actionError ? [paint(theme, "error", `error: ${visible(actionError)}`)] : []),
         ...(confirmKill ? [paint(theme, "warning", killHint)] : []),
-        paint(theme, "dim", `${origin === "rail" ? "Esc close" : "Esc return"} · k kill/cancel · R rerun · c copy output path · ↑/↓ scroll`),
-      ];
+        footerLine(),
+      ], budget);
     };
     const render = (nextWidth?: number): string[] => {
       width = nextWidth ?? Math.max(20, Math.floor((process.stdout.columns ?? 120) * ratio.w));
@@ -248,10 +354,10 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       // exceeds what the host will render and the bottom border gets sliced off.
       const rows = process.stdout.rows ?? 24;
       height = Math.min(Math.max(6, Math.floor(rows * ratio.h)), Math.max(4, rows - 2));
-      lastLines = renderBody();
-      const maxScroll = Math.max(0, lastLines.length - PANEL_ROWS);
+      lastLines = renderBody(Math.max(1, height - 2));
+      // The body is already budgeted, so its length no longer measures the scroll range;
+      // renderBody clamps `scroll` against the real output-line count instead.
       if (follow) scroll = 0;
-      else scroll = Math.min(scroll, maxScroll);
       return frame(detail ? "Async task detail" : "Async tasks", lastLines, width, height);
     };
     const move = (delta: number): void => {
@@ -265,16 +371,32 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       else if (detail && delta > 0) { scroll = Math.max(0, scroll - delta); follow = scroll === 0; }
       requestRender();
     };
+    const killSelected = (): void => {
+      const task = choose();
+      if (!task || (task.status !== "running" && task.status !== "pending")) return;
+      const fail = (error: unknown): void => {
+        actionError = String(error);
+        host.ui?.notify?.(actionError, "error");
+        requestRender();
+      };
+      // §2.9: a rejected kill must surface in the panel instead of an unhandled rejection.
+      try {
+        void Promise.resolve(registry.kill(task.taskId, "user")).catch(fail);
+      } catch (error) {
+        // Some hosts throw synchronously instead of rejecting; treat both the same.
+        fail(error);
+      }
+    };
     let latchedId: string | undefined;
     return {
       render,
       handleInput(data: string): void {
         const key = data.toLowerCase();
-        if (confirmKill && key !== "k") { confirmKill = false; requestRender(); return; }
-        if (key === "q") { done(undefined); return; }
+        if (confirmKill && !KILL_KEYS.has(data)) { confirmKill = false; requestRender(); return; }
+        if (key === "q") { close(undefined); return; }
         if (isEscapeKey(data)) {
           if (detail && origin === "list") { detail = false; confirmKill = false; actionError = undefined; requestRender(); }
-          else done(undefined);
+          else close(undefined);
           return;
         }
         if (key === "h" && !detail) {
@@ -286,19 +408,35 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           return;
         }
         if (data === "\r" || data === "\n") { detail = true; scroll = 0; follow = true; actionError = undefined; requestRender(); return; }
-        if (data === "\u001b[A" || data === "k") { if (detail && key === "k") {
+        // PLAN §2.9: PageUp/PageDown page the detail body (PageUp = older lines).
+        // renderBody clamps the actual offset against the output length.
+        if (detail && (data === "\u001b[5~" || data === "\u001b[6~")) {
+          scroll = Math.max(0, scroll + (data === "\u001b[5~" ? PAGE_SCROLL : -PAGE_SCROLL));
+          follow = scroll === 0;
+          requestRender();
+          return;
+        }
+        // Kill lives above the movement keys: `K` is a kill key, `k` alone scrolls up.
+        if (detail && KILL_KEYS.has(data)) {
           if (!confirmKill) { confirmKill = true; requestRender(); return; }
           confirmKill = false;
-          const task = choose();
-          if (task?.status === "running" || task?.status === "pending") void registry.kill(task.taskId, "user");
-          requestRender(); return;
-        } move(-1); return; }
+          killSelected();
+          requestRender();
+          return;
+        }
+        if (data === "\u001b[A" || key === "k") { move(-1); return; }
         if (data === "\u001b[B" || key === "j") { move(1); return; }
         if (data === "R" && detail) {
           const task = choose();
           if (task) {
             try {
-              const created = registry.submit({ command: task.command, name: task.name, mode: "background" });
+              // Rerun keeps the original task's cwd (REV-13) instead of the host process cwd.
+              const created = registry.submit({
+                command: task.command,
+                name: task.name,
+                mode: "background",
+                ...(task.cwd ? { cwd: task.cwd } : {}),
+              });
               selected = created.taskId;
               scroll = 0;
               follow = true;
@@ -312,9 +450,10 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         }
         if (data === "c" && detail) {
           const path = choose()?.metadata.outputFile;
+          // §2.9: pi has no copyToClipboard API — show the path so the user can copy it.
           if (typeof path === "string") {
-            if (host.ui?.copyToClipboard) host.ui.copyToClipboard(path);
-            else host.ui?.notify?.(path, "info");
+            host.ui?.notify?.(path, "info");
+            requestRender();
           }
         }
       },
@@ -353,17 +492,22 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         requestRender();
         return { handled: true };
       },
-      dispose(): void { void width; },
+      dispose(): void { teardown(); },
     };
   };
   // custom() resolves undefined outside supported TUI contexts. The RPC peer's
   // custom() returns a Promise even though mode guards prevent invocation there.
-  void custom(factory, {
-    overlay: true,
-    overlayOptions: {
-      width: kind === "detail" ? "85%" : "80%",
-      maxHeight: kind === "detail" ? "80%" : "70%",
-      anchor: "center",
-    },
-  }).catch(() => undefined);
+  try {
+    void Promise.resolve(custom.call(host.ui, factory, {
+      overlay: true,
+      overlayOptions: {
+        width: kind === "detail" ? "85%" : "80%",
+        maxHeight: kind === "detail" ? "80%" : "70%",
+        anchor: "center",
+      },
+    })).catch(() => release());
+  } catch {
+    // A synchronously throwing custom() must not leave the singleton latched open.
+    release();
+  }
 }

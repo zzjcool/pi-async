@@ -35,7 +35,7 @@ test("#4 spawn writes distinct stdout/stderr sidecars; watches do not cross-matc
       },
     });
     const outFile = String(f.registry.get(stdoutOnly.taskId)!.metadata.outputFile);
-    const { stdoutFile, stderrFile } = streamPaths(outFile);
+    const { stdout: stdoutFile, stderr: stderrFile } = streamPaths(outFile);
     await new Promise((r) => setTimeout(r, 200));
     assert.ok(existsSync(stdoutFile));
     assert.match(readFileSync(stdoutFile, "utf8"), /THIS_IS_ON_STDOUT/);

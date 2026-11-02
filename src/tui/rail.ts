@@ -3,8 +3,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
-import { summarySegments, survivesClearCutoff, type SummaryCounts } from "./status.ts";
-import { envNumber } from "../core/env.ts";
+import { inRailWindow, railLingerMs, railWindowCounts, summarySegments, type SummaryCounts } from "./status.ts";
 import { displayWidth, truncateToWidth } from "./width.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
@@ -14,7 +13,8 @@ type Theme = { fg(color: string, text: string): string; getFgAnsi?(color: string
 export interface RailWidget {
   render(width?: number): string[];
   handleMouse(event: TuiMouseEvent): { handled: boolean } | undefined;
-  handleInput?(data: string): { handled?: boolean } | void;
+  // 0.3.0 §2.9: the rail has no keyboard scrolling (it never receives focus), so
+  // `handleInput` / `RAIL_PAGE` were removed. Mouse wheel + click remain.
   dispose?(): void;
 }
 
@@ -86,29 +86,7 @@ export function renderRailRows(snapshots: TaskSnapshot[], width: number, now = D
   return rows.map((row) => truncateToWidth(row, limit));
 }
 
-/** Terminal-task linger window on the rail, overridable for tests. */
-function lingerMsFromEnv(): number {
-  return envNumber("PI_ASYNC_RAIL_LINGER_MS", 30_000, { integer: true, min: 0 });
-}
-
-const RAIL_PAGE = 2;
 let railTicker: ReturnType<typeof setInterval> | undefined;
-
-function summaryCounts(registry: TaskRegistry): SummaryCounts {
-  const all = registry.list({ includeHistory: true });
-  const running = all.filter((task) => task.status === "running");
-  const pending = all.filter((task) => task.status === "pending").length;
-  const visibleTerminal = all.filter((task) => TERMINAL.has(task.status) && survivesClearCutoff(task));
-  return {
-    running: running.length,
-    pending,
-    completed: visibleTerminal.filter((task) => task.status === "completed").length,
-    failed: visibleTerminal.filter((task) => task.status === "failed" || task.status === "killed").length,
-    ...(running.length ? { longestRunningStartedAt: Math.min(...running.map((task) => task.startedAt ?? task.createdAt)) } : {}),
-  };
-}
-
-const TERMINAL = new Set(["completed", "failed", "killed"]);
 
 function coloredSummary(counts: SummaryCounts, now: number, width: number, theme: Theme): string {
   const plainSegments = summarySegments(counts, now);
@@ -142,7 +120,10 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
   void pi;
   return (tui, theme) => {
     if (railTicker) clearInterval(railTicker);
-    const ticker = setInterval(() => tui.requestRender(), 1_000);
+    const ticker = setInterval(() => {
+      // A disposed/failing host must not crash the timer (same class as the retired heartbeat).
+      try { tui.requestRender(); } catch { /* repaint is best-effort */ }
+    }, 1_000);
     railTicker = ticker;
     ticker.unref?.();
     let scroll = 0;
@@ -150,34 +131,28 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     let latchedId: string | undefined;
     // Terminal tasks linger briefly so the user sees the outcome, then drop off
     // the rail (CONTRACT §8: idle sessions render nothing). Live tasks always show.
-    const lingerMs = lingerMsFromEnv();
-    const ordered = (now = Date.now()): TaskSnapshot[] => registry.list({ includeHistory: true })
-      .filter((task) => task.status === "running" || task.status === "pending"
-        || (now - (task.finishedAt ?? task.startedAt ?? task.createdAt)) < lingerMs)
+    const lingerMs = railLingerMs();
+    // Rows and summary counts are drawn from one snapshot + one window so `✓N`
+    // always has a matching row (0.3.0 §2.9).
+    const listAll = (): TaskSnapshot[] => {
+      try { return registry.list({ includeHistory: true }); } catch { return []; }
+    };
+    const ordered = (all: TaskSnapshot[], now = Date.now()): TaskSnapshot[] => all
+      .filter((task) => inRailWindow(task, now, lingerMs))
       .sort((a, b) => statePriority[a.status] - statePriority[b.status] || (b.startedAt ?? b.createdAt) - (a.startedAt ?? a.createdAt));
     const clampScroll = (count: number, taskSlots: number): void => {
       scroll = Math.max(0, Math.min(scroll, Math.max(0, count - taskSlots)));
     };
-    const applyScroll = (delta: number): boolean => {
-      const count = ordered().length;
-      if (count <= RAIL_TASK_SLOTS) return false;
-      const taskSlots = RAIL_TASK_SLOTS_OVERFLOW;
-      const next = Math.max(0, Math.min(count - taskSlots, scroll + delta));
-      if (next === scroll) return false;
-      scroll = next;
-      latchedId = undefined;
-      tui.requestRender();
-      return true;
-    };
     const render = (width = 120): string[] => {
       const now = Date.now();
-      const tasks = ordered(now);
+      const all = listAll();
+      const tasks = ordered(all, now);
       if (tasks.length === 0) { hitRows = []; return []; }
       const overflow = tasks.length > RAIL_TASK_SLOTS;
       const taskSlots = overflow ? RAIL_TASK_SLOTS_OVERFLOW : RAIL_TASK_SLOTS;
       clampScroll(tasks.length, taskSlots);
       const visible = tasks.slice(scroll, scroll + taskSlots);
-      const counts = summaryCounts(registry);
+      const counts = railWindowCounts(all, now, lingerMs);
       hitRows = ["", ...visible.map((task) => task.taskId)];
       const used = [swatch(theme, "error"), swatch(theme, "dim")];
       const rows = [coloredSummary(counts, now, width, theme), ...renderRailRows(visible, width).map((row, index) => {
@@ -219,20 +194,10 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     };
     return {
       render,
-      handleInput(data: string): { handled?: boolean } | void {
-        // PageUp / PageDown, and Ctrl+↑ / Ctrl+↓ when the rail has focus.
-        if (data === "\u001b[5~" || data === "\u001b[1;5A") {
-          return applyScroll(-RAIL_PAGE) ? { handled: true } : undefined;
-        }
-        if (data === "\u001b[6~" || data === "\u001b[1;5B") {
-          return applyScroll(RAIL_PAGE) ? { handled: true } : undefined;
-        }
-        return undefined;
-      },
       handleMouse(event: TuiMouseEvent): { handled: boolean } | undefined {
         const mouse = event as TuiMouseEvent & { type: string; y: number; button?: string; wheelDelta?: number };
         if (mouse.type === "wheel") {
-          const count = ordered().length;
+          const count = ordered(listAll()).length;
           if (count <= RAIL_TASK_SLOTS) return undefined;
           const taskSlots = RAIL_TASK_SLOTS_OVERFLOW;
           const next = Math.max(0, Math.min(count - taskSlots, scroll + Math.trunc(mouse.wheelDelta ?? 0)));

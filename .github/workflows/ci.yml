@@ -11,9 +11,45 @@ permissions:
 
 jobs:
   ci:
-    name: ci
+    name: ci (node ${{ matrix.node }})
     # Pinned, not ubuntu-latest: the label migrates to Ubuntu 26 on
     # 2026-10-19 (runner-images#14748). Move to 26.04 deliberately.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          check-latest: true
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        run: npm test
+
+      - name: Package contents
+        run: npm pack --dry-run
+
+  # The typecheck/test baseline above runs against the peer-dependency
+  # versions npm resolves for ^1.2.0. This job re-runs both against the
+  # newest supported host (pi 1.5.0) so host-side validation changes
+  # (pi 1.5.0 moved tool-argument validation to @earendil-works/pi-schema)
+  # cannot land silently broken.
+  pi-1-5:
+    name: pi 1.5.0 compat
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -30,8 +66,17 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: typecheck
+      - name: Install pi 1.5.0 type baseline
+        run: >-
+          npm install --no-save
+          @earendil-works/pi-coding-agent@1.5.0
+          @earendil-works/pi-tui@1.5.0
+
+      - name: typecheck against pi 1.5.0
         run: npm run typecheck
 
-      - name: test
+      - name: test against pi 1.5.0
         run: npm test
+
+      - name: Package contents
+        run: npm pack --dry-run

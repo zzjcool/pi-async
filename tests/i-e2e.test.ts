@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,8 +7,9 @@ import { init } from "../extensions/index.ts";
 
 type Tool = {
   name: string;
-  execute: (toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
+  execute: (toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
 };
+type ToolCtx = { cwd?: string; sessionManager?: { getSessionDir?: () => string; getSessionId?: () => string } };
 type Hook = (...args: unknown[]) => unknown;
 type Receipt = { taskId: string; status: string; outputTail?: string; exitCode?: number; mode?: string };
 
@@ -31,15 +32,18 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
   const tools = new Map<string, Tool>();
   const hooks = new Map<string, Hook>();
   const messages: Array<{ message: Record<string, unknown>; options: Record<string, unknown> }> = [];
+  const sessionManager = { getSessionDir: () => cwd, getSessionId: () => "i-e2e-session" };
   const pi = {
     cwd,
     pid: process.pid,
     mode: "rpc",
-    sessionManager: { getSessionId: () => "i-e2e-session" },
+    sessionManager,
     registerTool: (tool: Tool) => tools.set(tool.name, tool),
     on: (event: string, handler: Hook) => { hooks.set(event, handler); return () => hooks.delete(event); },
     sendMessage: (message: Record<string, unknown>, options: Record<string, unknown>) => { messages.push({ message, options }); },
   };
+  // Every tool call carries the session ctx (cwd + sessionManager), as pi does at runtime.
+  const ctx: ToolCtx = { cwd, sessionManager };
 
   try {
     await init(pi as never);
@@ -49,9 +53,11 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     const wait = tools.get("async_wait")!.execute;
 
     // Background: real shell child, event-driven wait, and captured stdout/exit status.
-    const background = payload(await run("e2e-background", { command: "echo hi", mode: "background" }));
+    const background = payload(await run("e2e-background", { command: "echo hi", mode: "background" }, undefined, undefined, ctx));
+    // D-16: the registry data dir is <sessionDir>/pi-async/<sessionId> — never the real homedir.
+    assert.ok(existsSync(join(cwd, "pi-async", "i-e2e-session", `${background.taskId}.json`)), "snapshot lives in the session-scoped data dir");
     assert.equal(background.status, "running");
-    const backgroundResult = payload(await wait("e2e-wait-background", { taskIds: [background.taskId], timeoutMs: 5000 })) as unknown as { results: Receipt[] };
+    const backgroundResult = payload(await wait("e2e-wait-background", { taskIds: [background.taskId], timeoutMs: 5000 }, undefined, undefined, ctx)) as unknown as { results: Receipt[] };
     assert.equal(backgroundResult.results[0]?.status, "completed");
     assert.equal(backgroundResult.results[0]?.exitCode, 0);
     assert.match(backgroundResult.results[0]?.outputTail ?? "", /hi/);
@@ -149,7 +155,8 @@ test("TUI init registers status, rail widget, and panel commands", async () => {
     cwd,
     pid: process.pid,
     mode: "tui",
-    sessionManager: { getSessionId: () => "i-tui-session" },
+    // D-16: never let a test fall back to the real ~/.pi data dir.
+    sessionManager: { getSessionDir: () => cwd, getSessionId: () => "i-tui-session" },
     registerTool: () => undefined,
     registerCommand: (name: string) => { commands.push(name); },
     on: (event: string, handler: Hook) => { hooks.set(event, handler); return () => hooks.delete(event); },

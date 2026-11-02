@@ -152,108 +152,80 @@ test("reloadFromDisk skips snapshots with unknown status (#34)", async () => {
 });
 
 // --- #44 reload orphans ---
-test("re-init shuts down the previous registry generation (#44)", async () => {
+test("re-init suspends the previous generation and the next configure adopts its task (#44)", async () => {
   const base = tmpDir("pi-async-w2-rrl-");
+  const sessionId = "w2-reload";
+  const dataDir = join(base, "pi-async", sessionId);
   const pids: number[] = [];
-  const makePi = (dataCwd: string) => {
-    const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
-    return {
-      cwd: dataCwd,
-      pid: process.pid,
-      sessionId: "reload-test",
-      registerTool: () => {},
-      on: (event: string, handler: (...args: unknown[]) => unknown) => {
-        const list = handlers.get(event) ?? [];
+  type Tool = { name: string; execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<{ details: { payload?: unknown }; isError?: boolean }> };
+  type Hook = (...args: unknown[]) => unknown;
+  const makeGen = () => {
+    const tools = new Map<string, Tool>();
+    const hooks = new Map<string, Hook[]>();
+    const sessionManager = { getSessionDir: () => base, getSessionId: () => sessionId };
+    const ctx = { mode: "rpc", hasUI: false, cwd: base, sessionManager };
+    // CONTRACT §15: the factory-time API carries no session cwd/pid — only event ctxs do.
+    const pi = {
+      sessionManager,
+      registerTool: (tool: Tool) => { tools.set(tool.name, tool); },
+      registerMessageRenderer: () => undefined,
+      sendMessage: () => undefined,
+      on: (event: string, handler: Hook) => {
+        const list = hooks.get(event) ?? [];
         list.push(handler);
-        handlers.set(event, list);
+        hooks.set(event, list);
+        return () => undefined;
       },
-      _handlers: handlers,
     };
+    const dispatch = async (event: string, payload?: unknown) => { for (const handler of hooks.get(event) ?? []) await handler(payload, ctx); };
+    const call = async <T,>(name: string, params: Record<string, unknown>): Promise<T> => {
+      const tool = tools.get(name);
+      assert.ok(tool, `${name} must be registered`);
+      const result = await tool.execute("call", params, undefined, undefined, ctx);
+      return result.details.payload as T;
+    };
+    return { pi, dispatch, call };
   };
-  // Isolate data dirs per generation so reloadFromDisk does not re-attach live work;
-  // we only assert that the previous generation's process is killed by re-init.
-  const dirs: string[] = [];
-  try {
-    for (let i = 0; i < 2; i++) {
-      const dir = join(base, `gen${i}`);
-      // registryDataDir uses cwd/.pi/async/<session>-<pid> — point cwd uniquely... 
-      // Actually both gens share sessionId-pid so same dataDir. That's intentional for #44.
-      // Use distinct session ids so we don't confuse snapshots; we track pids from submit via registry.
-      dirs.push(dir);
-    }
-    // Drive TaskRegistry directly to mirror the leak reproduction, then verify
-    // the module-level dispose path via init twice with shared data dir key.
-    const sharedCwd = join(base, "shared");
-    const pi1 = makePi(sharedCwd) as never;
-    await init(pi1);
-    // Access is internal; submit through tools.
-    const tools1 = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }>();
-    // Re-init will create new registry; first we need a live process on the active one.
-    // Simpler path: two TaskRegistry instances no shutdown — then call init twice.
-    const dataDir = join(sharedCwd, ".pi", "async", `reload-test-${process.pid}`);
-    // Direct registry leak baseline (documents the bug the fix addresses):
-    const orphanDir = join(base, "orphan");
-    const r1 = new TaskRegistry({ dataDir: join(orphanDir, "r1") });
-    const t1 = r1.submit({ command: "sleep 300", name: "orphan", mode: "background" });
-    assert.ok(t1.pid);
-    pids.push(t1.pid!);
-    await new Promise((r) => setTimeout(r, 400));
-    assert.equal(pidAlive(t1.pid!), true);
-    await r1.shutdown();
-    await new Promise((r) => setTimeout(r, 400));
-    assert.equal(pidAlive(t1.pid!), false, "shutdown must kill the process");
 
-    // Module-level re-init: start a task via first init's tools, then re-init.
-    const tools = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }>();
-    const host = {
-      cwd: sharedCwd,
-      pid: process.pid,
-      sessionId: "w2-reload",
-      registerTool: (tool: { name: string; execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }) => {
-        tools.set(tool.name, tool);
-      },
-      on: () => {},
-    };
-    await init(host as never);
-    const run = tools.get("async_run")!;
-    const submitted = await run.execute("c1", { command: "sleep 300", name: "live", mode: "background" }) as {
-      details: { payload: { taskId: string } };
-    };
-    // Recover pid from snapshot file
-    const snapPath = join(sharedCwd, ".pi", "async", `w2-reload-${process.pid}`, `${submitted.details.payload.taskId}.json`);
-    await new Promise((r) => setTimeout(r, 500));
-    assert.ok(existsSync(snapPath));
-    const snap = JSON.parse(readFileSync(snapPath, "utf8")) as { pid?: number };
-    assert.ok(snap.pid);
+  try {
+    const gen1 = makeGen();
+    await init(gen1.pi as never);
+    await gen1.dispatch("session_start", { type: "session_start", reason: "startup" });
+    const started = await gen1.call<{ taskId: string }>("async_run", { command: "sleep 300", name: "live", mode: "background", notifyOnCompletion: false });
+
+    // D-16: the session-scoped data dir, not the real homedir or the host cwd.
+    let snap: { pid?: number; status?: string } | undefined;
+    for (let i = 0; i < 80 && !(snap?.pid && snap.status === "running"); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const file = join(dataDir, `${started.taskId}.json`);
+      if (existsSync(file)) snap = JSON.parse(readFileSync(file, "utf8")) as { pid?: number; status?: string };
+    }
+    assert.ok(snap?.pid, "the task snapshot must persist under <sessionDir>/pi-async/<sessionId>");
+    pids.push(snap.pid!);
     assert.equal(pidAlive(snap.pid!), true);
 
-    // Second init must shut down the first generation.
-    const tools2 = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }>();
-    const host2 = {
-      cwd: sharedCwd,
-      pid: process.pid,
-      sessionId: "w2-reload",
-      registerTool: (tool: { name: string; execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }) => {
-        tools2.set(tool.name, tool);
-      },
-      on: () => {},
-    };
-    await init(host2 as never);
-    await new Promise((r) => setTimeout(r, 800));
-    assert.equal(pidAlive(snap.pid!), false, "re-init must kill previous generation process");
+    // Second init: the previous generation is SUSPENDED (not killed) so /reload can adopt.
+    const gen2 = makeGen();
+    await init(gen2.pi as never);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(pidAlive(snap.pid!), true, "re-init must suspend, never kill, the previous generation's tasks");
+
+    // The next generation's configure adopts the running task from disk.
+    await gen2.dispatch("session_start", { type: "session_start", reason: "reload" });
+    const adopted = await gen2.call<Array<{ taskId: string; status: string }>>("async_status", { includeHistory: true });
+    const row = adopted.find((task) => task.taskId === started.taskId);
+    assert.ok(row, "the adopted task is visible to the next generation");
+    assert.equal(row.status, "running");
+
+    // ...and quit finally kills it with shutdown semantics.
+    await gen2.dispatch("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    for (let i = 0; i < 80 && pidAlive(snap.pid!); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(pidAlive(snap.pid!), false, "quit kills the adopted task");
   } finally {
-    // Final init shutdown via a third empty init then session path — call init and
-    // shut down whatever is active by creating a registry and shutting via re-init with immediate empty.
-    const hostFinal = {
-      cwd: join(base, "final"),
-      pid: process.pid,
-      sessionId: "final",
-      registerTool: () => {},
-      on: () => {},
-    };
-    await init(hostFinal as never);
-    // One more init to dispose final
-    await init({ ...hostFinal, sessionId: "final2" } as never);
+    for (const pid of pids) {
+      try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
     rmSync(base, { recursive: true, force: true });
   }
 });
@@ -370,7 +342,7 @@ test("settle-guard activity message singularizes for one task (#16)", async () =
     activeCount: () => ({ running: tasks.filter((t) => t.status === "running").length, pending: 0 }),
     hasActiveWork: () => tasks.some((t) => t.status === "running"),
   };
-  const guard = new SettleGuard(fakePi as never, fakeReg as never, { heartbeatMs: 0 });
+  const guard = new SettleGuard(fakePi as never, fakeReg as never);
   guard.register();
   tasks = [{ taskId: "A", status: "running" }];
   // reportActivity is private; trigger via register's initial call then re-call through activeCount change —

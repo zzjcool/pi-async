@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { openPanel } from "../src/tui/panel.ts";
+import { openPanel, resetPanelForTests } from "../src/tui/panel.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 function createPanel(initialTaskId?: string) {
+  // D-14: the overlay is a module-level singleton, so each test must start closed.
+  resetPanelForTests();
   let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => any) | undefined;
   let closed = false;
   let options: unknown;
