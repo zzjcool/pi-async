@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isEscapeKey, openPanel } from "../src/tui/panel.ts";
+import { isEscapeKey, openPanel, resetPanelForTests } from "../src/tui/panel.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 import type { TaskSnapshot } from "../src/core/task.ts";
 
@@ -10,6 +10,8 @@ function create(opts: {
   notify?: (message: string, level?: string) => void;
   initialTaskId?: string;
 } = {}) {
+  // D-14: the overlay is a module-level singleton, so each test must start closed.
+  resetPanelForTests();
   let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => any) | undefined;
   let closed = false;
   const killed: string[] = [];
@@ -53,24 +55,23 @@ test("Enter opens task details and Escape returns to the list", () => {
 test("kill requires a second confirmation key", async () => {
   const { component, killed } = create();
   component.handleInput("\r");
-  component.handleInput("k");
+  component.handleInput("x");
   assert.deepEqual(killed, []);
-  component.handleInput("k");
+  assert.match(component.render(100).join("\n"), /press x again/);
+  component.handleInput("x");
   await Promise.resolve();
   assert.deepEqual(killed, ["task-1"]);
 });
 
-test("k can cancel a pending task (#11)", async () => {
+test("x cancels a pending task after a second confirmation (#11)", async () => {
   const pending = makeSnapshot({ taskId: "pend-1", name: "sched", status: "pending", mode: "delayed" });
   const { component, killed } = create({ tasks: [pending] });
   component.handleInput("\r");
-  const confirm = component.render(100).join("\n");
-  component.handleInput("k");
+  component.handleInput("x");
   assert.match(component.render(100).join("\n"), /Cancel this pending task/);
-  component.handleInput("k");
+  component.handleInput("x");
   await Promise.resolve();
   assert.deepEqual(killed, ["pend-1"]);
-  void confirm;
 });
 
 test("h toggles historical tasks and q closes the panel", () => {
@@ -111,11 +112,14 @@ test("detail R surfaces submit failure in the panel (#9)", () => {
   assert.ok(panel.notified.some((n) => n.message.includes("admission denied")));
 });
 
-test("detail c copies the output path", () => {
+test("detail c shows the output path without a copy API", () => {
   const panel = create();
   panel.component.handleInput("\r");
   panel.component.handleInput("c");
-  assert.deepEqual(panel.copied, ["/tmp/task.log"]);
+  // 0.3.0 §2.9: pi has no copyToClipboard — the path is surfaced via notify only.
+  assert.deepEqual(panel.copied, []);
+  assert.ok(panel.notified.some((entry) => entry.message === "/tmp/task.log"));
+  assert.match(panel.component.render(100).join("\n"), /c show output path/);
 });
 
 test("detail sanitizes ANSI and bare control characters in task fields and output", () => {
@@ -146,6 +150,7 @@ test("detail shows multiline command without folding newlines (#14)", () => {
 });
 
 test("RPC mode does not call custom UI", () => {
+  resetPanelForTests();
   let called = false;
   openPanel({ mode: "rpc", ui: { custom: () => { called = true; return Promise.resolve(); } } } as never, {} as never);
   assert.equal(called, false);

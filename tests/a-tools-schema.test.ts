@@ -8,14 +8,17 @@ import { join } from "node:path";
 
 test("tool schemas enforce sync/wait timeout requirements and output byte budget", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-async-tools-"));
-  const tools = new Map<string, { parameters: { required?: string[]; properties?: Record<string, unknown> }; execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }>();
-  const pi = { registerTool: (tool: { name: string; parameters: typeof tools extends Map<string, infer T> ? T extends { parameters: infer P } ? P : never : never; execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }) => tools.set(tool.name, tool) };
+  type Tool = { parameters: { required?: string[]; properties?: Record<string, unknown> }; execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown> };
+  const tools = new Map<string, Tool>();
+  const pi = { registerTool: (tool: { name: string; parameters: NonNullable<Tool["parameters"]>; execute: Tool["execute"] }) => tools.set(tool.name, tool) };
   const registry = new TaskRegistry({ dataDir: dir, maxTasks: 1 });
   try {
     registerTools(pi as never, registry);
     assert.equal(tools.size, 5);
     assert.ok(tools.get("async_wait")?.parameters.required?.includes("timeoutMs"));
     await assert.rejects(tools.get("async_run")!.execute("call", { command: "true", mode: "sync" }), /timeoutMs is required/);
+    // 0.3.0: onTimeout is a sync-only knob; non-sync calls must be rejected, not silently ignored.
+    await assert.rejects(tools.get("async_run")!.execute("call", { command: "true", mode: "background", onTimeout: "promote" }), /onTimeout is only valid for sync mode/);
     await assert.rejects(tools.get("async_run")!.execute("call", { command: "true", mode: "delayed" }), /delayMs is required/);
     await assert.rejects(tools.get("async_wait")!.execute("call", { taskIds: [] }), /timeoutMs is required/);
     assert.equal((tools.get("async_logs")?.parameters.properties?.maxBytes as { maximum: number }).maximum, 50 * 1024);

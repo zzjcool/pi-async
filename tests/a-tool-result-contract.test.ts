@@ -17,10 +17,11 @@ import { TaskRegistry } from "../src/core/registry.ts";
  * tool return values; only builtin tools self-wrap).
  */
 
+type Execute = (id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
 function makeHost() {
-  const tools = new Map<string, { execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> }>();
+  const tools = new Map<string, { execute: Execute }>();
   const pi = {
-    registerTool: (tool: { name: string; execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> }) => {
+    registerTool: (tool: { name: string; execute: Execute }) => {
       tools.set(tool.name, tool);
     },
   };
@@ -93,8 +94,34 @@ test("async_run sync mode also wraps (regression for mode=sync crash path)", asy
     const run = host.tools.get("async_run")!;
     const result = await run.execute("call-1", { command: "echo sync-ok", mode: "sync", timeoutMs: 5000 });
     assertToolResultShape("async_run(sync)", result);
+    assert.equal((result as { isError: boolean }).isError, false, "a clean sync exit is not a tool error");
     const text = (result as { content: Array<{ type: string; text: string }> }).content[0].text;
     assert.match(text, /sync-ok/, "sync output must ride inside the wrapped content text");
+  } finally { cleanup(); }
+});
+
+test("sync promote/abort timeouts are wrapped and not tool errors (D-19 / PLAN §2.7)", async () => {
+  const host = makeHost();
+  const { registry, cleanup } = makeRegistry();
+  try {
+    registerTools(host.pi as never, registry);
+    const run = host.tools.get("async_run")!;
+
+    const promoted = await run.execute("call-1", { command: "sleep 2", mode: "sync", timeoutMs: 100 });
+    assertToolResultShape("async_run(sync-promote)", promoted);
+    assert.equal((promoted as { isError: boolean }).isError, false, "promote timeout is not a tool error");
+    const promotedPayload = (promoted as { details: { payload: { taskId: string; status: string; promoted: boolean } } }).details.payload;
+    assert.equal(promotedPayload.status, "running", "promote leaves the task running in the background");
+    assert.equal(promotedPayload.promoted, true);
+    await registry.kill(promotedPayload.taskId, "user");
+
+    const aborted = await run.execute("call-2", { command: "sleep 2", mode: "sync", timeoutMs: 100, onTimeout: "abort" });
+    assertToolResultShape("async_run(sync-abort-timeout)", aborted);
+    assert.equal((aborted as { isError: boolean }).isError, false, "abort timeout is not a tool error");
+    const abortedPayload = (aborted as { details: { payload: { taskId: string; status: string; promoted: boolean } } }).details.payload;
+    assert.equal(abortedPayload.status, "running");
+    assert.equal(abortedPayload.promoted, false);
+    await registry.kill(abortedPayload.taskId, "user");
   } finally { cleanup(); }
 });
 
@@ -107,6 +134,8 @@ test("sync mode abort keeps result wrapped and task alive", async () => {
     const result = await run.execute("call-1", { command: "sleep 2", mode: "sync", timeoutMs: 300, onTimeout: "abort" });
     assertToolResultShape("async_run(sync-abort)", result);
     const payload = (result as { details: { payload: { promoted: boolean; status: string; taskId: string } } }).details.payload;
+    // D-19 (PLAN §2.7): abort only stops waiting; the task is still running, so this is not an error.
+    assert.equal((result as { isError: boolean }).isError, false, "an unfinished sync result is not a tool error");
     assert.equal(payload.promoted, false, "abort ends the wait without promoting");
     assert.equal(payload.status, "running", "abort keeps the task alive in sync mode");
     assert.equal(registry.get(payload.taskId)?.status, "running", "task survives in the registry");

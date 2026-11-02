@@ -56,6 +56,8 @@ export interface RunOptions {
   triggerOnCompletion?: boolean;
   env?: Record<string, string>;
   watch?: WatchSpec;
+  /** 0.3.0: directory the task runs in; defaults to the registry/session cwd, then process.cwd(). */
+  cwd?: string;
 }
 
 export interface RunReceipt {
@@ -99,4 +101,15 @@ export interface TaskSnapshot {
   outputConsumed: boolean;
   watch?: WatchSpec;
   metadata: Record<string, unknown>;
+  // 0.3.0 additions (all optional so pre-0.3.0 snapshots stay readable).
+  /** Working directory the task executes in (REV-13). */
+  cwd?: string;
+  /** Absolute deadline for `taskTimeoutMs` (reload re-arms the remaining time). */
+  timeoutAt?: number;
+  /** Absolute deadline for the watch window (reload restores the remaining budget). */
+  watchDeadline?: number;
+  /** Number of completion-notification attempts so far (honesty accounting, no retries). */
+  notifyAttempts?: number;
+  /** Process liveness seen when the snapshot was produced (false once finalized). */
+  processAlive?: boolean;
 }

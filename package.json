@@ -1,6 +1,6 @@
 {
   "name": "pi-async",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extension for async shell tasks: background/delayed/sync modes, output-matching watches, event-driven waiting, settle guard for legion children, and a TUI task rail — completion notifications wake your session.",
   "type": "module",
   "license": "MIT",
@@ -44,7 +44,9 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test tests/*.test.ts"
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "verify": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run verify"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^1.2.0",

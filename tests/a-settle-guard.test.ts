@@ -3,110 +3,129 @@ import test from "node:test";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
-test("settle guard reminds three times, then permits settle while retaining unresolved list", () => {
-  const handlers = new Map<string, (...args: unknown[]) => unknown>();
-  const entries: Array<[string, unknown]> = [];
-  const pi = { on: (event: string, cb: (...args: unknown[]) => unknown) => handlers.set(event, cb), appendEntry: (type: string, data: unknown) => entries.push([type, data]) };
-  const registry = {
-    list: () => [makeSnapshot({ taskId: "pending-1" })],
-    activeCount: () => ({ running: 1, pending: 0 }),
-    hasActiveWork: () => true,
-  };
+type Handler = (...args: unknown[]) => unknown;
+type Draft = { type?: string; customType?: string; content?: string; display?: boolean };
+type BeforeSettleResult = { entries?: Draft[]; continue?: boolean };
+
+/** Runs `fn` as a legion child (PI_LEGION_NODE_ID set), restoring the environment afterwards. */
+function asLegionChild<T>(fn: () => T): T {
   const previous = process.env.PI_LEGION_NODE_ID;
   process.env.PI_LEGION_NODE_ID = "test-node";
   try {
-    new SettleGuard(pi as never, registry as never, { heartbeatMs: 0 }).register();
-    const beforeSettle = handlers.get("agent_before_settle")!;
-    for (let i = 0; i < 3; i++) assert.deepEqual(beforeSettle(), { continue: true });
-    assert.equal(beforeSettle(), undefined);
-    assert.equal(entries.length, 4);
-    assert.match(JSON.stringify(entries[3]), /pending-1/);
-    assert.match(JSON.stringify(entries[0]), /async_wait/);
-  } finally { if (previous === undefined) delete process.env.PI_LEGION_NODE_ID; else process.env.PI_LEGION_NODE_ID = previous; }
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.PI_LEGION_NODE_ID;
+    else process.env.PI_LEGION_NODE_ID = previous;
+  }
+}
+
+test("settle guard reminds three times, then permits settle while retaining unresolved list", () => {
+  asLegionChild(() => {
+    const handlers = new Map<string, Handler>();
+    const pi = { on: (event: string, cb: Handler) => handlers.set(event, cb) };
+    const registry = {
+      list: () => [makeSnapshot({ taskId: "pending-1" })],
+      activeCount: () => ({ running: 1, pending: 0 }),
+      hasActiveWork: () => true,
+    };
+    new SettleGuard(pi as never, registry as never).register();
+    const beforeSettle = () => handlers.get("agent_before_settle")!({ entries: [] }) as BeforeSettleResult | undefined;
+
+    for (let i = 0; i < 3; i++) {
+      const result = beforeSettle();
+      assert.equal(result?.continue, true);
+      const draft = result?.entries?.at(-1);
+      assert.equal(draft?.type, "custom_message");
+      assert.equal(draft?.customType, "async-task-settle-reminder");
+      assert.equal(draft?.display, false);
+      assert.match(JSON.stringify(draft), /pending-1/);
+      assert.match(JSON.stringify(draft), /async_wait/);
+    }
+    const last = beforeSettle();
+    assert.equal("continue" in (last ?? {}), false, "no forced provider request once the budget is spent");
+    assert.equal(last?.entries?.at(-1)?.customType, "async-task-unresolved");
+    assert.match(JSON.stringify(last?.entries?.at(-1)), /pending-1/);
+  });
 });
 
 test("settle guard clears activity when no tasks remain", () => {
-  const handlers = new Map<string, (...args: unknown[]) => unknown>();
-  const calls: unknown[][] = [];
-  const pi = { on: (event: string, cb: (...args: unknown[]) => unknown) => handlers.set(event, cb), ui: { setActivity: (...args: unknown[]) => calls.push(args) } };
-  const registry = { list: () => [], activeCount: () => ({ running: 0, pending: 0 }), hasActiveWork: () => false };
-  const previous = process.env.PI_LEGION_NODE_ID;
-  process.env.PI_LEGION_NODE_ID = "test-node";
-  try {
-    new SettleGuard(pi as never, registry as never, { heartbeatMs: 0 }).register();
-    handlers.get("agent_before_settle")!();
-  } finally { if (previous === undefined) delete process.env.PI_LEGION_NODE_ID; else process.env.PI_LEGION_NODE_ID = previous; }
-  assert.equal(calls.at(-1)?.[0], "pi-async");
-  assert.equal(calls.at(-1)?.[1], undefined);
+  asLegionChild(() => {
+    const handlers = new Map<string, Handler>();
+    const calls: unknown[][] = [];
+    const pi = { on: (event: string, cb: Handler) => handlers.set(event, cb), ui: { setActivity: (...args: unknown[]) => calls.push(args) } };
+    const registry = { list: () => [], activeCount: () => ({ running: 0, pending: 0 }), hasActiveWork: () => false };
+    new SettleGuard(pi as never, registry as never).register();
+    handlers.get("agent_before_settle")!({ entries: [] });
+    assert.equal(calls.at(-1)?.[0], "pi-async");
+    assert.equal(calls.at(-1)?.[1], undefined);
+  });
+});
+
+test("settle guard activity message singularizes for one task", () => {
+  asLegionChild(() => {
+    const handlers = new Map<string, Handler>();
+    const calls: unknown[][] = [];
+    let tasks = [makeSnapshot({ taskId: "A" })];
+    const pi = { on: (event: string, cb: Handler) => handlers.set(event, cb), ui: { setActivity: (...args: unknown[]) => calls.push(args) } };
+    const registry = {
+      list: () => tasks,
+      activeCount: () => ({ running: tasks.length, pending: 0 }),
+      hasActiveWork: () => tasks.length > 0,
+    };
+    new SettleGuard(pi as never, registry as never).register();
+    assert.deepEqual(calls.at(-1)?.[1], { message: "1 async task" });
+    tasks = [makeSnapshot({ taskId: "A" }), makeSnapshot({ taskId: "B" })];
+    handlers.get("agent_before_settle")!({ entries: [] });
+    assert.deepEqual(calls.at(-1)?.[1], { message: "2 async tasks" });
+  });
 });
 
 test("a new agent run rearms the reminder limit", () => {
-  const handlers = new Map<string, (...args: unknown[]) => unknown>();
-  const pi = { on: (event: string, cb: (...args: unknown[]) => unknown) => handlers.set(event, cb) };
-  const registry = { list: () => [makeSnapshot()], activeCount: () => ({ running: 1, pending: 0 }), hasActiveWork: () => true };
-  const prev = process.env.PI_LEGION_NODE_ID; process.env.PI_LEGION_NODE_ID = "test-node";
-  try {
-    new SettleGuard(pi as never, registry as never, { heartbeatMs: 0 }).register();
-    const hook = handlers.get("agent_before_settle")!;
-    hook(); hook(); hook(); assert.equal(hook(), undefined);
+  asLegionChild(() => {
+    const handlers = new Map<string, Handler>();
+    const pi = { on: (event: string, cb: Handler) => handlers.set(event, cb) };
+    const registry = { list: () => [makeSnapshot()], activeCount: () => ({ running: 1, pending: 0 }), hasActiveWork: () => true };
+    new SettleGuard(pi as never, registry as never).register();
+    const hook = () => handlers.get("agent_before_settle")!({ entries: [] }) as BeforeSettleResult | undefined;
+
+    hook(); hook(); hook();
+    assert.equal("continue" in (hook() ?? {}), false);
     handlers.get("agent_start")!();
-    assert.deepEqual(hook(), { continue: true });
-  } finally { if (prev === undefined) delete process.env.PI_LEGION_NODE_ID; else process.env.PI_LEGION_NODE_ID = prev; }
+    assert.equal(hook()?.continue, true);
+  });
 });
 
 /**
  * Regression: 2026-10-21 crash (pi 1.3.0, legion worktree-green-field-1393).
  *
- * After `/reload` or a session replacement pi invalidates the captured
- * factory-time API, so `appendEntry` throws "This extension ctx is stale...".
- * The heartbeat runs in a `setInterval` callback, i.e. outside pi's event-loop
- * try/catch, so that throw escaped as `uncaughtException` and killed pi:
- *
- *     at Object.assertActive (.../chunk-66G7ITPS.js)
- *     at Object.appendEntry (...)
- *     at Timeout._onTimeout (.../pi-async/src/guard/settle-guard.ts:70:26)
+ * After `/reload` or a session replacement pi invalidates the captured factory-time API, so
+ * reading `pi.ui` throws "This extension ctx is stale...". The deleted heartbeat did that from
+ * a `setInterval` callback — outside pi's event-loop try/catch — and the throw escaped as
+ * `uncaughtException`, killing pi (crash report at `Timeout._onTimeout`). 0.3.0 has no timer,
+ * but the remaining paths (register / an event handler / dispose) must still never leak it.
  */
-test("a stale ctx stops the heartbeat instead of crashing the process", async () => {
-  const handlers = new Map<string, (...args: unknown[]) => unknown>();
-  let live = true;
-  let appends = 0;
-  const pi = {
-    on: (event: string, cb: (...args: unknown[]) => unknown) => { handlers.set(event, cb); return () => handlers.delete(event); },
-    appendEntry: () => {
-      if (!live) throw new Error("This extension ctx is stale after session replacement or reload.");
-      appends++;
-    },
-  };
-  const registry = { list: () => [makeSnapshot()], activeCount: () => ({ running: 1, pending: 0 }), hasActiveWork: () => true };
-  const guard = new SettleGuard(pi as never, registry as never, { heartbeatMs: 5 });
-  guard.register();
-  const tick = (): Promise<void> => new Promise((resolve) => { setTimeout(resolve, 40); });
+test("a stale ui getter never throws out of register, a handler or dispose", () => {
+  asLegionChild(() => {
+    let live = true;
+    let unsubscribed = 0;
+    const handlers = new Map<string, Handler>();
+    const pi = {
+      on: (event: string, cb: Handler) => {
+        handlers.set(event, cb);
+        return () => { unsubscribed++; handlers.delete(event); };
+      },
+      get ui() {
+        if (!live) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return { setActivity: () => undefined };
+      },
+    };
+    const registry = { list: () => [makeSnapshot()], activeCount: () => ({ running: 1, pending: 0 }), hasActiveWork: () => true };
+    const guard = new SettleGuard(pi as never, registry as never);
 
-  await tick();
-  assert.ok(appends > 0, "heartbeat appends while the ctx is live");
-
-  live = false;
-  const before = appends;
-  await tick();
-  assert.equal(appends, before, "a stale appendEntry is never retried");
-  assert.equal(handlers.has("agent_start"), false, "the stale generation detaches its hooks");
-  await tick();
-  assert.equal(appends, before, "the heartbeat timer is cleared, so nothing keeps firing");
-});
-
-test("a stale ui getter in reportActivity does not throw out of a timer", async () => {
-  let live = true;
-  const pi = {
-    on: () => () => undefined,
-    get ui() {
-      if (!live) throw new Error("This extension ctx is stale after session replacement or reload.");
-      return { setActivity: () => undefined };
-    },
-  };
-  const registry = { list: () => [], activeCount: () => ({ running: 0, pending: 0 }), hasActiveWork: () => false };
-  const guard = new SettleGuard(pi as never, registry as never, { heartbeatMs: 5 });
-  guard.register();
-  live = false;
-  await new Promise((resolve) => { setTimeout(resolve, 40); });
-  assert.doesNotThrow(() => guard.dispose());
+    assert.doesNotThrow(() => guard.register());
+    live = false;
+    assert.doesNotThrow(() => handlers.get("agent_before_settle")!({ entries: [] }), "a stale activity read is swallowed");
+    assert.ok(unsubscribed > 0, "the stale generation detaches its hooks");
+    assert.doesNotThrow(() => guard.dispose());
+  });
 });

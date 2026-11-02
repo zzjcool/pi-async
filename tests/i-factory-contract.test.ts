@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { init } from "../extensions/index.ts";
@@ -27,10 +27,11 @@ import { resetTuiHostForTests } from "../src/tui/host.ts";
 type FactoryPi = {
   cwd?: string;
   registerTool?: unknown;
+  registerMessageRenderer?: unknown;
   on?: unknown;
   sendMessage?: unknown;
   appendEntry?: unknown;
-  sessionManager?: unknown;
+  sessionManager?: { getSessionDir?: () => string | undefined; getSessionId?: () => string | undefined };
 };
 
 /** Build a factory pi that mirrors the REAL host surface: NO mode, NO ui, NO cwd at factory time. */
@@ -41,10 +42,16 @@ function realFactoryPi(overrides: Partial<FactoryPi> = {}): Record<string, unkno
     registerShortcut: () => undefined,
     on: () => () => undefined,
     sendMessage: () => undefined,
+    registerMessageRenderer: () => undefined,
     appendEntry: () => undefined,
     setLabel: () => undefined,
     getSessionName: () => "contract-test",
-    sessionManager: { getSessionId: () => "contract-test-session" },
+    // D-16: never fall back to the repo cwd or the real ~/.pi — a test that needs a data dir
+    // must override sessionManager with its own mkdtemp directory.
+    sessionManager: {
+      getSessionDir: () => { throw new Error("test must provide a session dir (D-16)"); },
+      getSessionId: () => "contract-test-session",
+    },
     ...overrides,
   };
 }
@@ -57,6 +64,7 @@ test("init tolerates a factory API without mode/ui (the real pi 1.2.0 surface)",
   const statuses: string[] = [];
   const pi = realFactoryPi({
     cwd: dir,
+    sessionManager: { getSessionDir: () => dir, getSessionId: () => "contract-test-session" },
     on: (event: string, handler: (e: unknown, c: unknown) => void) => {
       hooks.set(event, handler as (event: unknown, ctx: unknown) => void);
       return () => hooks.delete(event);
@@ -79,6 +87,9 @@ test("init tolerates a factory API without mode/ui (the real pi 1.2.0 surface)",
     };
     hooks.get("session_start")?.({ type: "session_start", reason: "new" }, { mode: "tui", hasUI: true, ui: ctxUi });
     hooks.get("message_start")?.({ type: "message_start" }, { mode: "tui", hasUI: true, ui: ctxUi });
+    // D-16: the session-scoped data dir (<sessionDir>/pi-async/<sessionId>) is created lazily on
+    // first persist — factory/configure must not leave artifacts, and tests never touch ~/.pi.
+    assert.equal(existsSync(join(dir, ".pi")), false, "the legacy <cwd>/.pi data dir is gone");
     assert.ok(widgets.includes("pi-async-rail"), "tui session_start ctx binds the rail widget");
     assert.ok(!statuses.includes("pi-async"), "footer status is retired");
   } finally {
@@ -100,20 +111,16 @@ test("init never throws when the factory API is missing optional methods entirel
 });
 
 /**
- * Regression: 2026-10-21 crash. A generation's heartbeat timer must never
- * outlive the ctx it captured: once pi invalidates that API (session
- * replacement / reload), `appendEntry` throws "This extension ctx is stale",
- * and a throw from a timer callback is not caught by pi's event loop —
- * it escapes as uncaughtException and kills pi. `init()` therefore releases the
- * previous generation up front rather than trusting a teardown event to land
- * first (pi emits `session_shutdown` on reload, but the ordering is not ours to
- * assume).
+ * Regression: 2026-10-21 crash (fixed differently in 0.3.0). The old fix added a
+ * heartbeat timer that had to be cleared on reload; 0.3.0 deletes the heartbeat
+ * entirely (D-12), so `init()` must not create ANY interval, and a second init must
+ * retire the previous generation without throwing (never killing adopted work —
+ * reload adoption is covered in tests/d-reload.test.ts).
  */
-test("a second init() releases the previous generation's heartbeat timer", async () => {
+test("init() creates no interval timer and a second init() retires the previous generation without throwing", async () => {
   resetTuiHostForTests();
   const dir = mkdtempSync(join(tmpdir(), "pi-async-reload-guard-"));
-  const created: Array<ReturnType<typeof setInterval>> = [];
-  const cleared = new Set<ReturnType<typeof setInterval>>();
+  const created: ReturnType<typeof setInterval>[] = [];
   const realSet = globalThis.setInterval;
   const realClear = globalThis.clearInterval;
   // SAFETY: the test swaps only the two timer functions for the duration of one init pair.
@@ -122,30 +129,25 @@ test("a second init() releases the previous generation's heartbeat timer", async
     created.push(handle);
     return handle;
   }) as unknown as typeof globalThis.setInterval;
-  globalThis.clearInterval = ((handle: never) => {
-    cleared.add(handle);
-    return realClear(handle);
-  }) as unknown as typeof globalThis.clearInterval;
+  globalThis.clearInterval = ((handle: never) => realClear(handle)) as unknown as typeof globalThis.clearInterval;
   const generation = (): Record<string, unknown> => ({
     cwd: dir,
     pid: process.pid,
-    sessionManager: { getSessionId: () => "reload-guard-session" },
+    sessionManager: { getSessionDir: () => dir, getSessionId: () => "reload-guard-session" },
     registerTool: () => undefined,
+    registerMessageRenderer: () => undefined,
     on: () => () => undefined,
     appendEntry: () => undefined,
   });
-  const prev = process.env.PI_ASYNC_HEARTBEAT_MS;
-  process.env.PI_ASYNC_HEARTBEAT_MS = "5";
   try {
     await init(generation() as never);
-    assert.equal(created.length, 1, "the first generation starts one heartbeat timer");
+    assert.equal(created.length, 0, "the factory must not start any interval timer (heartbeat removed, D-12)");
     await init(generation() as never);
-    assert.ok(cleared.has(created[0]!), "init() must clear the reloaded generation's timer");
+    assert.equal(created.length, 0, "re-init must not start an interval timer either");
+    assert.equal(existsSync(join(dir, "pi-async", "reload-guard-session")), false, "the factory must not create the data dir (D-04)");
   } finally {
     globalThis.setInterval = realSet;
     globalThis.clearInterval = realClear;
-    if (prev === undefined) delete process.env.PI_ASYNC_HEARTBEAT_MS;
-    else process.env.PI_ASYNC_HEARTBEAT_MS = prev;
     rmSync(dir, { recursive: true, force: true });
     resetTuiHostForTests();
   }

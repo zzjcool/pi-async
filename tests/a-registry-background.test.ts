@@ -41,17 +41,19 @@ test("wait timeout returns notReady and AbortSignal rejects without killing work
   } finally { await f.registry.shutdown(); f.cleanup(); }
 });
 
-test("MAX_TASKS rejects over-admission and notification retry rolls back the latch", async () => {
+test("MAX_TASKS rejects over-admission and notification failure does not latch and does not retry", async () => {
   const f = fixture(1);
   try {
     const task = f.registry.submit({ command: "sleep 5" });
     assert.throws(() => f.registry.submit({ command: "true" }), /Maximum active/);
     let calls = 0;
-    const pi = { sendMessage: async () => { calls++; throw new Error("offline"); } };
+    // Sync throw: the pi host calls sendMessage synchronously and has no ack (PLAN §2.3).
+    const pi = { sendMessage: () => { calls++; throw new Error("offline"); } };
     const payload = { taskId: task.taskId, name: task.name, status: "failed" as const, outputFile: join(f.dir, `${task.taskId}.output`) };
-    assert.equal(await sendCompletionNotification(pi as never, f.registry, payload), false);
-    assert.equal(calls, 3);
+    assert.equal(await sendCompletionNotification(pi as never, f.registry, payload), "failed");
+    assert.equal(calls, 1);
     assert.equal(f.registry.get(task.taskId)?.notified, false);
+    assert.equal(f.registry.get(task.taskId)?.notifyAttempts, 1);
     await f.registry.kill(task.taskId, "user");
   } finally { await f.registry.shutdown(); f.cleanup(); }
 });

@@ -11,6 +11,7 @@ import {
   metadataSection,
   outputSection,
   openPanel,
+  resetPanelForTests,
 } from "../src/tui/panel.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
@@ -59,6 +60,7 @@ test("detail sections paint tokens and insert hierarchy (#75)", () => {
 });
 
 test("colored detail keeps frame borders aligned on narrow terminals (#75)", () => {
+  resetPanelForTests();
   let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => any) | undefined;
   const task = makeSnapshot({
     taskId: "color-task",
@@ -90,6 +92,7 @@ test("colored detail keeps frame borders aligned on narrow terminals (#75)", () 
 });
 
 test("detail still renders with empty theme mock (#75)", () => {
+  resetPanelForTests();
   let factory: ((tui: unknown, theme: unknown, keybindings: unknown, done: (value?: unknown) => void) => any) | undefined;
   const task = makeSnapshot({ taskId: "plain", metadata: { outputFile: "/tmp/plain.log" } });
   openPanel({ mode: "tui", ui: { custom: (f: typeof factory) => { factory = f; return Promise.resolve(); } } } as never, {
