@@ -70,16 +70,135 @@ async function expectToolError(promise: Promise<ToolResult>, pattern: RegExp): P
 
 const payload = <T>(result: ToolResult): T => result.details.payload as T;
 
-test("async_run exposes promptSnippet/promptGuidelines on async_run only (D-17)", async () => {
+/**
+ * D-C9: prompt copy is contract. These literals are the frozen text from docs/PLAN-CONTEXT.md
+ * (D-C1 snippets, D-C2 description + field descriptions, D-C3 guidelines) — assert them verbatim
+ * so a refactor cannot silently drift the discoverability surface.
+ */
+const D_C1_SNIPPETS: Record<string, string> = {
+  async_run: "Run a long or gating shell command detached (build/test over a minute, server, watcher); returns a taskId, not output.",
+  async_wait: "Block until async tasks finish or the budget expires; results land in context. Never kills.",
+  async_logs: "Read the bounded, ANSI-stripped output of an async task, including while it is still running.",
+  async_status: "List active async tasks with elapsed time; includeHistory for recent finished ones.",
+  async_kill: "Stop an async task and its whole process group.",
+};
+
+const D_C2_DESCRIPTION = "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.";
+
+const D_C3_GUIDELINES = [
+  "Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.",
+  "Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.",
+  "Pass name so later calls address the task by name, and read output with async_logs (works while running) instead of re-running the command.",
+];
+
+const MAX_SNIPPET_CHARS = 140;
+
+test("all five tools carry a single-line promptSnippet verbatim from D-C1", async () => {
   const { tools, cleanup } = makeRegistry();
   try {
-    const run = tool(tools, "async_run");
-    assert.equal(run.promptSnippet, "Run a shell command in the background, with optional watch conditions and completion notification.");
-    assert.ok(Array.isArray(run.promptGuidelines));
-    assert.ok((run.promptGuidelines ?? []).length >= 2 && (run.promptGuidelines ?? []).length <= 3, "D-17 asks for 2–3 guidelines");
-    for (const other of ["async_wait", "async_logs", "async_status", "async_kill"]) {
-      assert.equal(tool(tools, other).promptSnippet, undefined, `${other} must not carry a promptSnippet`);
+    for (const [name, expected] of Object.entries(D_C1_SNIPPETS)) {
+      const snippet = tool(tools, name).promptSnippet;
+      assert.equal(typeof snippet, "string", `${name} must carry a promptSnippet (D-C1)`);
+      assert.ok((snippet ?? "").length > 0, `${name} snippet must be non-empty`);
+      assert.equal(snippet, expected, `${name} snippet must equal D-C1 verbatim`);
+      assert.doesNotMatch(snippet ?? "", /[\r\n]/, `${name} snippet must be a single line`);
+      assert.ok((snippet ?? "").length <= MAX_SNIPPET_CHARS, `${name} snippet must be <= ${MAX_SNIPPET_CHARS} chars, got ${(snippet ?? "").length}`);
     }
+  } finally { await cleanup(); }
+});
+
+test("async_run promptGuidelines equal the three D-C3 guidelines", async () => {
+  const { tools, cleanup } = makeRegistry();
+  try {
+    assert.deepEqual(tool(tools, "async_run").promptGuidelines, D_C3_GUIDELINES);
+  } finally { await cleanup(); }
+});
+
+test("async_run description is the two D-C2 sentences and no longer carries check discipline", async () => {
+  const { tools, cleanup } = makeRegistry();
+  try {
+    const description = tool(tools, "async_run").description ?? "";
+    assert.equal(description, D_C2_DESCRIPTION);
+    assert.doesNotMatch(description, /\|\| true/, "check discipline moved to the skill (D-C2/D-C7)");
+    assert.doesNotMatch(description, /jq -e/, "check discipline moved to the skill (D-C2/D-C7)");
+  } finally { await cleanup(); }
+});
+
+test("async_run field descriptions follow D-C2 verbatim (command and watch pinned)", async () => {
+  const previous = process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
+  // Pin the default budget so the interpolated D-C2 template is deterministic.
+  delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
+  const { tools, cleanup } = makeRegistry();
+  try {
+    const maxSyncTimeoutMs = 600_000;
+    const expected: Record<string, string> = {
+      command: "Shell command to execute (/bin/sh -c) in the session cwd.",
+      name: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars).",
+      mode: "background (default) returns a taskId now; sync waits up to timeoutMs; delayed starts after delayMs.",
+      timeoutMs: `sync only: how long to wait before promoting to background (max ${maxSyncTimeoutMs} ms, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).`,
+      delayMs: "delayed only: milliseconds to wait before starting.",
+      taskTimeoutMs: "Kill the task after this many ms, in any mode.",
+      onTimeout: "sync only: promote (default) returns while the task keeps running; abort stops waiting only — the task keeps running and still notifies.",
+      notifyOnCompletion: "Send a completion notification (default true).",
+      triggerOnCompletion: "Start a new turn when the task finishes (default true).",
+      env: "Extra environment variables for the child process (safe policy applied).",
+    };
+    const properties = (tool(tools, "async_run").parameters?.properties ?? {}) as Record<string, { description?: unknown }>;
+    for (const [field, text] of Object.entries(expected)) {
+      const description = properties[field]?.description;
+      assert.equal(typeof description, "string", `${field} must carry a description`);
+      assert.ok((description as string).length > 0, `${field} description must be non-empty`);
+      assert.equal(description, text, `${field} description must equal D-C2 verbatim`);
+    }
+    // Pinned by name per the L0 ticket: command and watch are spelled out; the rest only checked above.
+    assert.equal(properties.watch?.description, "Poll output (>=1s) for success_when/failure_when; conditions are OR-ed, first match wins, and checks must not swallow errors (no `|| true`).");
+  } finally {
+    await cleanup();
+    if (previous === undefined) delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
+    else process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS = previous;
+  }
+});
+
+test("async_run receipt states a notification exception only when one exists (D-C5 revised)", async () => {
+  const { registry, tools, cleanup } = makeRegistry();
+  try {
+    const run = tool(tools, "async_run");
+
+    const normal = payload<{ outputHint: string; willNotify?: boolean; willWake?: boolean }>(
+      await call(run, { command: "sleep 0.1", name: "normal", mode: "background" }),
+    );
+    assert.equal("willNotify" in normal, false, "the default receipt does not repeat the general rule");
+    assert.equal("willWake" in normal, false);
+    assert.match(normal.outputHint, /Use async_logs with taskId/);
+
+    const quiet = payload<{ outputHint: string; willNotify?: boolean; willWake?: boolean }>(
+      await call(run, { command: "sleep 0.1", name: "quiet", mode: "background", notifyOnCompletion: false }),
+    );
+    assert.equal(quiet.willNotify, false, "notifications-off is a per-call fact worth stating");
+    assert.equal("willWake" in quiet, false);
+    assert.match(quiet.outputHint, /Notifications are off for this task/);
+
+    const noTurn = payload<{ outputHint: string; willNotify?: boolean; willWake?: boolean }>(
+      await call(run, { command: "sleep 0.1", name: "no-turn", mode: "background", triggerOnCompletion: false }),
+    );
+    assert.equal(noTurn.willWake, false);
+    assert.equal("willNotify" in noTurn, false);
+    assert.match(noTurn.outputHint, /will not start a new turn/);
+  } finally { await cleanup(); }
+});
+
+test("a promoted sync task carries the same notification exception", async () => {
+  const { registry, tools, cleanup } = makeRegistry();
+  try {
+    const run = tool(tools, "async_run");
+    const promoted = payload<{ taskId: string; status: string; promoted: boolean; willNotify?: boolean; outputHint: string }>(
+      await call(run, { command: "sleep 2", mode: "sync", timeoutMs: 100, notifyOnCompletion: false }),
+    );
+    assert.equal(promoted.promoted, true);
+    assert.equal(promoted.status, "running");
+    assert.equal(promoted.willNotify, false);
+    assert.match(promoted.outputHint, /Notifications are off for this task/);
+    await registry.kill(promoted.taskId, "user");
   } finally { await cleanup(); }
 });
 
