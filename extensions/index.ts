@@ -161,12 +161,23 @@ export async function init(pi: PiCtx): Promise<void> {
   let configured = false;
   let tui = false;
 
-  /** One-time `configure({dataDir, cwd})` from whatever ctx is available (session event or tool call). */
+  /**
+   * `configure({dataDir, cwd})` for the generation that is actually alive.
+   *
+   * Normally this is our own `registry` and the call is one-time. But a tool registration can
+   * outlive its generation (the host keeps the first registration while a later `init()` suspends
+   * the registry that closure captured), so a call arriving through a stale closure must configure
+   * the LIVE registry — otherwise it starts work in the new generation with no data dir or cwd
+   * applied. `configure()` is idempotent, so re-entry through a stale closure is harmless.
+   */
   const ensureConfigured = (ctx?: { cwd?: string; sessionManager?: SessionManagerLike }): void => {
-    if (configured) return;
-    configured = true;
+    const target = activeRegistry ?? registry;
+    if (target === registry) {
+      if (configured) return;
+      configured = true;
+    }
     try {
-      registry.configure({ dataDir: sessionDataDir(ctx) ?? factoryDataDir, cwd: typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : undefined });
+      target.configure({ dataDir: sessionDataDir(ctx) ?? factoryDataDir, cwd: typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : undefined });
     } catch (error) {
       // configure() is contractually non-throwing (D-05); never let a wiring hiccup break a tool call.
       console.error("pi-async: registry configure failed", error);
@@ -273,7 +284,10 @@ export async function init(pi: PiCtx): Promise<void> {
     },
   });
 
-  if (typeof context.registerTool === "function") registerTools(pi, registry, ensureConfigured);
+  // REV-24: the resolver, not the captured instance, so a registration the host kept from a
+  // retired generation still reaches the live one. `activeRegistry` is cleared on shutdown, and
+  // the fallback then reports the retired registry's own (actionable) admission error.
+  if (typeof context.registerTool === "function") registerTools(pi, () => activeRegistry ?? registry, ensureConfigured);
 
   // Discoverability layer (PLAN-CONTEXT §D-C4/§D-C5): post-hoc advice after long foreground
   // bash calls, plus one live task-state line before each request while work is in flight.

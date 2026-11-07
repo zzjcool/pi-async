@@ -274,9 +274,9 @@ export class TaskRegistry {
     if (task.status === "running") loop.start();
   }
   private assertAdmission(opts: RunOptions): void {
-    if (this.closed) throw new Error("Async task admission is closed");
+    if (this.closed) throw new Error("Async task admission is closed (this session shut down; start a new session to run async tasks)");
     // A retired generation must not start work: the next generation owns the session data dir.
-    if (this.suspended) throw new Error("Async task admission is closed (registry suspended)");
+    if (this.suspended) throw new Error("Async task admission is closed (registry suspended: a reload or resume retired this generation and a newer one owns new work; reload the session if this tool still points here)");
     const active = this.activeCount();
     if (active.running + active.pending >= this.maxTasks) throw new Error(`Maximum active async tasks reached (${this.maxTasks})`);
     if (!opts.command.trim()) throw new Error("command must not be empty");

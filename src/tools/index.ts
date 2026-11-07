@@ -161,7 +161,7 @@ function elapsedMsOf(task: TaskSnapshot, now = Date.now()): number {
  * then still needs its session cwd/dataDir (PLAN §2.8). Tools stay usable
  * without it (tests, direct embedding).
  */
-export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigured?: (ctx?: ToolContext) => void): void {
+export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => TaskRegistry), ensureConfigured?: (ctx?: ToolContext) => void): void {
   type ToolDef = {
     name: string;
     label: string;
@@ -176,6 +176,17 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
   if (!api.registerTool) throw new Error("Pi host does not expose registerTool");
   const maxSyncTimeoutMs = resolveMaxSyncTimeoutMs();
   const configure = (ctx?: ToolContext): void => ensureConfigured?.(ctx);
+  /**
+   * Resolve the registry **at call time**, not at registration time.
+   *
+   * A tool registration can outlive its generation: the host keeps the first registration for a
+   * tool name (first-wins across extensions) while a later `init()` suspends the registry the
+   * original closure captured. That combination used to route every call into a retired registry,
+   * so `async_run` refused admission forever with no way out but a session restart.
+   * Passing the live registry as a resolver lets such a call reach the generation that owns the
+   * work; passing a plain registry keeps the old behaviour for embedders and tests.
+   */
+  const resolveRegistry: () => TaskRegistry = typeof registrySource === "function" ? registrySource : () => registrySource;
 
   api.registerTool({
     name: "async_run", label: "Run async command",
@@ -199,6 +210,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
     }, ["command"]),
     execute: async (_id, params, signal, _onUpdate, ctx) => {
       configure(ctx);
+      const registry = resolveRegistry();
       const mode = String(params.mode ?? "background");
       if (mode !== "background" && mode !== "sync" && mode !== "delayed") throw new Error(`Unsupported async_run mode: ${mode}`);
       const command = String(params.command ?? "");
@@ -261,6 +273,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
     parameters: schema({ taskIds: { type: "array", items: stringField }, timeoutMs: timeoutField }, ["taskIds", "timeoutMs"]),
     execute: async (_id, params, signal, _onUpdate, ctx) => {
       configure(ctx);
+      const registry = resolveRegistry();
       if (params.timeoutMs === undefined) throw new Error("timeoutMs is required");
       const taskIds = Array.isArray(params.taskIds) ? params.taskIds.map((id) => registry.resolveTaskId(String(id)).taskId) : [];
       return toolResult(await registry.wait(taskIds, Number(params.timeoutMs), signal));
@@ -278,6 +291,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
     }, ["taskId"]),
     execute: async (_id, params, _signal, _onUpdate, ctx) => {
       configure(ctx);
+      const registry = resolveRegistry();
       const maxBytes = params.maxBytes === undefined ? MAX_LOG_BYTES : Number(params.maxBytes);
       if (maxBytes > MAX_LOG_BYTES) throw new Error("maxBytes must be at most 50 KiB");
       const stream = params.stream === "stdout" || params.stream === "stderr" ? params.stream : "merged";
@@ -297,6 +311,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
     }),
     execute: async (_id, params, _signal, _onUpdate, ctx) => {
       configure(ctx);
+      const registry = resolveRegistry();
       const includeHistory = params.includeHistory === true;
       const status: TaskStatus | "active" | undefined = isTaskStatus(params.status) ? params.status : params.status === "active" ? "active" : undefined;
       const name = typeof params.name === "string" && params.name.length > 0 ? params.name : undefined;
@@ -319,6 +334,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
     parameters: schema({ taskId: stringField }, ["taskId"]),
     execute: async (_id, params, _signal, _onUpdate, ctx) => {
       configure(ctx);
+      const registry = resolveRegistry();
       // Unknown id/name throws here (registry message: "Unknown task or name: ...") → host isError result.
       const resolved = registry.resolveTaskId(String(params.taskId));
       const taskId = resolved.taskId;
@@ -353,6 +369,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
     }, ["taskId"]),
     execute: async (_id, params, _signal, _onUpdate, ctx) => {
       configure(ctx);
+      const registry = resolveRegistry();
       // Unknown id/name throws here (registry message: "Unknown task or name: ...") → host isError result.
       const resolved = registry.resolveTaskId(String(params.taskId));
       const remindAfterMs = typeof params.remindAfterMs === "number" ? params.remindAfterMs : undefined;
