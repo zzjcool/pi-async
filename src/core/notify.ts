@@ -33,7 +33,9 @@ export function buildNotificationXml(p: NotifyPayload): string {
   fields.push(["output-file", p.outputFile]);
   if (p.summary) fields.push(["summary", p.summary]);
   if (p.summaryTruncated) fields.push(["summary-truncated", "true"]);
-  if (p.status === "failed" && p.guidance) fields.push(["guidance", p.guidance]);
+  // D-C8: `completed` stays pure information, but a timeout-killed task is the one `killed`
+  // shape where the next step matters, so it carries guidance too (status itself is unchanged).
+  if ((p.status === "failed" || p.killKind === "timeout") && p.guidance) fields.push(["guidance", p.guidance]);
   return `<async-task-notification>${fields.map(([tag, value]) => `<${tag}>${escapeXml(value)}</${tag}>`).join("")}</async-task-notification>`;
 }
 

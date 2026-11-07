@@ -214,13 +214,41 @@ test("PI_ASYNC_SETTLE_GUARD=0 registers nothing at all", () => {
   });
 });
 
-test("non-legion sessions skip agent_before_settle but still register agent_settled", () => {
+test("main sessions get one advisory draft without continue, re-armed per run (D-C6)", () => {
   withNodeId(undefined, () => {
-    const { pi, handlers } = makePi();
-    new SettleGuard(pi as never, makeRegistry() as never).register();
-    assert.equal(handlers.has("agent_before_settle"), false, "reminders are a legion-child feature");
-    assert.equal(handlers.has("agent_settled"), true, "aborted-run nudges apply to every session");
-    assert.equal(handlers.has("agent_start"), true, "the latch/budget are re-armed for every session");
+    const tasks = [makeSnapshot({ taskId: "live-1" })];
+    const { pi, fireOne, handlers } = makePi();
+    new SettleGuard(pi as never, makeRegistry({ tasks: () => tasks }) as never).register();
+
+    assert.equal(handlers.has("agent_before_settle"), true, "main sessions hear the settle boundary");
+    assert.equal(handlers.has("agent_settled"), true, "aborted-run nudges still apply to every session");
+    assert.equal(handlers.has("agent_start"), true, "the advisory latch is re-armed for every session");
+
+    const first = fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined;
+    const advisory = first?.entries?.at(-1);
+    assert.equal(advisory?.type, "custom_message");
+    assert.equal(advisory?.customType, "async-task-settle-advisory");
+    assert.equal(advisory?.display, false);
+    assert.match(String(advisory?.content), /live-1/, "the advisory names the task ids");
+    assert.match(String(advisory?.content), /async_wait/);
+    assert.equal("continue" in (first ?? {}), false, "an advisory must never force another provider request");
+
+    assert.equal(fireOne("agent_before_settle", { entries: [] }), undefined, "at most one advisory per generation");
+
+    fireOne("agent_start");
+    const refreshed = fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined;
+    assert.equal(refreshed?.entries?.at(-1)?.customType, "async-task-settle-advisory", "a new run re-arms the advisory");
+
+    tasks.push(makeSnapshot({ taskId: "live-2" }));
+    assert.equal(fireOne("agent_before_settle", { entries: [] }), undefined, "still one per generation");
+  });
+});
+
+test("a main session with nothing in flight gets no advisory", () => {
+  withNodeId(undefined, () => {
+    const { pi, fireOne } = makePi();
+    new SettleGuard(pi as never, makeRegistry({ tasks: () => [] }) as never).register();
+    assert.deepEqual(fireOne("agent_before_settle", { entries: [] }), undefined);
   });
 });
 

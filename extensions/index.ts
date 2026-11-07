@@ -3,6 +3,8 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { clearTaskActivity, raiseTaskActivity, reportActivity } from "../src/core/bus.ts";
 import { sendCompletionNotification } from "../src/core/notify.ts";
+import { registerNudges } from "../src/context/nudges.ts";
+import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
@@ -60,6 +62,9 @@ let activeRegistry: TaskRegistry | undefined;
 /** Previous generation's settle guard; disposed up front instead of trusting a teardown event. */
 let activeGuard: SettleGuard | undefined;
 
+/** Previous generation's context nudges (tool_result / context hooks); released like the guard. */
+let activeNudges: (() => void) | undefined;
+
 /** One-line card for completion notifications (PLAN §2.8), rendered from message.details. */
 function formatDuration(ms: number): string {
   return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
@@ -116,8 +121,17 @@ export async function init(pi: PiCtx): Promise<void> {
   // from disk. Never kill here — killing is quit/new/fork's job (PLAN §2.8).
   const previousGuard = activeGuard;
   const previousRegistry = activeRegistry;
+  const previousNudges = activeNudges;
   activeGuard = undefined;
   activeRegistry = undefined;
+  activeNudges = undefined;
+  if (previousNudges) {
+    try {
+      previousNudges();
+    } catch (error) {
+      console.error("pi-async: previous context nudges disposal during reload failed", error);
+    }
+  }
   if (previousGuard) {
     try {
       previousGuard.dispose();
@@ -212,6 +226,9 @@ export async function init(pi: PiCtx): Promise<void> {
       if (snapshot.failureKind === "lost") failureNotes.push("Exit status unknown after session reload; output may be incomplete.");
       if (startError !== undefined) failureNotes.push(`Start error: ${startError}`);
       if (snapshot.status === "failed") failureNotes.push(`Inspect task output with async_logs (taskId: ${snapshot.taskId}).`);
+      // D-C8: a timeout kill is `killed`, not `failed`, but it is the case that most needs a
+      // next step — say what to change instead of leaving the model with a dead end.
+      if (snapshot.killKind === "timeout") failureNotes.push("Killed at taskTimeoutMs. Rerun with a larger taskTimeoutMs, or watch for a success_when condition instead of a hard deadline.");
       const guidance = failureNotes.length > 0 ? failureNotes.join(" ") : undefined;
       const payload = {
         taskId: snapshot.taskId,
@@ -245,6 +262,13 @@ export async function init(pi: PiCtx): Promise<void> {
   });
 
   if (typeof context.registerTool === "function") registerTools(pi, registry, ensureConfigured);
+
+  // Discoverability layer (PLAN-CONTEXT §D-C4/§D-C5): post-hoc advice after long foreground
+  // bash calls, plus one live task-state line before each request while work is in flight.
+  activeNudges = registerNudges(pi, registry);
+  // D-C7: the procedural playbook (checks, watch semantics, promotion) ships as a skill so the
+  // system prompt keeps one routing line instead of a wall of instructions.
+  registerSkillDiscovery(pi);
 
   // Completion notification card (PLAN §2.8). Local component implementation: the TUI lane owns
   // src/tui/*, so this renderer must not import from there.
