@@ -30,13 +30,20 @@ pi-async/
 │   │   ├── output.ts       # 输出捕获、tail 读取、ANSI 剥离
 │   │   ├── watch.ts        # 轮询 + 条件匹配引擎
 │   │   ├── notify.ts       # 完成通知/唤醒、抑制闩（每任务一条，不合并）
+│   │   ├── env.ts          # EnvPolicy（safe/all/none）子进程环境构建 + 危险键拒绝（REV-16）
+│   │   ├── duration.ts     # 时长格式化（Ns / Mm Ss / Hh Mm），rail/panel 共用
 │   │   └── bus.ts          # 预留 eventbus + OSC activity 上报
+│   ├── context/
+│   │   ├── nudges.ts       # 情境注入：bash 长命令事后教学 / <async-state> 行（REV-21）
+│   │   └── resources.ts    # resources_discover：把随包 skill 注册给宿主（REV-22）
 │   ├── tools/
 │   │   └── index.ts        # 6 个工具的注册与 schema
 │   ├── tui/
 │   │   ├── rail.ts         # 任务轨道图 widget（≤4 行，含汇总行）
 │   │   ├── panel.ts        # 百分比尺寸面板（列表+详情）
-│   │   └── status.ts       # 汇总格式与共享 clear watermark 谓词；initStatus 仅 reportActivity
+│   │   ├── status.ts       # 汇总格式与共享 clear watermark 谓词；initStatus 上报 activity + opt-in footer
+│   │   ├── host.ts         # TUI 宿主上下文惰性绑定（factory 期无 mode/ui，见 §15）
+│   │   └── width.ts        # 显示宽度计算（东亚宽字符/emoji 占 2 列）与截断
 │   └── guard/
 │       └── settle-guard.ts # agent_before_settle custom_message 提醒 + agent_settled 兜底（无心跳）
 ├── vendor/reference/       # 已就位（只读参考，不编译）
@@ -65,9 +72,11 @@ pending --(delay 到期/spawn 成功)--> running --┬-- exit 0 --> completed
 - **双字段、不统一 reason（REV-11）**：KillKind 答「谁杀的/为何杀进程」；FailureKind 答「任务为何 failed」。
   禁止发明第三套 `reason` 枚举把两者揉扁——通知与投影字段各自透传已有字段即可。
 - delayed 任务在 pending 期可 cancel（→ killed, kind=user）。
-- 通知诚实语义（REV-14）：`notified` 持久闩（写进 metadata，reload 不重置）；**单次投递，不重试、
-  不回滚**（宿主 `sendMessage` 无 ack）。发送前 `notifyAttempts++`，`sendMessage` 返回后置
-  `notified=true`；失败保持 false。`session_start` 对未确认任务补发一次（24h 内、attempts<2、未被消费）。
+- 通知诚实语义（REV-14）：`notified` 持久闩（快照**顶层**字段 `TaskSnapshot.notified`，不在 metadata 内；
+  reload 不重置）；**单次投递，不重试、不回滚**（宿主 `sendMessage` 无 ack）。发送前 `notifyAttempts++`，
+  `sendMessage` 返回后置 `notified=true`；失败保持 false。`session_start` 对未确认任务补发一次
+  （24h 内、attempts<2、未被消费）。补发与完成通知共用同一道开关门：`metadata.notifyOnCompletion === false`
+  的任务**不参与补发**（`resendUnnotified` 逐条跳过）。
 
 ## 3. 任务模式与启动参数（async_run 工具，冻结）
 
@@ -79,13 +88,13 @@ async_run({
   // ── delayed ──
   delayMs?: number,                   // mode=delayed 必填；pending 到期启动
   // ── sync ──
-  timeoutMs: number,                  // mode=sync 必填（schema enforce）；
+  timeoutMs: number,                  // mode=sync 必填（execute 运行时强制，非 schema：required 只有 ["command"]）；
                                       // 上界 PI_ASYNC_MAX_SYNC_TIMEOUT_MS（默认 600000，schema maximum + 运行时校验）
                                       // 到点：onTimeout="promote" → 转 background 继续；
                                       // onTimeout="abort" → Esc 语义，等待中断任务保留
   onTimeout?: "promote" | "abort",    // 默认 promote
   // ── 通用 ──
-  taskTimeoutMs?: number,             // 任务自身寿命；缺省 = 无限（watch 必填除外，见 §4）
+  taskTimeoutMs?: number,             // 任务自身寿命；缺省 = 无限；无任何模式/组合强制（watch 也不要求它）
   notifyOnCompletion?: boolean,       // 默认 true
   triggerOnCompletion?: boolean,      // 默认 true：完成 sendMessage({triggerTurn:true}) 唤醒
   env?: Record<string, string>,       // 追加到 spawn env
@@ -105,7 +114,7 @@ spawn 失败立即抛错，无重试等待。admission 检查为 closed / `suspe
 shutdown 先 drain 再退出。
 （**REV-6 裁决**：原「≤30s admission 预检」从未实现且与同步 spawn 设计冲突，改为描述现状；见 #29。）
 
-**工具集（5 个）**：`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill`。
+**工具集（6 个）**：`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill` / `async_extend`（REV-23，§18）。
 命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。
 
 **可发现性面（REV-20/21/22）**：6 个工具各带一条 `promptSnippet`（逐字见 §17），`async_run` 另带 3 条
@@ -132,7 +141,8 @@ type Condition =
   | { type: "output_matches"; regex: string }         // 合并输出流匹配（设备码等）；编译带 m（^/$ 按行）；不支持内联标志 (?i)
 ```
 
-- `success_when` 命中 → **不杀进程**：任务标 completed，通知带命中详情；进程按 taskTimeoutMs/kill 自然管理。
+- `success_when` 命中 → **不杀进程**：任务标 completed，命中详情写入 `metadata.watchSuccess`（`async_status`
+  可见）；**完成通知的 XML 不含该字段**（§6 字段表）。进程按 taskTimeoutMs/kill 自然管理。
   （区别于 better-bg 的 check 命令模式：我们 watch 的是**已存在任务**的输出/退出。）
 - 条件在 async_run 时**启动前校验**，非法 regex/JSON path 直接拒绝（不产生 pending 任务）。
 - **blind_checks 语义（REV-2 澄清）**：仅计「检查基础设施失败」（readOutput 抛错等）；
@@ -140,10 +150,17 @@ type Condition =
   继续轮询**。两者是不同语义，禁止合并。条件持续 pending 时**不**触发 blind 兜底，仅由
   `timeoutMs` 结束 watch（WatchSpec 字段注释已与本条对齐，见 #27）。
 - **组内 OR**：`success_when` / `failure_when` 各自是 OR（首个命中即返回），没有 `match:"all"` 模式。
-- **匹配窗口**：只匹配输出尾部 **64K 字符**（不是字节，常量 `MAX_MATCH_CHARS`）；更早的输出会滚出窗口。
-- promptGuidelines（写进工具 description）：check 不要 `|| true` 自吞错误；未知态映射失败；
-  结构化输出优先 jq -e；`output_matches` 的 regex 须加锚定防止过早匹配（编译固定带 `m`，
-  `^`/`$` 按行边界，故 `^READY$` 可命中多行输出中的某一行）。
+- **匹配窗口只限 `output_matches`**：正则作用对象被截到输出尾部 `MAX_OUTPUT_MATCH_BYTES`（64×1024，
+  `output.slice(-N)` 按 **UTF-16 码元**截断，不是字节）；更早的输出会滚出窗口。`stdout_contains` /
+  `stderr_contains` 是**全量字符串** `includes`，没有窗口；`exit_code` 只看退出码。
+  代价要如实计入：watch 每个 tick 的 `readWatchOutput` 把 `.output` / `.stdout` / `.stderr` **整文件**
+  `readFileSync` 读入（不走 `MAX_LOG_WINDOW`），所以超大输出在 watch 期间有内存/CPU 开销；
+  上面的截断只限正则作用对象，**不减少读取量**。
+- **check 纪律在随包 skill，不在工具面（REV-22）**：不 `|| true` 自吞错误、未知态映射失败、结构化输出
+  优先 `jq -e`、`output_matches` 须加锚定（编译固定带 `m`，`^`/`$` 按行边界，故 `^READY$` 可命中
+  多行输出中的某一行）——全文见 `skills/async-tasks/SKILL.md`；工具面只留 `watch` 的 schema
+  description 一句压缩版（OR-ed / first-match-wins / 不吞错）。`async_run` 的 3 条 `promptGuidelines`
+  讲的是**使用时机 / 收割 / 命名**，与 check 纪律无关（§17 REV-20 / REV-22）。
 - **watch 失败性终态的进程处置（REV-4 裁决）**：`failure_when` 命中、blind 耗尽、watch timeout
   三条 watch 失败路径在 finalize 任务的同时**必须 kill 进程组**（与 `failure_when → killed(watch_failure)`
   同语义）；仅 `success_when`（D4）不干预进程。杀失败时响亮上报（kill 链已有 catch），
@@ -187,7 +204,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 
 - 环境检测：`PI_LEGION_NODE_ID` 存在 → legion child 环境，settle 守卫默认开启。
 - 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/**kill-kind**/**failure-kind**/output-file/summary/**summary-truncated**/guidance
-  （guidance 仅 failed 带，completed 纯信息——patty chatter 教训）。
+  （guidance 仅在 `failed` **或** `killKind === "timeout"` 时带，completed 纯信息——patty chatter 教训；
+  §17 REV-21 修订）。
   - `kill-kind` / `failure-kind`：有值才输出（与 snapshot 同名语义）；模型据此区分非零退出 / output_cap / watch 失败 / lost，无需先 round-trip `async_status`（#37）。
   - `summary-truncated`：summary 因 output_cap 或通知 tail 上限被截断时输出 `true`，避免把截断前缀误读为完整输出。
   - **失败原因矩阵（REV-11）**：
@@ -293,6 +311,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   （`stream` 默认 `merged`），truncated 带全量路径提示（`fullPath` 有效至被 §10 retention prune）。
   `taskId` 可用 name（REV-15）；输出文件缺失 → `{text:"", truncated:false, fullPath, missing:true}`，
   不 throw；读取前校验 `fullPath` 在 dataDir 内，越界 throw。
+  - **硬顶 8 MiB（`MAX_LOG_WINDOW`）**：`maxBytes` 一律先夹到 `min(请求值, 8 MiB)` 再读，防误传超大窗口
+    导致无界分配；模型侧默认窗口仍是 50 KiB。
 - ANSI/CSI/OSC 剥离：`async_logs` 返回与 TUI 显示前必须剥离（安全项，防输出注入转义序列）。
 - sync 返回 outputTail ≤ 8 KiB / 200 行（whichever first）。
 
@@ -302,7 +322,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   无法证明死亡 → 响亮报错「Descendant processes may have leaked」。
 - `session_shutdown(reason)`（REV-17）：`reload` / `resume` → `registry.suspend()`（停 timer/watch、
   持久化快照，**不 kill 进程**，交给下一代 `configure()` 收养）；`quit` / `new` / `fork` / 未知 →
-  `registry.shutdown()`（幂等：admission close + drain + 全任务 kill(kind=shutdown)）；
+  `registry.shutdown()`（幂等：admission close + drain + **running 任务** kill(kind=shutdown)；
+  pending（delayed 未到期）**不杀、不改状态**，仅清 delay timer/watch 并保留 pending 快照，
+  以便同进程 reload 继续恢复）；
   **不承诺 crash-durability**（metadata 原子写，output 不 fsync）。
 - reload / 重启恢复（REV-17）：同进程 `/reload` 不杀任务；新代 `configure()` 重新载入后按持久化的
   `timeoutAt` / `watchDeadline` / `cwd` 重建剩余预算（不是重置）；running 且 pid 已死/无 pid → 标 failed(lost)；
@@ -367,11 +389,14 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   jiti 虚拟模块映射要求）。
 - 语言 TS + node:test；验证命令：`npm run typecheck` && `npm test`；CI/发布门禁统一为
   `npm run verify`（= `typecheck` + `test`，`prepublishOnly` 同一条），另跑 `npm pack --dry-run`。
-- 发布（0.3.0）：`version` = `0.3.0` 且 `package-lock.json` 同步；peerDependencies 保持 `^1.2.0`
+- 发布流程（**版本号不在本条目写死**：0.3.1 见 §17，0.4.0 见 §18–§19；实际值以 `package.json` 与
+  `package-lock.json` 为准）：peerDependencies 保持 `^1.2.0`
   （**不抬下限、不进 dependencies**）；CI 是 node 22/24 matrix + 一个 pi 1.5.0 相容 job（`npm install
   --no-save @earendil-works/pi-coding-agent@1.5.0 @earendil-works/pi-tui@1.5.0`）；
-  `.github/workflows/release.yml` 只由维护者推送 `v*` tag 触发（**不自动建 tag**），执行
-  `npm run verify` → 校验 tag 与 package.json 版本一致 → `npm publish --provenance`（`NPM_TOKEN`）→
+  `.github/workflows/release.yml` 由维护者推送 `v*` tag 触发（**不自动建 tag**），也支持
+  `workflow_dispatch` 手动运行（用于「tag 已存在、补发当前 package.json 版本」）；执行
+  `npm run verify` → 校验 tag 与 package.json 版本一致（仅 tag 触发时）→ `npm publish --provenance`
+  （**Trusted Publishing / OIDC**：`id-token: write`，**无 `NODE_AUTH_TOKEN` / `NPM_TOKEN`**）→
   `gh release create --generate-notes`（`GITHUB_TOKEN`）。
 - vendor/reference 不编译不 import，只作参考。
 - MIT License；legion viz 整块复用处保留 attribution 注释。
@@ -388,7 +413,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | D6 | TUI 仅主会话；subagent 自动退化纯工具面（mode guard） |
 | D7 | OSC busy 上报 feature-detect + settle 前上报闭合竞态（#156 契约）；未落地静默降级 |
 | D8 | 不改 legion/pi 本体；busy-hold 走上游（#156 + 补充评论已发） |
-| D9 | delayed：reload 恢复计时，切 session 不迁移 |
+| D9 | delayed：reload 恢复计时；dataDir 变更（切 session）时 copy+rename 迁移 `.json/.output/.stdout/.stderr` 并重写 `metadata.outputFile`，任务不丢（§10 / REV-17） |
 | D10 | settle 守卫每 run 重武装、累计 ≤3 次，超限放行但保留未决清单提示 |
 
 ## 14. 验收清单（verify 门禁）
@@ -457,6 +482,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   sync 以非 0 状态**真的结束**时 → `isError:true`（详情见 REV-19；payload 保留完整 `SyncResult`）；`async_status` 新增
   `status` / `name` / `limit`（1–50，默认 50），`includeHistory` 与显式 `status` 按
   `(finishedAt ?? createdAt)` 降序；`delayedEnv` 值打码为 `***`。
+  - `async_kill` 的返回形状：`{ taskId, status, killKind?, alreadyTerminal, processAlive, warning? }`；
+    `isError` 判据为 `Boolean(warning && status !== "killed")`——「确认不了死但任务已 killed」只作
+    `warning` 呈现，不算工具错误；未知 id/name 照旧抛错。
 - **回退开关**：无（只放宽入参、收紧错误面）。
 
 ### REV-16（env policy）
@@ -547,7 +575,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     （无 wall time 时删掉 `took {N}s in the foreground; `）。`structuredContent.wall_time_seconds` 缺失时，
     用 `tool_execution_start` 记录的起点计算耗时（`tool_result` 在 `afterToolCall` 内触发，早于
     `tool_execution_end`，此时 `durationMs` 尚不可用）；`tool_execution_end` 负责清理残留条目。
-  - `context_with_system`（回退 `context`）：有活跃任务时在 messages 末尾追加一条 user 消息
+  - `context_with_system` **与** `context` **两个钩子同时注册**（不按宿主择一：注册期无法可靠判断宿主
+    用哪个），靠 signature 去重保证宿主不会收到重复内容：有活跃任务时在 messages 末尾追加一条 user 消息
     （`UserMessage` 必须带 `timestamp`）：
     `<async-state>{n} async task(s) active: {name (status, elapsed[, no-notify]) · …}{ +K more} {tail}</async-state>`
     默认最多 5 项；空闲时返回 `undefined`（零 token）；任务集合或状态不变时不重复注入；`agent_start` 重新武装。
@@ -665,7 +694,14 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
 ### 18.8 持久化与 reload
 
 - `TaskSnapshot` 新增 `remindAt?: number`（绝对时刻）与 `remindCount?: number`。
-- reload 按剩余时间重布防（对齐 `timeoutAt` 的 D-03 做法，`registry.ts:746`）。`remindAt` 已过期 →
+- `metadata` 里还有两个持久字段，reload 的退避基线靠它们（不看 `remindAt`）：
+  - `metadata.remindAfterMs`：`async_run` 的**显式旋钮**；delayed 任务在 pending 期也必须记住它
+    （间隔到真正开跑时才求值），故随快照落盘。
+  - `metadata.remindIntervalMs`：任务**开始运行时**求值出的首次间隔（显式值 / 带 watch 关闭 / 缺省 20 分钟）；
+    缺席 = 该任务不提醒。reload 时 `reminderBaseMs()` 只读这个字段作为退避基线——只靠 `remindAfterMs`
+    无法还原「开始时求值」的结果。
+- reload 按剩余时间重布防（对齐 `timeoutAt` 的 D-03 做法：
+  `rearmReminderFromDisk()`，与 `reloadFromDisk()` 里按 `timeoutAt` 重建硬杀的那步并列）。`remindAt` 已过期 →
   立即触发一次并继续退避。
 - 与 `timeoutAt` 同样 `unref`：从磁盘恢复的提醒定时器不得单独撑住宿主进程。
 
@@ -692,7 +728,7 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
 - `outputConsumed` / `notifyOnCompletion:false` / 终态 → 跳过且不重布防。
 - `async_extend` 移动 `remindAt`、重置计数；终态返回 `alreadyTerminal`；两参数都不传报错。
 - reload 后按剩余预算重布防。
-- 工具清单断言与 `docs/CONTRACT.md` §17「5 个工具」的表述同步更新为 6 个。
+- 工具清单断言与 `docs/CONTRACT.md` §3 的「工具集（6 个）」表述同步。
 
 ### 18.12 实现补充（REV-23a，冻结）
 
@@ -722,7 +758,8 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
 `init()` 在同一模块实例上二次执行时会把前代 registry `suspend()`（`extensions/index.ts:144`，
 REV-17 设计）。两者叠加 → 存活下来的工具闭包指向**已被退役的那一代**：
 
-- `suspended` 无重置路径（`registry.ts:783` 是唯一致值点，全仓无 `= false`）
+- `suspended` 无**运行期**重置路径（唯一置 true 在 `suspend()`；全仓无运行期 `= false`，字段初始化
+  `private suspended = false` 不算重置）
 - `configure()` 不会清 `suspended`，且工具闭包里的 `ensureConfigured` 还会把旧一代标成
   `configured = true`
 - admission 在 `submit` / `scheduleDelayed` / `runSync` 三条路径前置，所以新工作**确定性失败**

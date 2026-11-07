@@ -2,6 +2,37 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 未发布 — 契约文档校准到实现（CONTRACT 逐条对齐）
+
+主题：**代码是唯一事实**。一次通读实现与冻结契约，把文档里已被实现超越的措辞改回去；
+除一条注释外**没有任何行为变更**。
+
+### Changed
+
+- `README.md` / `skills/async-tasks/SKILL.md`：把「匹配窗口是尾部 64K」改成**只对 `output_matches` 成立**
+  （子串条件扫全量），并如实标注 watch 每次轮询整文件重读的代价。这两处是模型**实际会读到**的措辞
+  （`skills/` 经 `resources_discover` 注入），所以不能只改契约。
+- `docs/CONTRACT.md` 校准 22 处（不改行为，逐条有代码依据）：
+  - **矛盾纠正**：`taskTimeoutMs` 无 watch 必填约束（§3）；匹配窗口只限 `output_matches`，子串条件扫全量
+    且 watch 每 tick 整文件读入（§4）；`shutdown()` 不杀 pending delayed、只清 timer 并保留快照（§10）；
+    工具集是 **6 个**（§3 漏了 `async_extend`）；`success_when` 详情只进 `metadata.watchSuccess`，完成通知
+    XML 不含该字段（§4/§6）；`context` 与 `context_with_system` 是**双注册 + signature 去重**（§17 REV-21）；
+    D9 切 session **会**迁移产物（§13）；guidance 在 `failed` **或** `killKind=timeout` 时都带（§6）；
+    `sync.timeoutMs` 必填是 execute 运行时强制、不是 schema（§3）；`suspended` 无**运行期**重置路径（§19.2）；
+    check 纪律在随包 skill 而不在 `promptGuidelines`（§4）。
+  - **陈旧数值/失效引用**：`MAX_MATCH_CHARS` → `MAX_OUTPUT_MATCH_BYTES`（且是 UTF-16 码元截断，不是字节）；
+    发布流程不再写死版本号（指向 §17 / §18–§19），并修正为 Trusted Publishing（OIDC）+ `workflow_dispatch`；
+    §18.8 去掉失效行号；§1 目录树补齐 `env.ts` / `duration.ts` / `context/nudges.ts` / `context/resources.ts` /
+    `tui/host.ts` / `tui/width.ts`；`notified` 标注为快照**顶层**字段；§18.11 交叉引用 §17 → §3；
+    `initStatus` 不再写「仅 reportActivity」。
+  - **反向缺口补写（代码有、文档没写）**：`async_kill` 的返回形状与 `isError` 判据（§16 REV-15）；
+    `logs()` 的 8 MiB `MAX_LOG_WINDOW` 硬顶（§9）；`metadata.remindAfterMs` / `metadata.remindIntervalMs`
+    与 reload 的退避基线来源（§18.8）；`resendUnnotified` 的 `notifyOnCompletion === false` 门（§2）。
+- `src/context/nudges.ts` 改了一条与实现不符的注释（原写“registration time 择一，宿主拿不到两个”，
+  实际是两个钩子同时注册、靠 signature 去重）：**仅注释**，无逻辑变更。
+- `docs/PLAN-CONTEXT.md` 顶部加状态横幅：本文是 0.3.1 阶段计划快照，当前契约以 `docs/CONTRACT.md`
+  （已按 0.4.0 实现校准）为准。
+
 ## 未发布 — 代际交接（REV-24）
 
 ### Fixed
