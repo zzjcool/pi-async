@@ -147,8 +147,8 @@ type Condition =
 - 条件在 async_run 时**启动前校验**，非法 regex/JSON path 直接拒绝（不产生 pending 任务）。
 - **blind_checks 语义（REV-2 澄清）**：仅计「检查基础设施失败」（readOutput 抛错等）；
   「尚未可判定」（exit_code 未退出 / json_path 输出尚非 JSON）为 **pending 态，不累计 blind、照常
-  继续轮询**。两者是不同语义，禁止合并。条件持续 pending 时**不**触发 blind 兜底，仅由
-  `timeoutMs` 结束 watch（WatchSpec 字段注释已与本条对齐，见 #27）。
+  继续轮询**。两者是不同语义，禁止合并。条件持续 pending 时**不**触发 blind 兜底；watch 由
+  `timeoutMs` 到期、进程退出或 `async_kill` / `failure_when` 终结（WatchSpec 字段注释已与本条对齐，见 #27）。
 - **组内 OR**：`success_when` / `failure_when` 各自是 OR（首个命中即返回），没有 `match:"all"` 模式。
 - **两层窗口，各有理由（REV-25）**：
   - **读取窗口**：每次求值（每个 tick，以及进程退出时那一次）的 `readWatchOutput` 经 `logs()` 只读**尾部**，
@@ -157,7 +157,7 @@ type Condition =
   - **正则窗口**：`output_matches` 在读取窗口内再截到尾部 `MAX_MATCH_CHARS`（64×1024，按
     **UTF-16 码元**截断，不是字节）以限制 ReDoS 影响面。
   - 因此可见范围：`stdout_contains` / `stderr_contains` 是**尾部 8 MiB**（不是无限）；
-    `json_path_exists` 只能解析尾部 8 MiB 内的 JSON（超大 JSON 会因此永远 `pending`，靠 `timeoutMs` 收尾）；
+    `json_path_exists` 只能解析尾部 8 MiB 内的 JSON（超大 JSON 会因此永远 `pending`，由进程退出、`timeoutMs` 或 `async_kill` 终结 watch）；
     `output_matches` 是尾部 64K 码元；`exit_code` 只看退出码，与窗口无关。
   - 缺失的合并输出文件仍 **throw**（让 `blind_checks` 计为基础设施失败）；`stdout` / `stderr` 缺席按空串处理（#4）。
 - **check 纪律在随包 skill，不在工具面（REV-22）**：不 `|| true` 自吞错误、未知态映射失败、结构化输出

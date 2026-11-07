@@ -50,8 +50,8 @@ const MAX_LOG_WINDOW = 8 * 1024 * 1024;
  *
  * A watch decides on the tail, so the read is bounded by the same defensive ceiling as any other
  * output read rather than loading the whole file: a marker that scrolled beyond this window is
- * invisible to the check, and a multi-GB log costs one bounded read per interval instead of a full
- * load. `output_matches` is then narrowed again to `MAX_MATCH_CHARS` (64K UTF-16 units) for ReDoS
+ * invisible to the check, and a large log (the write cap defaults to 20 MiB) costs one bounded
+ * read per interval instead of a full load. `output_matches` is then narrowed again to `MAX_MATCH_CHARS` (64K UTF-16 units) for ReDoS
  * containment — two different bounds for two different reasons.
  */
 const WATCH_READ_BYTES = MAX_LOG_WINDOW;

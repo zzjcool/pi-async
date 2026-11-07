@@ -12,7 +12,7 @@
   （默认写盘 cap 是 20 MiB，见 `PI_ASYNC_MAX_OUTPUT_BYTES`，所以「多 GB」需要先调大该 cap。）
 - 行为变化（有意）：滚出尾部 8 MiB 的输出对**所有**条件不再可见。此时终态由命令退出码或
   `timeoutMs` 决定（区分是否命中要看 `metadata.watchSuccess`，不看 `status`）。
-  **看更早的输出用 receipt / 通知里的 `output-file` 路径配 `bash`**（如 `grep -n marker <file>`）；
+  **看更早的输出用通知 XML 或 `async_status` 的 `metadata.outputFile` 路径配 `bash`**（如 `grep -n marker <file>`）；
   `async_logs` 救不了——工具层硬顶 50 KiB，且只有头部 / 尾部两档，中间段取不到。
 - 保留原有两条语义：数据目录外路径仍 throw（D-11）；合并输出文件缺失仍 throw（让
   `blind_checks` 能计为基础设施失败）；`stdout` / `stderr` 缺席仍按空串处理。

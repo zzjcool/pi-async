@@ -20,6 +20,18 @@ import { makeSnapshot } from "./helpers/index.ts";
 const DEFAULT_REMIND_MS = 20 * 60 * 1000;
 /** Absolute-time assertions tolerate the couple of Date.now() calls inside one start path. */
 const SLACK_MS = 25;
+/**
+ * A reminder is armed *after* the child spawned, so `remindAt - startedAt` is `delay + spawnLatency`
+ * and spawn latency is not bounded by the test. Asserting `delay ± SLACK_MS` therefore flakes under
+ * CPU contention (observed in a full-suite run). Pin the interval itself through
+ * `metadata.remindIntervalMs` and require the deadline to sit in `[delay, delay + spawn budget]`.
+ */
+const SPAWN_BUDGET_MS = 5_000;
+function assertArmedAfterStart(remindAt: number | undefined, startedAt: number, delay: number, label: string): void {
+  assert.ok(remindAt !== undefined, `${label}: remindAt must be set`);
+  const delta = remindAt - startedAt;
+  assert.ok(delta >= delay && delta <= delay + SPAWN_BUDGET_MS, `${label}: ${delta}ms after start, expected ${delay}..${delay + SPAWN_BUDGET_MS}`);
+}
 
 type Tool = {
   name: string;
@@ -76,12 +88,12 @@ test("§18.2 default: background + no watch arms start + 20 minutes; 0 disables;
   try {
     const plain = f.registry.submit({ command: "sleep 20", name: "plain" });
     assert.ok(plain.remindAt !== undefined, "a plain background task must arm a reminder");
-    assert.ok(Math.abs(plain.remindAt! - (plain.startedAt ?? plain.createdAt) - DEFAULT_REMIND_MS) <= SLACK_MS, "default is 1_200_000 ms from start");
+    assertArmedAfterStart(plain.remindAt, plain.startedAt ?? plain.createdAt, DEFAULT_REMIND_MS, "default is 20 minutes from start");
     assert.equal(plain.metadata.remindIntervalMs, DEFAULT_REMIND_MS);
 
     // §18.2 rule 1: an explicit value wins; §18.11: 0 → no remindAt and no timer.
     const explicit = f.registry.submit({ command: "sleep 20", name: "explicit", remindAfterMs: 60_000 });
-    assert.ok(Math.abs(explicit.remindAt! - (explicit.startedAt ?? explicit.createdAt) - 60_000) <= SLACK_MS);
+    assertArmedAfterStart(explicit.remindAt, explicit.startedAt ?? explicit.createdAt, 60_000, "an explicit remindAfterMs wins");
     const disabled = f.registry.submit({ command: "sleep 20", name: "disabled", remindAfterMs: 0 });
     assert.equal(disabled.remindAt, undefined);
     assert.equal(disabled.metadata.remindIntervalMs, undefined);
@@ -97,7 +109,7 @@ test("§18.2 default: background + no watch arms start + 20 minutes; 0 disables;
       command: "sleep 20", name: "watched-explicit", remindAfterMs: 30_000,
       watch: { intervalMs: 1000, timeoutMs: 60_000, success_when: [{ type: "stdout_contains", value: "never" }], failure_when: [] },
     });
-    assert.ok(Math.abs(watchedExplicit.remindAt! - (watchedExplicit.startedAt ?? watchedExplicit.createdAt) - 30_000) <= SLACK_MS);
+    assertArmedAfterStart(watchedExplicit.remindAt, watchedExplicit.startedAt ?? watchedExplicit.createdAt, 30_000, "an explicit knob opens a watched task");
 
     // §18.2 rule 4: the hard deadline lands first → no reminder that could only be late.
     const beaten = f.registry.submit({ command: "sleep 20", name: "beaten", remindAfterMs: 60_000, taskTimeoutMs: 30_000 });
@@ -120,7 +132,7 @@ test("§18.2 at start, not at createdAt: a delayed task arms when it actually st
     await waitFor(() => f.registry.get(task.taskId)?.status === "running", "the delayed start");
     const started = f.registry.get(task.taskId)!;
     assert.ok(started.startedAt !== undefined);
-    assert.ok(Math.abs(started.remindAt! - started.startedAt! - 25) <= SLACK_MS, "the interval counts from the real start");
+    assertArmedAfterStart(started.remindAt, started.startedAt!, 25, "the interval counts from the real start");
   } finally {
     await f.cleanup();
   }
@@ -176,7 +188,7 @@ test("§18.4 backoff: 1x → 2x → 4x, then stop at three reminders without kil
   try {
     const events = recordReminders(f.registry);
     const task = f.registry.submit({ command: "sleep 20", name: "backoff", remindAfterMs: base });
-    assert.ok(Math.abs(task.remindAt! - (task.startedAt ?? task.createdAt) - base) <= SLACK_MS, "first reminder at 1x");
+    assertArmedAfterStart(task.remindAt, task.startedAt ?? task.createdAt, base, "first reminder at 1x");
 
     await waitFor(() => events.length >= 3, "three reminders");
     // Each event reports the schedule it just armed: 2x after the first, 4x after the second.

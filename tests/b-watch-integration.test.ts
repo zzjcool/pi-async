@@ -8,7 +8,9 @@ import type { WatchSpec } from "../src/core/task.ts";
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "pi-async-watch-integration-"));
-  const registry = new TaskRegistry({ dataDir: dir });
+  // Pin the write cap: this file asserts window sizes, so an inherited PI_ASYNC_MAX_OUTPUT_BYTES
+  // smaller than the 9 MiB fixture would truncate the output and make the case lie.
+  const registry = new TaskRegistry({ dataDir: dir, maxOutputBytes: 32 * 1024 * 1024 });
   return { dir, registry, cleanup: async () => { await registry.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
