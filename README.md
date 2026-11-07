@@ -38,6 +38,33 @@ The extension registers five tools:
 
 `async_wait`, `async_logs`, and `async_kill` accept a task **name** as well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown ids/names are an error instead of a silent success.
 
+### How the model finds these tools
+
+All five tools carry a one-line `promptSnippet`, so the host lists every one of them in the system prompt's
+tools section — `async_run` is not the only entry point the model can see.
+
+`async_run` additionally ships three `promptGuidelines` in the system prompt: when to reach for it instead
+of `bash`, that ending a turn with running tasks is expected (the completion notification wakes the
+session), and that `name` + `async_logs` beat re-running a command.
+
+The procedural detail — check-writing discipline, watch semantics, promote vs. abort, legion collection —
+ships as an Agent Skill (`skills/async-tasks/SKILL.md`, advertised through `resources_discover`), so it
+costs one routing line until the task actually needs it.
+
+Two runtime nudges close the gap that a static prompt cannot:
+
+- after a foreground `bash` call of 60 s or more — or a `tail -f` / `until` / `watch` / `sleep N` shaped
+command — the tool result gets one extra line suggesting `async_run`. When the host does not report a wall
+time, the extension times the call from `tool_execution_start` instead of guessing;
+- while tasks are active, one `<async-state>` line is appended before each request (nothing is injected
+when idle, and an unchanged state is not repeated). Its closing sentence follows the **per-task** truth:
+a task started with `notifyOnCompletion: false` (or `triggerOnCompletion: false`) is marked `no-notify`,
+and when nothing can wake the session the line says so instead of promising a notification.
+
+The general rule lives in the system prompt once; a receipt only adds the **exception** for that call
+(`willNotify: false` / `willWake: false` plus a one-line hint). Both nudges are advisory and best-effort;
+`PI_ASYNC_NUDGE=0` disables them.
+
 Tool notes:
 
 - `async_run`: `mode` is `background` (default), `delayed` (requires `delayMs`) or `sync` (requires `timeoutMs`). `timeoutMs` is sync-only, `delayMs` is delayed-only, `onTimeout` is sync-only — passing them to the wrong mode is rejected. `onTimeout: "promote"` (default) hands an expired wait to background; `"abort"` stops waiting only, the command keeps running and still notifies. A sync run that **finishes** without exit 0 returns `isError: true` with the full payload (`status` / `exitCode` / `outputTail` / `promoted`) intact. `promoted: true` means the sync wait expired and the task was handed to background (`status: "running"`) — a promoted or aborted wait is **not** a tool error.
@@ -69,6 +96,7 @@ The rail's first row summarizes running, pending, elapsed, completed, and failed
 | `PI_ASYNC_MAX_SYNC_TIMEOUT_MS` | `600000` (10 min) | Upper bound for `sync.timeoutMs` (schema `maximum` and runtime check). |
 | `PI_ASYNC_ENV_INHERIT` | `safe` | Child env policy: `safe` strips credential-like variables and rejects dangerous explicit keys; `all` restores full inheritance (explicit dangerous-key overrides are still rejected in every policy); `none` passes only a minimal allowlist (`PATH`, `HOME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TMPDIR`, `USER`). |
 | `PI_ASYNC_SETTLE_GUARD` | `on` | Set `0` to disable the settle guard entirely (no `agent_before_settle` reminder, no `agent_settled` backstop). |
+| `PI_ASYNC_NUDGE` | `on` | Set `0` to disable the runtime context nudges (the long-command hint and the `<async-state>` line). |
 | `PI_ASYNC_FOOTER` | `off` | Set `1` to also render a one-line task summary through the host's `setStatus` footer (only when the host exposes `setStatus`). The rail's first row is the default status surface. |
 | `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
@@ -88,6 +116,7 @@ Completion notifications are **best-effort**. `pi.sendMessage` returns `void` �
 - `async_status` exposes `notified` / `outputConsumed` / `notifyAttempts`, so an agent can check whether it already received (or suppressed) a result.
 - `notifyOnCompletion: false` opts a task out entirely.
 - A delayed task whose start failed records `metadata.startError`; the failure notification's `guidance` includes it as `Start error: ...`, so the cause (missing `cwd`, rejected `env` key, spawn failure) is visible without an extra `async_logs` call.
+- A task killed by `taskTimeoutMs` stays `killed`, but its notification carries `guidance` (grow `taskTimeoutMs` or use `watch`) — it is the one `killed` shape where the next step matters. `completed` notifications stay pure information.
 
 ## Watches
 
@@ -112,7 +141,7 @@ If the resolved data directory changes inside a live process, artifacts are copi
 
 ## Legion child sessions
 
-In a legion child session, collect task results with `async_wait` before returning a verdict. The settle guard pushes a reminder into the model context before settling (up to 3 times, `custom_message` draft), and an aborted run with active tasks gets a follow-up reminder on `agent_settled`. Notifications themselves remain best-effort (see above); see [CONTRACT.md §6](docs/CONTRACT.md#6-唤醒链路与-legion-兼容冻结) for the frozen notification and collection requirements.
+In a legion child session, collect task results with `async_wait` before returning a verdict. The settle guard pushes a reminder into the model context before settling (up to 3 times, `custom_message` draft, `continue: true`), and an aborted run with active tasks gets a follow-up reminder on `agent_settled`. In the main session the same boundary produces one **advisory** draft (no forced re-run) saying that stopping with background work is fine, because its completion notification will wake the session. Notifications themselves remain best-effort (see above); see [CONTRACT.md §6](docs/CONTRACT.md#6-唤醒链路与-legion-兼容冻结) for the frozen notification and collection requirements.
 
 ## Known limitations
 
@@ -127,8 +156,14 @@ In a legion child session, collect task results with `async_wait` before returni
 npm run typecheck
 npm test
 npm run verify           # typecheck + test (same gate as prepublishOnly)
+npm run adoption         # adoption report from real session JSONL (last 15 sessions)
 npm pack --dry-run
 ```
+
+`npm run adoption` reads `~/.pi/agent/sessions/*/*.jsonl` (`--dir` / `--limit` / `--json` to change scope)
+and prints the bash duration distribution, the foreground wall time it cost, the sleep-polling share, and
+how many calls the shipped nudge would have flagged. Use it to compare a change instead of trusting the
+anecdote in a review doc.
 
 ## Container QA
 

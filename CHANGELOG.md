@@ -2,6 +2,41 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.3.1 — 2026-11-07（可发现性层）
+
+主题是**让模型重新发现这些能力**。0.3.0 把「状态面不说谎」做扎实了，但模型在系统提示里只看得到
+`async_run` 一个工具（约 2% 的 shell 调用走异步）。本版只改提示面与上下文注入，不动任务行为。
+详见 `docs/PLAN-CONTEXT.md` 与 `docs/CONTRACT.md` §17（REV-20/21/22）。
+
+### Added
+
+- **5 个工具全部带 `promptSnippet`**（REV-20）：宿主只列出带 snippet 的工具，此前
+  `async_wait` / `async_logs` / `async_status` / `async_kill` 在系统提示的 Available tools 段缺席。
+- **情境注入**（REV-21）：
+  - `bash` 前台调用 ≥60s（或 `tail -f` / `until` / `watch` / `sleep N` 形状）返回后，追加一行建议改用
+    `async_run`；宿主没给 wall time 时用 `tool_execution_start` 的起点计时兜底；
+  - 有活跃任务时，每次 provider 请求前注入一行 `<async-state>`（空闲零 token，状态不变不重复）；
+    尾句按真实的每任务通知开关分句，`notifyOnCompletion: false` 的任务标 `no-notify`，不再一律声称
+    「完成会叫醒你」；
+  - `async_run` 的 receipt 只在**例外**时多说一句（`willNotify: false` / `willWake: false` + 对应 hint），
+    通用规则不重复计费；
+  - 主会话 settle 前给出一次**不带 `continue`** 的建议（带着后台任务结束 turn 是合法的）。
+- **采纳率度量**：`npm run adoption` 扫 pi 会话 JSONL，输出 bash 耗时分布、前台阻塞时间、sleep 轮询占比
+  与 nudge 覆盖率（dev-only，不进包）。
+- **随包 skill**（REV-22）：`skills/async-tasks/SKILL.md`，经 `resources_discover` 注册。check 纪律、
+  watch 语义、promote/abort 等内容移到这里，按需加载。
+- `PI_ASYNC_NUDGE=0` 关闭 `tool_result` / `context` 情境钩子。
+
+### Changed
+
+- `async_run` 的 description 收缩为两句，模式/超时语义下沉到字段级 description；check 纪律移入 skill。
+- `promptGuidelines` 重写为 3 条「触发条件 → 动作」，并明确「不必为了结束 turn 而阻塞在 `async_wait`」
+  （原话术把异步用法翻译成阻塞等待，review 记录 `async_wait` 超时中位数 210s）。
+- **`killed` + `killKind=timeout` 的通知现在带 `guidance`**（D5 修订）：状态仍是 `killed`，只是补上下一步
+  （调大 `taskTimeoutMs` 或改用 `watch`）。`completed` 仍然纯信息。
+- settle 守卫的 `agent_before_settle` 改为所有会话注册：legion child 行为不变（≤3 次 + `continue`），
+  主会话只给一次建议。
+
 ## 0.3.0 — 2026-11-02
 
 自 0.2.0 起的累积发布（含 0.2.0 之后未发版的 6 个提交）。主题是**不再对用户和模型撒谎**：任务在
