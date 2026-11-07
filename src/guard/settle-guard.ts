@@ -49,7 +49,9 @@ const idsOf = (active: TaskSnapshot[]): string => active.map((task) => task.task
  */
 export class SettleGuard {
   private readonly maxReminders: number;
+  private readonly legionChild = process.env.PI_LEGION_NODE_ID !== undefined;
   private reminders = 0;
+  private advisorySent = false;
   private settledSent = false;
   private removeHooks: Array<() => void> = [];
   private disposed = false;
@@ -91,6 +93,19 @@ export class SettleGuard {
       // Any drafts pi already queued for this boundary are preserved in front of ours.
       const entries = [...((event as BeforeSettleEvent | undefined)?.entries ?? [])];
       const ids = idsOf(active);
+      // Main sessions get ADVISORY only (D-C6): never `continue`, so a turn that legitimately
+      // ends with background work cannot be looped back. The tasks notify on completion anyway.
+      if (!this.legionChild) {
+        if (this.advisorySent) return undefined;
+        this.advisorySent = true;
+        const advisory: CustomMessageDraft = {
+          type: "custom_message",
+          customType: "async-task-settle-advisory",
+          content: `${active.length} async task(s) still running: ${ids}. If this answer does not need them, stop here — their completion notifications will wake you. Otherwise collect them with async_wait.`,
+          display: false,
+        };
+        return { entries: [...entries, advisory] };
+      }
       if (this.reminders >= this.maxReminders) {
         // Budget spent: record the unresolved list for the transcript, then let the run settle
         // (`continue` omitted so pi does not force another provider request).
@@ -114,6 +129,7 @@ export class SettleGuard {
 
     const agentStart = (): void => {
       this.reminders = 0;
+      this.advisorySent = false;
       this.settledSent = false;
     };
 
@@ -144,9 +160,9 @@ export class SettleGuard {
       } catch { /* best effort: sending is advisory, never fatal to settle */ }
     };
 
-    // SAFETY: PI_LEGION_NODE_ID is the documented legion-child marker; presence opts into settle reminders.
-    const legionChild = process.env.PI_LEGION_NODE_ID !== undefined;
-    if (legionChild) listen("agent_before_settle", beforeSettle);
+    // D-C6: every session hears the settle boundary. Legion children get up to three
+    // `continue:true` reminders (unchanged); main sessions get one advisory draft.
+    listen("agent_before_settle", beforeSettle);
     listen("agent_start", agentStart);
     // Thread 2 of the guard: registered for every session (not only legion children).
     listen("agent_settled", agentSettled);

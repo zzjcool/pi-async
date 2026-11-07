@@ -6,12 +6,19 @@ import test from "node:test";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { buildNotificationXml, sendCompletionNotification } from "../src/core/notify.ts";
 
-test("completion notifications escape XML and include guidance only for failure", () => {
+test("completion notifications escape XML; guidance rides only on failed or timeout-killed tasks", () => {
   const common = { taskId: "a&b", name: "<task>", outputFile: "/tmp/out" };
   const done = buildNotificationXml({ ...common, status: "completed", guidance: "ignored" });
   assert.match(done, /a&amp;b/);
   assert.doesNotMatch(done, /guidance/);
   assert.match(buildNotificationXml({ ...common, status: "failed", guidance: "inspect logs" }), /<guidance>inspect logs<\/guidance>/);
+  // D-C8: a timeout kill stays `killed` but carries the next step.
+  assert.match(
+    buildNotificationXml({ ...common, status: "killed", killKind: "timeout", guidance: "retry" }),
+    /<status>killed<\/status>.*<guidance>retry<\/guidance>/,
+  );
+  // Other kill shapes remain guidance-free.
+  assert.doesNotMatch(buildNotificationXml({ ...common, status: "killed", killKind: "user", guidance: "ignored" }), /guidance/);
 });
 
 test("notification latch sends once and outputConsumed suppresses delivery", async () => {

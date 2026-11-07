@@ -34,9 +34,12 @@ function notifyPayloadFromSnapshot(registry: TaskRegistry, snapshot: TaskSnapsho
   const outputFile = String(snapshot.metadata.outputFile ?? "");
   const logSlice = registry.logs(snapshot.taskId, { maxBytes: 8192, tail: true });
   const outputTail = logSlice.text;
-  const guidance = snapshot.status === "failed"
-    ? `Inspect task output with async_logs (taskId: ${snapshot.taskId}).`
-    : undefined;
+  const failureNotes: string[] = [];
+  if (snapshot.failureKind === "lost") failureNotes.push("Exit status unknown after session reload; output may be incomplete.");
+  if (snapshot.status === "failed") failureNotes.push(`Inspect task output with async_logs (taskId: ${snapshot.taskId}).`);
+  // D-C8: timeout kills stay `killed`, but they still carry a next step.
+  if (snapshot.killKind === "timeout") failureNotes.push("Killed at taskTimeoutMs. Rerun with a larger taskTimeoutMs, or watch for a success_when condition instead of a hard deadline.");
+  const guidance = failureNotes.length > 0 ? failureNotes.join(" ") : undefined;
   const summaryTruncated = snapshot.metadata.capped === true || logSlice.truncated;
   return {
     taskId: snapshot.taskId,
@@ -51,6 +54,31 @@ function notifyPayloadFromSnapshot(registry: TaskRegistry, snapshot: TaskSnapsho
     ...(summaryTruncated ? { summaryTruncated: true as const } : {}),
   };
 }
+
+test("taskTimeoutMs kill is `killed` + kill-kind=timeout and still carries guidance (D-C8)", async () => {
+  const f = fixture();
+  const xmls: string[] = [];
+  try {
+    f.registry.setEvents({
+      onFinalize: (snapshot) => { xmls.push(buildNotificationXml(notifyPayloadFromSnapshot(f.registry, snapshot))); },
+      onStateChange: () => undefined,
+    });
+    const task = f.registry.submit({ command: "sleep 8", name: "deadline", taskTimeoutMs: 150 });
+    const outcome = await f.registry.wait([task.taskId], 5000);
+    assert.ok("results" in outcome);
+    const result = outcome.results[0]!;
+    assert.equal(result.status, "killed", "a timeout kill stays killed, not failed");
+    assert.equal(result.killKind, "timeout");
+
+    assert.ok(xmls.length >= 1);
+    const xml = xmls.at(-1)!;
+    assert.match(xml, /<kill-kind>timeout<\/kill-kind>/);
+    assert.match(xml, /<guidance>Killed at taskTimeoutMs\./);
+    assert.match(xml, /larger taskTimeoutMs/);
+  } finally {
+    await f.cleanup();
+  }
+});
 
 test("buildNotificationXml emits kill-kind, failure-kind, and summary-truncated when set", () => {
   const xml = buildNotificationXml({
