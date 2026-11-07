@@ -106,8 +106,9 @@ type ContextSlice = { messages?: unknown[] };
  * Register both nudges and return an idempotent disposer.
  *
  * `context_with_system` is the 1.5 hook that may rewrite the message list per request; older
- * hosts expose plain `context`. The fallback is chosen at registration time so a host never
- * gets both.
+ * hosts expose plain `context`. Both are registered unconditionally: registration time cannot
+ * tell which one a host will fire. De-duplication therefore happens inside the handler, where a
+ * task-set signature keeps a host that fires both from seeing the state line twice (REV-21).
  */
 export function registerNudges(pi: PiCtx, registry: TaskRegistry, opts?: { max?: number }): () => void {
   if (nudgesDisabled()) return () => undefined;
