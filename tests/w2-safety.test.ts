@@ -8,7 +8,7 @@ import { stripAnsi, stripLogControls, truncateUtf8Bytes } from "../src/core/outp
 import { buildNotificationXml } from "../src/core/notify.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { capName, deriveName, isTaskStatus, TASK_STATUSES } from "../src/core/task.ts";
-import { evalConditions, validateWatchSpec, MAX_OUTPUT_MATCH_BYTES } from "../src/core/watch.ts";
+import { evalConditions, validateWatchSpec, MAX_MATCH_CHARS } from "../src/core/watch.ts";
 import { registerTools } from "../src/tools/index.ts";
 import { init } from "../extensions/index.ts";
 
@@ -96,16 +96,16 @@ test("validateWatchSpec rejects nested-quantifier regexes (#24)", () => {
   if (!result.ok) assert.match(result.error, /nested quantifiers|ReDoS/i);
 });
 
-test("output_matches evaluates only the last MAX_OUTPUT_MATCH_BYTES (#24)", () => {
-  assert.ok(MAX_OUTPUT_MATCH_BYTES > 0);
+test("output_matches evaluates only the last MAX_MATCH_CHARS (#24)", () => {
+  assert.ok(MAX_MATCH_CHARS > 0);
   const needle = "UNIQUE_TAIL_MARKER_XYZ";
-  const output = "a".repeat(MAX_OUTPUT_MATCH_BYTES + 100) + needle;
+  const output = "a".repeat(MAX_MATCH_CHARS + 100) + needle;
   assert.equal(
     evalConditions([{ type: "output_matches", regex: needle }], { output, stdout: output, stderr: "" }),
     true,
   );
   // Marker only in the dropped prefix must not match.
-  const buried = needle + "b".repeat(MAX_OUTPUT_MATCH_BYTES + 10);
+  const buried = needle + "b".repeat(MAX_MATCH_CHARS + 10);
   assert.equal(
     evalConditions([{ type: "output_matches", regex: needle }], { output: buried, stdout: buried, stderr: "" }),
     false,

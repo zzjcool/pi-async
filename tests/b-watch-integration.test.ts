@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,8 +8,22 @@ import type { WatchSpec } from "../src/core/task.ts";
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "pi-async-watch-integration-"));
-  const registry = new TaskRegistry({ dataDir: dir });
-  return { registry, cleanup: async () => { await registry.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
+  // Pin the write cap: this file asserts window sizes, so an inherited PI_ASYNC_MAX_OUTPUT_BYTES
+  // smaller than the 9 MiB fixture would truncate the output and make the case lie.
+  const registry = new TaskRegistry({ dataDir: dir, maxOutputBytes: 32 * 1024 * 1024 });
+  return { dir, registry, cleanup: async () => { await registry.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
+}
+
+/** Deterministic barrier: wait until an artifact reaches `size` bytes (watch windows are size-based). */
+async function waitForSize(path: string, size: number, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (statSync(path).size >= size) return;
+    } catch { /* not created yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`${path} never reached ${size} bytes`);
 }
 function assertProcessGroupDead(pid: number): void {
   // Zombies still answer kill(-pgid, 0); only non-zombie members count as alive (#6).
@@ -141,5 +155,34 @@ test("terminal task stops watch loop and invalid specs are rejected before admis
     const loops = (f.registry as unknown as { watchLoops: Map<string, { stopped: boolean }> }).watchLoops;
     assert.equal(loops.has(task.taskId), false);
     assert.equal(f.registry.hasActiveWork(), false);
+  } finally { await f.cleanup(); }
+});
+
+test("a watch reads a bounded tail, so output that scrolled out is invisible (REV-25)", async () => {
+  const f = fixture();
+  try {
+    // ~9 MiB, which is deliberately larger than the 8 MiB read window: HEAD sits outside it.
+    const command = "printf 'HEAD-MARKER\\n'; head -c 9000000 /dev/zero | tr '\\0' 'x'; printf '\\nTAIL-MARKER\\n'; sleep 20";
+    const late = f.registry.submit({ command });
+    const early = f.registry.submit({ command });
+
+    // Inside the tail window → the check still matches.
+    f.registry.attachWatch(late.taskId, watch({ type: "stdout_contains", value: "TAIL-MARKER" }, { timeoutMs: 15_000 }));
+    const lateResult = await f.registry.wait([late.taskId], 15_000);
+    assert.ok("results" in lateResult, "the tail marker must be reachable");
+    assert.equal(lateResult.results[0]?.status, "completed");
+    assert.equal(f.registry.get(late.taskId)?.metadata.watchSuccess !== undefined, true);
+
+    // Outside the window → the check must NOT match, and the watch timeout ends it instead.
+    // Before REV-25 the whole file was re-read every tick, so this line matched.
+    // Wait for `early` to pass the window first: its stream is written independently of `late`, and a
+    // watch attached while the file is still small would legitimately see HEAD-MARKER.
+    await waitForSize(join(f.dir, `${early.taskId}.stdout`), 9_000_000);
+    f.registry.attachWatch(early.taskId, watch({ type: "stdout_contains", value: "HEAD-MARKER" }, { timeoutMs: 1_500 }));
+    const earlyResult = await f.registry.wait([early.taskId], 6_000);
+    assert.ok("results" in earlyResult);
+    assert.equal(earlyResult.results[0]?.status, "failed");
+    assert.equal(f.registry.get(early.taskId)?.failureKind, "watch_timeout");
+    assert.equal(f.registry.get(early.taskId)?.metadata.watchSuccess, undefined);
   } finally { await f.cleanup(); }
 });

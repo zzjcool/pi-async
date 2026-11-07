@@ -2,6 +2,28 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 未发布 — watch 读取有界 + 常量改名（REV-25）
+
+### Fixed
+
+- **watch 每个轮询 tick 整文件读取输出**：`readWatchOutput` 原本对 `.output` / `.stdout` / `.stderr`
+  各自 `readFileSync` 整份读入，大日志在 watch 期间被反复全量加载。改走 `logs()` 的
+  有界尾部读（`WATCH_READ_BYTES` = `MAX_LOG_WINDOW` = 8 MiB，**每流各一次**）。
+  （默认写盘 cap 是 20 MiB，见 `PI_ASYNC_MAX_OUTPUT_BYTES`，所以「多 GB」需要先调大该 cap。）
+- 行为变化（有意）：滚出尾部 8 MiB 的输出对**所有**条件不再可见。此时终态由命令退出码或
+  `timeoutMs` 决定（区分是否命中要看 `metadata.watchSuccess`，不看 `status`）。
+  **看更早的输出用通知 XML 或 `async_status` 的 `metadata.outputFile` 路径配 `bash`**（如 `grep -n marker <file>`）；
+  `async_logs` 救不了——工具层硬顶 50 KiB，且只有头部 / 尾部两档，中间段取不到。
+- 保留原有两条语义：数据目录外路径仍 throw（D-11）；合并输出文件缺失仍 throw（让
+  `blind_checks` 能计为基础设施失败）；`stdout` / `stderr` 缺席仍按空串处理。
+
+### Changed
+
+- 常量 `MAX_OUTPUT_MATCH_BYTES` → `MAX_MATCH_CHARS`：旧名声称 bytes，实现是
+  `String.length` / `String.prototype.slice`（UTF-16 码元）。0.4.0 未发布，不留兼容别名。
+- 文档同步：契约把「窗口」拆成**读取窗口（8 MiB）**与**正则窗口（64K 码元）**两层；
+  README / SKILL 的面向模型措辞一并改正（此前提到的「整文件重读代价」已不存在）。
+
 ## 未发布 — 契约文档校准到实现（CONTRACT 逐条对齐）
 
 主题：**代码是唯一事实**。一次通读实现与冻结契约，把文档里已被实现超越的措辞改回去；
@@ -10,17 +32,17 @@
 ### Changed
 
 - `README.md` / `skills/async-tasks/SKILL.md`：把「匹配窗口是尾部 64K」改成**只对 `output_matches` 成立**
-  （子串条件扫全量），并如实标注 watch 每次轮询整文件重读的代价。这两处是模型**实际会读到**的措辞
+  （子串条件扫全量），并如实标注 watch 每次轮询整文件重读的代价（后由 REV-25 改为有界读取）。这两处是模型**实际会读到**的措辞
   （`skills/` 经 `resources_discover` 注入），所以不能只改契约。
 - `docs/CONTRACT.md` 校准 22 处（不改行为，逐条有代码依据）：
-  - **矛盾纠正**：`taskTimeoutMs` 无 watch 必填约束（§3）；匹配窗口只限 `output_matches`，子串条件扫全量
-    且 watch 每 tick 整文件读入（§4）；`shutdown()` 不杀 pending delayed、只清 timer 并保留快照（§10）；
+  - **矛盾纠正**：`taskTimeoutMs` 无 watch 必填约束（§3）；匹配窗口的表述（§4，后由 REV-25 重写为
+    两层窗口）；`shutdown()` 不杀 pending delayed、只清 timer 并保留快照（§10）；
     工具集是 **6 个**（§3 漏了 `async_extend`）；`success_when` 详情只进 `metadata.watchSuccess`，完成通知
     XML 不含该字段（§4/§6）；`context` 与 `context_with_system` 是**双注册 + signature 去重**（§17 REV-21）；
     D9 切 session **会**迁移产物（§13）；guidance 在 `failed` **或** `killKind=timeout` 时都带（§6）；
     `sync.timeoutMs` 必填是 execute 运行时强制、不是 schema（§3）；`suspended` 无**运行期**重置路径（§19.2）；
     check 纪律在随包 skill 而不在 `promptGuidelines`（§4）。
-  - **陈旧数值/失效引用**：`MAX_MATCH_CHARS` → `MAX_OUTPUT_MATCH_BYTES`（且是 UTF-16 码元截断，不是字节）；
+  - **陈旧数值/失效引用**：常量名与语义（旧名声称 bytes；后由 REV-25 统一为 `MAX_MATCH_CHARS`）；
     发布流程不再写死版本号（指向 §17 / §18–§19），并修正为 Trusted Publishing（OIDC）+ `workflow_dispatch`；
     §18.8 去掉失效行号；§1 目录树补齐 `env.ts` / `duration.ts` / `context/nudges.ts` / `context/resources.ts` /
     `tui/host.ts` / `tui/width.ts`；`notified` 标注为快照**顶层**字段；§18.11 交叉引用 §17 → §3；

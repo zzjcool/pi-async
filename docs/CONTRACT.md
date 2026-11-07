@@ -147,15 +147,19 @@ type Condition =
 - 条件在 async_run 时**启动前校验**，非法 regex/JSON path 直接拒绝（不产生 pending 任务）。
 - **blind_checks 语义（REV-2 澄清）**：仅计「检查基础设施失败」（readOutput 抛错等）；
   「尚未可判定」（exit_code 未退出 / json_path 输出尚非 JSON）为 **pending 态，不累计 blind、照常
-  继续轮询**。两者是不同语义，禁止合并。条件持续 pending 时**不**触发 blind 兜底，仅由
-  `timeoutMs` 结束 watch（WatchSpec 字段注释已与本条对齐，见 #27）。
+  继续轮询**。两者是不同语义，禁止合并。条件持续 pending 时**不**触发 blind 兜底；watch 由
+  `timeoutMs` 到期、进程退出或 `async_kill` / `failure_when` 终结（WatchSpec 字段注释已与本条对齐，见 #27）。
 - **组内 OR**：`success_when` / `failure_when` 各自是 OR（首个命中即返回），没有 `match:"all"` 模式。
-- **匹配窗口只限 `output_matches`**：正则作用对象被截到输出尾部 `MAX_OUTPUT_MATCH_BYTES`（64×1024，
-  `output.slice(-N)` 按 **UTF-16 码元**截断，不是字节）；更早的输出会滚出窗口。`stdout_contains` /
-  `stderr_contains` 是**全量字符串** `includes`，没有窗口；`exit_code` 只看退出码。
-  代价要如实计入：watch 每个 tick 的 `readWatchOutput` 把 `.output` / `.stdout` / `.stderr` **整文件**
-  `readFileSync` 读入（不走 `MAX_LOG_WINDOW`），所以超大输出在 watch 期间有内存/CPU 开销；
-  上面的截断只限正则作用对象，**不减少读取量**。
+- **两层窗口，各有理由（REV-25）**：
+  - **读取窗口**：每次求值（每个 tick，以及进程退出时那一次）的 `readWatchOutput` 经 `logs()` 只读**尾部**，
+    上限 `WATCH_READ_BYTES` = `MAX_LOG_WINDOW`（8 MiB，**每流各一次**）。不再整文件 `readFileSync`。
+    滚出读取窗口的输出对**任何**条件都不可见。
+  - **正则窗口**：`output_matches` 在读取窗口内再截到尾部 `MAX_MATCH_CHARS`（64×1024，按
+    **UTF-16 码元**截断，不是字节）以限制 ReDoS 影响面。
+  - 因此可见范围：`stdout_contains` / `stderr_contains` 是**尾部 8 MiB**（不是无限）；
+    `json_path_exists` 只能解析尾部 8 MiB 内的 JSON（超大 JSON 会因此永远 `pending`，由进程退出、`timeoutMs` 或 `async_kill` 终结 watch）；
+    `output_matches` 是尾部 64K 码元；`exit_code` 只看退出码，与窗口无关。
+  - 缺失的合并输出文件仍 **throw**（让 `blind_checks` 计为基础设施失败）；`stdout` / `stderr` 缺席按空串处理（#4）。
 - **check 纪律在随包 skill，不在工具面（REV-22）**：不 `|| true` 自吞错误、未知态映射失败、结构化输出
   优先 `jq -e`、`output_matches` 须加锚定（编译固定带 `m`，`^`/`$` 按行边界，故 `^READY$` 可命中
   多行输出中的某一行）——全文见 `skills/async-tasks/SKILL.md`；工具面只留 `watch` 的 schema
@@ -796,3 +800,49 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - 二次 `init()` 之后，仍持有前代工具对象的调用方：`async_run` **成功**，且新任务归新代所有。
 - 无活代数时（`shutdown` 之后），同一调用报出带「reload the session」指引的可操作错误。
 - `registerTools(pi, registry)` 直接传实例的旧签名继续可用。
+
+## 20. 0.4.0 watch 读取有界 + 常量改名（REV-25，冻结）
+
+起因：`readWatchOutput` 每次求值都把 `.output` / `.stdout` / `.stderr` **整文件** `readFileSync`，
+一个大日志（默认写盘 cap 20 MiB，可调 `PI_ASYNC_MAX_OUTPUT_BYTES`）在 watch 期间会被反复全量读入；同时契约把「尾部 64K 窗口」写成所有条件的通用性质，
+而实现里只有 `output_matches` 截断。
+
+### 20.1 读取有界
+
+`readWatchOutput` 改走 `logs({ maxBytes: WATCH_READ_BYTES, tail: true })`：
+
+- `WATCH_READ_BYTES = MAX_LOG_WINDOW`（8 MiB），每次求值（tick 或进程退出）每流各一次**有界尾部读**。
+- 保留两条既有语义：数据目录外路径 **throw**（D-11）；**合并输出文件缺失 throw**，使 `blind_checks`
+  能计为基础设施失败（#37/#68）。`logs()` 对缺失返回 `missing: true`，此处转回 throw。
+- `stdout` / `stderr` 缺席仍按空串处理，流分离不变（#4）。
+
+### 20.2 两层窗口，语义分离
+
+| 窗口 | 值 | 适用范围 | 理由 |
+|---|---|---|---|
+| 读取窗口 | 8 MiB（`MAX_LOG_WINDOW`） | 所有条件 | 内存 / CPU 有界 |
+| 正则窗口 | 64K 码元（`MAX_MATCH_CHARS`） | 仅 `output_matches` | 限制 ReDoS 作用面 |
+
+滚出读取窗口的输出对**所有**条件都不可见。这是有意语义（watch 决定的是「最近发生了什么」），
+不是实现妥协。**补救路径是 `output-file` 路径 + `bash`**（如 `grep -n marker <file>`）；
+`async_logs` **救不了**：工具层硬顶 50 KiB，且只有头部 / 尾部两档，中间段取不到。
+
+### 20.3 常量改名
+
+`MAX_OUTPUT_MATCH_BYTES` → `MAX_MATCH_CHARS`：旧名声称 bytes，实现是 `String.length` /
+`String.prototype.slice`（UTF-16 码元）。0.4.0 未发布，直接改名，不留兼容别名。
+
+### 20.4 验收清单
+
+- 尾部窗口内的标记可命中；超出窗口的标记不命中，终态由退出码或 `timeoutMs` 决定
+  （`tests/b-watch-integration.test.ts` 的 9 MiB 用例）。区分是否命中要看 `metadata.watchSuccess`，
+  而不是看 `status`（命令自行 `exit 0` 时也是 `completed`）。
+- 合并输出文件缺失仍走 blind 计数；数据目录外路径仍 throw。
+- `output_matches` 仍只在尾部 64K 码元内求值（`MAX_MATCH_CHARS`）。
+
+### 20.5 已知限制（接受，不修）
+
+窗口起点若横切一个 ANSI/OSC 序列，会留下半截转义残片：`logs()` 是「先切窗口再
+`stripLogControls`」，而 `ANSI_ESCAPE` 只修补**结尾**未闭合的序列、不修**开头**残片。
+影响仅限 >8 MiB 文件窗口头部的数十字节，对条件判定无实际意义。修它需要改动 `logs()` 的
+清洗顺序（会影响 `async_logs` 的每个窗口），收益不足，记录在此。
