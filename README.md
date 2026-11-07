@@ -124,7 +124,7 @@ Completion notifications are **best-effort**. `pi.sendMessage` returns `void` �
 - Conditions inside a group (`success_when`, `failure_when`) are OR-ed: the **first match wins**. There is no AND mode; use one condition with a richer `stdout_contains` value if you need a conjunction.
 - `success_when` records completion without killing the process (task lifetime still belongs to `taskTimeoutMs` / `async_kill`); `failure_when`, blind exhaustion, and watch timeout all kill the process group.
 - `blind_checks` (default 3) counts **only infrastructure errors** (e.g. the output file could not be read). "Not yet decidable" states — process still running, JSON not valid yet — stay pending and never accumulate blind checks.
-- The match window is the trailing **64K characters** of output, not bytes, and early output scrolls out of it. Anchor regexes differently if the marker can appear far from the tail.
+- `output_matches` sees only the trailing **64K characters** of output (UTF-16 code units, not bytes), so a marker far from the tail falls out of the window — anchor accordingly. `stdout_contains` / `stderr_contains` check the whole captured stream.
 - `output_matches` compiles with the `m` flag, so `^` / `$` are line boundaries.
 
 ## Data directory

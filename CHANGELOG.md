@@ -9,6 +9,9 @@
 
 ### Changed
 
+- `README.md` / `skills/async-tasks/SKILL.md`：把「匹配窗口是尾部 64K」改成**只对 `output_matches` 成立**
+  （子串条件扫全量），并如实标注 watch 每次轮询整文件重读的代价。这两处是模型**实际会读到**的措辞
+  （`skills/` 经 `resources_discover` 注入），所以不能只改契约。
 - `docs/CONTRACT.md` 校准 22 处（不改行为，逐条有代码依据）：
   - **矛盾纠正**：`taskTimeoutMs` 无 watch 必填约束（§3）；匹配窗口只限 `output_matches`，子串条件扫全量
     且 watch 每 tick 整文件读入（§4）；`shutdown()` 不杀 pending delayed、只清 timer 并保留快照（§10）；

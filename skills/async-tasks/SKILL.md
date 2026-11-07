@@ -56,7 +56,7 @@ Payload per `type`: `stdout_contains`/`stderr_contains` take `value` (a literal 
 
 Two shapes that are rejected before any task is created: `output_matches` regexes with inline flags (`(?i)READY` — JavaScript has no inline flags here, the pattern is compiled with `m` only; write `[Rr][Ee][Aa][Dd][Yy]` or use `stdout_contains`), and `delayMs` without `mode: "delayed"`.
 
-- Polling interval is at least 1000 ms, and both `intervalMs` and `timeoutMs` are required. The match window is the trailing **64K characters** of output, not bytes — early output scrolls out of it.
+- Polling interval is at least 1000 ms, and both `intervalMs` and `timeoutMs` are required. `output_matches` sees only the trailing **64K characters** of output (UTF-16 code units, not bytes), so a marker far from the tail falls out of the window; `stdout_contains` / `stderr_contains` check the whole stream. Every poll re-reads the whole captured output, so watching a multi-GB log is expensive.
 - Conditions inside a group are OR-ed: the first match wins. There is no AND mode; when you need a conjunction, use one condition with a richer `stdout_contains` value.
 - A `success_when` match does **not** kill the process: the task is marked `completed`, and process lifetime stays with `taskTimeoutMs` / `async_kill`.
 - `blind_checks` counts only infrastructure failures (unreadable output, malformed check) and defaults to 3. "Not yet decidable" is a pending state and does not accumulate.
