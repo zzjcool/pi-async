@@ -7,6 +7,7 @@ import { registerNudges } from "../src/context/nudges.ts";
 import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
+import { registerHold } from "../src/guard/hold.ts";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
 import { registerTools, type ToolContext } from "../src/tools/index.ts";
 import { registerRail } from "../src/tui/rail.ts";
@@ -65,6 +66,9 @@ let activeGuard: SettleGuard | undefined;
 /** Previous generation's context nudges (tool_result / context hooks); released like the guard. */
 let activeNudges: (() => void) | undefined;
 
+/** Previous generation's settle hold (PLAN-HOLD D-1); released up front like the guard. */
+let activeHold: (() => void) | undefined;
+
 /** One-line card for completion notifications (PLAN §2.8), rendered from message.details. */
 function formatDuration(ms: number): string {
   return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
@@ -122,14 +126,23 @@ export async function init(pi: PiCtx): Promise<void> {
   const previousGuard = activeGuard;
   const previousRegistry = activeRegistry;
   const previousNudges = activeNudges;
+  const previousHold = activeHold;
   activeGuard = undefined;
   activeRegistry = undefined;
   activeNudges = undefined;
+  activeHold = undefined;
   if (previousNudges) {
     try {
       previousNudges();
     } catch (error) {
       console.error("pi-async: previous context nudges disposal during reload failed", error);
+    }
+  }
+  if (previousHold) {
+    try {
+      previousHold();
+    } catch (error) {
+      console.error("pi-async: previous settle hold disposal during reload failed", error);
     }
   }
   if (previousGuard) {
@@ -309,6 +322,9 @@ export async function init(pi: PiCtx): Promise<void> {
     context.on("session_start", (_event: unknown, ctx: unknown) => onLifecycle(ctx));
     context.on("message_start", (_event: unknown, ctx: unknown) => onLifecycle(ctx));
 
+    // PLAN-HOLD D-1: the hold registers BEFORE the guard, so the settle boundary waits first and
+    // the guard's advisory still runs afterwards on the same boundary.
+    activeHold = registerHold(pi, registry);
     // agent_settled / agent_before_settle are registered by SettleGuard itself.
     activeGuard = new SettleGuard(pi, registry);
     activeGuard.register();

@@ -45,7 +45,8 @@ pi-async/
 │   │   ├── host.ts         # TUI 宿主上下文惰性绑定（factory 期无 mode/ui，见 §15）
 │   │   └── width.ts        # 显示宽度计算（东亚宽字符/emoji 占 2 列）与截断
 │   └── guard/
-│       └── settle-guard.ts # agent_before_settle custom_message 提醒 + agent_settled 兜底（无心跳）
+│       ├── settle-guard.ts # agent_before_settle custom_message 提醒 + agent_settled 兜底（无心跳）
+│       └── hold.ts         # settle hold：会唤醒会话的 running 任务终态前不 settle（D-14 / §7.1）
 ├── vendor/reference/       # 已就位（只读参考，不编译）
 └── docs/
 ```
@@ -268,6 +269,23 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - RPC（legion child）内：setActivity 依赖 legion `extension_activity` 转发（#156 落地后生效），
   未落地时静默降级，不影响工具面。
 
+### 7.1 Settle hold（默认开，D-14）
+
+- 注册于 `agent_before_settle`（每 run 最多 1 次，`agent_start` 重新武装），在 SettleGuard **之前**
+  注册，不改动 guard 自身逻辑。
+- 条件：存在 holdable 任务——`status === "running"` + `notifyOnCompletion !== false` +
+  `triggerOnCompletion !== false`（`pending`/delayed 任务不 hold：预算内不可能终态）。
+  仅在交互 TUI 会话 hold（`ctx.mode === "tui"` 或 ctx 缺失）；军团 child（`PI_LEGION_NODE_ID` 存在）、
+  `print`/`json`/`rpc` 都不 hold。
+- 行为：在边界内轮询等待（`PI_ASYNC_HOLD_POLL_MS`，默认 1000ms），直到快照内的 holdable 任务全部
+  终态或到达 `PI_ASYNC_HOLD_MS`（默认 600000ms，单调时钟计时）。只有这两条出口，不探测宿主队列。
+- 返回：全部终态 → 追加一条 `custom_message`（`customType: "async-task-settle-results"`、`display: false`、
+  不含 outputTail、指路 `async_logs`）并 **`continue: true`**；超时 → 原样 `undefined`（不带 entries/continue）。
+  `continue` 不会成环：再次进入边界时快照内任务已终态。
+- 不 consume 输出、不动 `notified`、不抑制通知、不改任务状态、不内联 outputTail。
+- footer：`waiting for N task(s) <elapsed>`（key `pi-async-hold`），15s 刷新，结束后清除；全部 best-effort。
+- 开关：`PI_ASYNC_HOLD=0` 不注册任何 handler；`PI_ASYNC_HOLD_MS <= 0` 同样关闭。
+
 ## 8. TUI（冻结，仅主会话）
 
 - guard：所有 TUI 路径 `ctx.mode === "tui"`（hasUI 陷阱）；rail/面板跳过 rpc/json/print。
@@ -365,6 +383,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_ENV_INHERIT` | `safe` | 子进程 env 策略：`safe` 剥离敏感键（含 `npm_config_*` 中带 auth/token/password 的键）并拒绝危险显式键；`all` 恢复完整继承（显式危险键覆盖**在任何策略下仍被拒绝**）；`none` 只给 `PATH`/`HOME`/`SHELL`/`TERM`/`LANG`/`LC_*`/`TMPDIR`/`USER`（存在的）。未知值按 `safe` 处理 |
 | `PI_ASYNC_SETTLE_GUARD` | 开启（未设） | `0` → 守卫不注册任何 handler |
 | `PI_ASYNC_NUDGE` | 开启（未设） | `0` → 不注册 `tool_result` / `context`(+"_with_system") 情境钩子（REV-21） |
+| `PI_ASYNC_HOLD` | 开启（未设） | `0` → settle hold 关闭，一个 handler 都不注册（D-14） |
+| `PI_ASYNC_HOLD_MS` | `600_000`（10 分钟） | 单次 hold 上限（单调时钟计时）；**≤ 0 关闭**（负数不会回退到默认值） |
+| `PI_ASYNC_HOLD_POLL_MS` | `1_000` | hold 期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
 | `PI_ASYNC_FOOTER` | 关闭（未设） | `1` 且宿主 `ui.setStatus` 存在时额外渲染一行 footer 汇总；rail 首行仍是默认状态面 |
 | `PI_ASYNC_RETENTION_MS` | `604_800_000`（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
@@ -419,6 +440,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | D8 | 不改 legion/pi 本体；busy-hold 走上游（#156 + 补充评论已发） |
 | D9 | delayed：reload 恢复计时；dataDir 变更（切 session）时 copy+rename 迁移 `.json/.output/.stdout/.stderr` 并重写 `metadata.outputFile`，任务不丢（§10 / REV-17） |
 | D10 | settle 守卫每 run 重武装、累计 ≤3 次，超限放行但保留未决清单提示 |
+| D-14 | settle hold（§7.1）：仅在交互 TUI 会话、且存在会唤醒会话的 **running** 任务时，在 `agent_before_settle` 内等它们全部终态再 settle（上限 `PI_ASYNC_HOLD_MS`，默认 600000ms，单调时钟；**只有两条出口**：全终态或超时）；全部终态时自带 `async-task-settle-results` entry + `continue: true`（不内联 outputTail），超时原样放行；`pending`/delayed、军团 child、`print`/`json`/`rpc` 都不 hold（修订 1 / 修订 2） |
 
 ## 14. 验收清单（verify 门禁）
 
