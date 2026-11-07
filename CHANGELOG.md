@@ -2,122 +2,115 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
-## 未发布 — watch 读取有界 + 常量改名（REV-25）
+## 0.4.0 — 2026-11-07（settle hold + 有界 watch 读取）
 
-### Fixed
+主题是**状态与代价都不再说谎**：turn 结束不再闪一下 `done`（settle hold，默认开）；watch 不再每个轮询
+tick 整文件重读；契约与报错文案校准到实现。此外含 0.3.1 之后未发版的 REV-23（运行期提醒 +
+`async_extend`）与 REV-24（代际交接）。
 
-- **watch 每个轮询 tick 整文件读取输出**：`readWatchOutput` 原本对 `.output` / `.stdout` / `.stderr`
-  各自 `readFileSync` 整份读入，大日志在 watch 期间被反复全量加载。改走 `logs()` 的
-  有界尾部读（`WATCH_READ_BYTES` = `MAX_LOG_WINDOW` = 8 MiB，**每流各一次**）。
-  （默认写盘 cap 是 20 MiB，见 `PI_ASYNC_MAX_OUTPUT_BYTES`，所以「多 GB」需要先调大该 cap。）
-- 行为变化（有意）：滚出尾部 8 MiB 的输出对**所有**条件不再可见。此时终态由命令退出码或
-  `timeoutMs` 决定（区分是否命中要看 `metadata.watchSuccess`，不看 `status`）。
-  **看更早的输出用通知 XML 或 `async_status` 的 `metadata.outputFile` 路径配 `bash`**（如 `grep -n marker <file>`）；
-  `async_logs` 救不了——工具层硬顶 50 KiB，且只有头部 / 尾部两档，中间段取不到。
-- 保留原有两条语义：数据目录外路径仍 throw（D-11）；合并输出文件缺失仍 throw（让
-  `blind_checks` 能计为基础设施失败）；`stdout` / `stderr` 缺席仍按空串处理。
+### Added
+
+- **settle hold（默认开，CONTRACT §7.1 / D-14）**：交互 TUI 主会话在一个 turn 结束时，如果还有
+  「会唤醒会话」的 **running** async 任务（`notifyOnCompletion !== false` + `triggerOnCompletion !== false`）
+  在跑，就在 `agent_before_settle` 边界内轮询等待它们全部终态再 settle，上限 `PI_ASYNC_HOLD_MS`
+  （默认 10 分钟，单调时钟计时）；期间终端 OSC 7501 保持 `working`，不再闪一下 `done`。全部终态时追加一条
+  `async-task-settle-results` custom_message（只有 name/status/exitCode，不含 outputTail）并 `continue: true`，
+  让结果落进 transcript 且一定还有一轮续跑；超时则原样放行（无 entries/continue）。
+  每 run 最多 1 次（`agent_start` 重新武装），不 consume、不抑制通知；轮询只有「全终态」与「预算耗尽」
+  两条出口，不探测宿主队列（`ctx.hasPendingMessages()` 数的是会话级用户队列，hold 期间的完成通知走
+  `agent.followUpQueue`，读它会在首个任务完成后误判并截断多任务 hold）。`pending`/delayed 任务、
+  军团 child、`print`/`json`/`rpc` 模式都不 hold；footer 显示 `waiting for N tasks <elapsed>`。
+  `PI_ASYNC_HOLD=0` 关闭整个特性，`PI_ASYNC_HOLD_MS <= 0` 同样关闭，`PI_ASYNC_HOLD_POLL_MS` 调轮询间隔。
+  已知限制：hold 期间按 Esc 不会打断等待（边界内没有 host signal），`/tree` 这类 `await session.abort()`
+  的命令也会等到放行；TUI 的 working 转圈在 `agent_end` 时已被宿主清掉，hold 不负责重新点亮。
+- **运行期提醒 + 续期（REV-23，CONTRACT §18）**：主题是**提醒 ≠ 杀**——`taskTimeoutMs` 只有硬杀一档，
+  杀掉正在跑的长构建比不杀更糟；而没有硬期限的 background 任务跑飞了又没人管。
+  - `async_run` 新增 `remindAfterMs`（运行时长；`0` = 关闭）。background 且无 `watch` 的任务默认
+    **20 分钟**（`1_200_000` ms）后收到一条 `async-task-reminder`（`deliverAs: followUp` + 触发新 turn，
+    只带 8 KiB tail 切片）。带 `watch` 默认不提醒（`watch.timeoutMs` 已是期限），显式传才开；
+    `timeoutAt` 会先到时**不布防**。`notifyOnCompletion: false` 一并静默提醒。
+  - **提醒绝不改变任务**：不调 `kill`、不改 `status`、不写 `failureKind`；按 2 倍退避（1× → 2× → 4×）
+    最多 3 次，用尽后不再布防、任务继续运行。抑制在**触发时**求值（已终态 / 输出已收割 /
+    `notifyOnCompletion: false` / registry 已 closed 或 suspended），跳过时不重布防。
+  - **新工具 `async_extend`（工具面 5 → 6）**：`{ taskId, remindAfterMs?, taskTimeoutMs? }` 续期提醒和/或
+    硬期限，任一次续期重置计数与间隔，`0` 清除对应期限；两者都不传报错；终态任务返回 `alreadyTerminal`
+    而不是错误（对齐 `async_kill`）。带 `promptSnippet`，否则不进系统提示（REV-20）。
+  - **reload 安全**：`TaskSnapshot` 新增 `remindAt`（绝对时刻）/ `remindCount`；`/reload` 按剩余预算重布防
+    并 `unref`（不会单独撑住宿主进程），已过期的 `remindAt` 立即触发一次并继续退避。一次性 `setTimeout`、
+    回调内重读 registry、`try/catch` 包住——不复活 D-12 的 `setInterval`。
+  - `SKILL.md` 增加一条纪律：默认 20 分钟提醒，收到提醒要么 `async_extend` 续期要么 `async_kill` 停止；
+    提醒本身不杀进程。工具清单断言与 `CONTRACT §17` 的计数同步为 6 个。
+- **工具在调用期解析活跃 registry（REV-24）**：`registerTools(pi, TaskRegistry | (() => TaskRegistry))`，
+  传解析器时每次 `execute` 现取活代数，传实例保持旧行为；`tests/g-generation-handoff.test.ts` 覆盖
+  解析器改道、跨代接管、无活代时报可操作错误。
+- **`watch` schema 补齐字段级 description**：`intervalMs` / `timeoutMs` / `success_when` / `failure_when` /
+  `blind_checks` 以及各 condition 的 `value` / `equals` / `regex`。其中 `blind_checks` 此前是裸字段，
+  而它的语义（只计基础设施失败、默认 3、pending 不累计）恰恰是最容易误用的一项。
+- `SKILL.md` 增加一个可复制粘贴的完整 `watch` 示例（含 `type` 判别字段与各 payload），
+  并列出两种启动前即被拒的写法。
 
 ### Changed
 
-- 常量 `MAX_OUTPUT_MATCH_BYTES` → `MAX_MATCH_CHARS`：旧名声称 bytes，实现是
-  `String.length` / `String.prototype.slice`（UTF-16 码元）。0.4.0 未发布，不留兼容别名。
-- 文档同步：契约把「窗口」拆成**读取窗口（8 MiB）**与**正则窗口（64K 码元）**两层；
-  README / SKILL 的面向模型措辞一并改正（此前提到的「整文件重读代价」已不存在）。
-
-## 未发布 — 契约文档校准到实现（CONTRACT 逐条对齐）
-
-主题：**代码是唯一事实**。一次通读实现与冻结契约，把文档里已被实现超越的措辞改回去；
-除一条注释外**没有任何行为变更**。
-
-### Changed
-
-- `README.md` / `skills/async-tasks/SKILL.md`：把「匹配窗口是尾部 64K」改成**只对 `output_matches` 成立**
-  （子串条件扫全量），并如实标注 watch 每次轮询整文件重读的代价（后由 REV-25 改为有界读取）。这两处是模型**实际会读到**的措辞
-  （`skills/` 经 `resources_discover` 注入），所以不能只改契约。
-- `docs/CONTRACT.md` 校准 22 处（不改行为，逐条有代码依据）：
-  - **矛盾纠正**：`taskTimeoutMs` 无 watch 必填约束（§3）；匹配窗口的表述（§4，后由 REV-25 重写为
-    两层窗口）；`shutdown()` 不杀 pending delayed、只清 timer 并保留快照（§10）；
-    工具集是 **6 个**（§3 漏了 `async_extend`）；`success_when` 详情只进 `metadata.watchSuccess`，完成通知
-    XML 不含该字段（§4/§6）；`context` 与 `context_with_system` 是**双注册 + signature 去重**（§17 REV-21）；
-    D9 切 session **会**迁移产物（§13）；guidance 在 `failed` **或** `killKind=timeout` 时都带（§6）；
-    `sync.timeoutMs` 必填是 execute 运行时强制、不是 schema（§3）；`suspended` 无**运行期**重置路径（§19.2）；
+- 常量 `MAX_OUTPUT_MATCH_BYTES` → `MAX_MATCH_CHARS`：旧名声称 bytes，实现是 `String.length` /
+  `String.prototype.slice`（UTF-16 码元）。0.4.0 未发布，不留兼容别名。
+- **契约把「窗口」拆成两层**：**读取窗口**（8 MiB，`WATCH_READ_BYTES` = `MAX_LOG_WINDOW`）与
+  **正则窗口**（64K 码元，只对 `output_matches` 成立，子串条件扫全量）。README / SKILL 的面向模型措辞
+  一并改正（此前提到的「整文件重读代价」已不存在）。
+- `docs/CONTRACT.md` 校准 22 处到实现（逐条有代码依据）：
+  - **矛盾纠正**：`taskTimeoutMs` 无 watch 必填约束（§3）；匹配窗口的表述（§4）；`shutdown()` 不杀
+    pending delayed、只清 timer 并保留快照（§10）；工具集是 **6 个**（§3 漏了 `async_extend`）；
+    `success_when` 详情只进 `metadata.watchSuccess`，完成通知 XML 不含该字段（§4/§6）；
+    `context` 与 `context_with_system` 是**双注册 + signature 去重**（§17 REV-21）；D9 切 session **会**迁移
+    产物（§13）；guidance 在 `failed` **或** `killKind=timeout` 时都带（§6）；`sync.timeoutMs` 必填是
+    execute 运行时强制、不是 schema（§3）；`suspended` 无**运行期**重置路径（§19.2）；
     check 纪律在随包 skill 而不在 `promptGuidelines`（§4）。
-  - **陈旧数值/失效引用**：常量名与语义（旧名声称 bytes；后由 REV-25 统一为 `MAX_MATCH_CHARS`）；
-    发布流程不再写死版本号（指向 §17 / §18–§19），并修正为 Trusted Publishing（OIDC）+ `workflow_dispatch`；
-    §18.8 去掉失效行号；§1 目录树补齐 `env.ts` / `duration.ts` / `context/nudges.ts` / `context/resources.ts` /
-    `tui/host.ts` / `tui/width.ts`；`notified` 标注为快照**顶层**字段；§18.11 交叉引用 §17 → §3；
+  - **陈旧数值/失效引用**：常量名与语义；发布流程不再写死版本号（指向 §17 / §18–§19），并修正为
+    Trusted Publishing（OIDC）+ `workflow_dispatch`；§18.8 去掉失效行号；§1 目录树补齐 `env.ts` /
+    `duration.ts` / `context/nudges.ts` / `context/resources.ts` / `tui/host.ts` / `tui/width.ts` /
+    `guard/hold.ts`；`notified` 标注为快照**顶层**字段；§18.11 交叉引用 §17 → §3；
     `initStatus` 不再写「仅 reportActivity」。
   - **反向缺口补写（代码有、文档没写）**：`async_kill` 的返回形状与 `isError` 判据（§16 REV-15）；
     `logs()` 的 8 MiB `MAX_LOG_WINDOW` 硬顶（§9）；`metadata.remindAfterMs` / `metadata.remindIntervalMs`
     与 reload 的退避基线来源（§18.8）；`resendUnnotified` 的 `notifyOnCompletion === false` 门（§2）。
+- `README.md` / `skills/async-tasks/SKILL.md`：把「匹配窗口是尾部 64K」改成**只对 `output_matches` 成立**
+  （子串条件扫全量）。这两处是模型**实际会读到**的措辞（`skills/` 经 `resources_discover` 注入），
+  所以不能只改契约。
 - `src/context/nudges.ts` 改了一条与实现不符的注释（原写“registration time 择一，宿主拿不到两个”，
   实际是两个钩子同时注册、靠 signature 去重）：**仅注释**，无逻辑变更。
 - `docs/PLAN-CONTEXT.md` 顶部加状态横幅：本文是 0.3.1 阶段计划快照，当前契约以 `docs/CONTRACT.md`
   （已按 0.4.0 实现校准）为准。
 
-## 未发布 — 代际交接（REV-24）
-
 ### Fixed
 
-- **扩展代际切换后 `async_run` 永久拒绝准入**：宿主对同名工具是「首次注册胜」，而二次 `init()`
-  会把前代 registry `suspend()`（REV-17）。两者叠加时，存活的工具闭包指向已退役的一代，`async_run`
-  持续报 `admission is closed`，只能重启会话恢复。现在工具在**调用期**解析活跃 registry。
-- **过时的只读快照**（同根因、更难发现）：`async_status` / `async_logs` 在退役代上不报错，
-  返回旧一代的内存快照——一个「看起来正常但已经过时」的世界。同样由 19.3 修复。
+- **watch 每个轮询 tick 整文件读取输出**：`readWatchOutput` 原本对 `.output` / `.stdout` / `.stderr`
+  各自 `readFileSync` 整份读入，大日志在 watch 期间被反复全量加载。改走 `logs()` 的有界尾部读
+  （`WATCH_READ_BYTES` = `MAX_LOG_WINDOW` = 8 MiB，**每流各一次**）。
+  （默认写盘 cap 是 20 MiB，见 `PI_ASYNC_MAX_OUTPUT_BYTES`，所以「多 GB」需要先调大该 cap。）
+- 行为变化（有意）：滚出尾部 8 MiB 的输出对**所有**条件不再可见。此时终态由命令退出码或 `timeoutMs`
+  决定（区分是否命中要看 `metadata.watchSuccess`，不看 `status`）。看更早的输出用通知 XML 或
+  `async_status` 的 `metadata.outputFile` 路径配 `bash`（如 `grep -n marker <file>`）；`async_logs` 救不了
+  ——工具层硬顶 50 KiB，且只有头部 / 尾部两档，中间段取不到。
+- 保留原有两条语义：数据目录外路径仍 throw（D-11）；合并输出文件缺失仍 throw（让 `blind_checks`
+  能计为基础设施失败）；`stdout` / `stderr` 缺席仍按空串处理。
+- **扩展代际切换后 `async_run` 永久拒绝准入**：宿主对同名工具是「首次注册胜」，而二次 `init()` 会把前代
+  registry `suspend()`（REV-17）。两者叠加时，存活的工具闭包指向已退役的一代，`async_run` 持续报
+  `admission is closed`，只能重启会话恢复。现在工具在**调用期**解析活跃 registry。
+- **过时的只读快照**（同根因、更难发现）：`async_status` / `async_logs` 在退役代上不报错，返回旧一代的
+  内存快照——一个「看起来正常但已经过时」的世界。同样由 REV-24 修复。
 - 经由旧闭包进来的调用现在会把 **dataDir / cwd 配到活代数**上，不再让新代带着空配置开工。
 - admission 的两条错误文案补上原因与出路（关闭 / 被 reload-resume 退役），不再只报 `closed`。
-
-### Added
-
-- `registerTools(pi, TaskRegistry | (() => TaskRegistry))`：传解析器时每次 `execute` 现取活代数；
-  传实例保持旧行为。加 `tests/g-generation-handoff.test.ts`（三个回归：解析器改道、跨代接管、无活代时报可操作错误）。
-
-## 未发布 — 报错可操作性
-
-主题：**报错要能直接指向修复动作**。起因是一次真实使用：`output_matches` 写 `(?i)fatal` 只收到
-`invalid regex`，`delayMs` 缺 `mode` 只收到「不合法」，两次都要靠猜才能改对。
-
-### Fixed
-
-- `output_matches` 的正则编译失败不再折叠成一句 `invalid regex`：现在回显原始正则、保留 V8 的
-  原因（`Invalid group` / `Unterminated character class`），并在内联标志（`(?i)` / `(?m)` / `(?s)` / `(?x)`）
-  时明确指出「编译固定带 `m`，JS 没有内联标志」+ 给出替代写法（字符类或 `stdout_contains`）。
-- `delayMs is only valid for delayed mode` 补上修复动作：`(pass mode: "delayed" to schedule it, or omit delayMs)`；
-  `delayMs is required for delayed mode` 补上单位示例。
-- `docs/CONTRACT.md` 删掉了 `\A` / `\z` 的错误建议——JS 把这两个当字面量 `A` / `z`，
-  **不报错但锚定静默失效**，比报错更难查；改为 `[\s\S]*` 或 `stdout_contains` 的指引。
-- `docs/CONTRACT.md` 的 `intervalMs` 注释从「默认 30_000」改为「必填无默认」（与 schema、
-  `validateWatchSpec` 的实际行为一致）。
-
-### Added
-
-- `watch` schema 补齐字段级 description：`intervalMs` / `timeoutMs` / `success_when` / `failure_when` /
-  `blind_checks` 以及各 condition 的 `value` / `equals` / `regex`。其中 `blind_checks` 此前是裸字段，
-  而它的语义（只计基础设施失败、默认 3、pending 不累计）恰恰是最容易误用的一项。
-- `SKILL.md` 增加一个可复制粘贴的完整 `watch` 示例（含 `type` 判别字段与各 payload），
-  并列出两种启动前即被拒的写法。
-- 回归测试：内联标志与未闭合字符类必须分别给出可操作的报错（`tests/b-watch-validate.test.ts`）。
-
-### Added — 0.4.0 运行期提醒与续期（REV-23，CONTRACT §18）
-
-主题：**提醒 ≠ 杀**。`taskTimeoutMs` 只有硬杀一档，杀掉正在跑的长构建比不杀更糟；而没有硬期限的
-background 任务跑飞了又没人管。提醒是注意力信号，杀是进程生命周期决策，两者分开。
-
-- **默认提醒**：`async_run` 新增 `remindAfterMs`（运行时长；`0` = 关闭）。background 且无 `watch`
-  的任务默认 **20 分钟**（`1_200_000` ms）后收到一条 `async-task-reminder`（`deliverAs: followUp` +
-  触发新 turn，只带 8 KiB tail 切片）。带 `watch` 默认不提醒（`watch.timeoutMs` 已是期限），
-  显式传 `remindAfterMs` 才开；`timeoutAt` 会先到时**不布防**。`notifyOnCompletion: false` 一并静默提醒。
-- **提醒绝不改变任务**：不调 `kill`、不改 `status`、不写 `failureKind`；按 **2 倍退避**（1× → 2× → 4×）
-  最多 3 次，用尽后不再布防、任务继续运行。抑制在**触发时**求值（已终态 / 输出已收割 /
-  `notifyOnCompletion: false` / registry 已 closed 或 suspended），跳过时不重布防。
-- **新工具 `async_extend`（工具面 5 → 6）**：`{ taskId, remindAfterMs?, taskTimeoutMs? }` 续期提醒和/或
-  硬期限，任一次续期重置计数与间隔，`0` 清除对应期限；两者都不传报错；终态任务返回 `alreadyTerminal`
-  而不是错误（对齐 `async_kill`）。带 `promptSnippet`，否则不进系统提示（REV-20）。
-- **reload 安全**：`TaskSnapshot` 新增 `remindAt`（绝对时刻）/ `remindCount`；`/reload` 按剩余预算重布防
-  并 `unref`（不会单独撑住宿主进程），已过期的 `remindAt` 立即触发一次并继续退避。一次性 `setTimeout`、
-  回调内重读 registry、`try/catch` 包住——不复活 D-12 的 `setInterval`。
-- `SKILL.md` 增加一条纪律：默认 20 分钟提醒，收到提醒要么 `async_extend` 续期要么 `async_kill` 停止；
-  提醒本身不杀进程。工具清单断言与 `CONTRACT §17` 的计数同步为 6 个。
+- **报错可操作性**（起因：`output_matches` 写 `(?i)fatal` 只收到 `invalid regex`，`delayMs` 缺 `mode`
+  只收到「不合法」，两次都要靠猜才能改对）：
+  - `output_matches` 的正则编译失败不再折叠成一句 `invalid regex`：回显原始正则、保留 V8 的原因
+    （`Invalid group` / `Unterminated character class`），并在内联标志（`(?i)` / `(?m)` / `(?s)` / `(?x)`）
+    时明确指出「编译固定带 `m`，JS 没有内联标志」+ 给出替代写法（字符类或 `stdout_contains`）。
+  - `delayMs is only valid for delayed mode` 补上修复动作：`(pass mode: "delayed" to schedule it, or omit delayMs)`；
+    `delayMs is required for delayed mode` 补上单位示例。
+  - `docs/CONTRACT.md` 删掉 `\A` / `\z` 的错误建议——JS 把这两个当字面量 `A` / `z`，**不报错但锚定静默失效**，
+    比报错更难查；改为 `[\s\S]*` 或 `stdout_contains` 的指引。
+  - `docs/CONTRACT.md` 的 `intervalMs` 注释从「默认 30_000」改为「必填无默认」（与 schema、
+    `validateWatchSpec` 的实际行为一致）。
+  - 回归测试：内联标志与未闭合字符类必须分别给出可操作的报错（`tests/b-watch-validate.test.ts`）。
 
 ## 0.3.1 — 2026-11-07（可发现性层）
 
