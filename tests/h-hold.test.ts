@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { init } from "../extensions/index.ts";
 import { registerHold } from "../src/guard/hold.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
@@ -612,4 +614,37 @@ test("a results entry never claims a status it could not read", async () => {
     );
     assert.ok(!String(keptDraft.content).includes("running"), "no fake terminal status");
   });
+});
+
+/**
+ * The poll sleep must keep the event loop alive: it is what the held boundary is currently awaiting.
+ *
+ * 0.4.0 shipped `timer.unref()` there and CI node 22 cancelled the entire file with "Promise
+ * resolution is still pending but the event loop has already resolved" — a process whose only
+ * pending handle was that timer simply drained. A child process is the only honest way to see it:
+ * in-memory the test runner itself keeps the loop alive.
+ */
+test("a hold still resolves in a process with no other live handles (no unref'd poll timer)", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const holdPath = join(here, "..", "src", "guard", "hold.ts");
+  const script = `
+    import { registerHold } from ${JSON.stringify(new URL("file://" + holdPath).href)};
+    let polls = 0;
+    const registry = {
+      list: () => {
+        polls++;
+        return polls < 2 ? [{ taskId: "A", name: "only", status: "running", metadata: {}, createdAt: 0 }] : [];
+      },
+    };
+    const handlers = new Map();
+    registerHold({ on: (event, handler) => { handlers.set(event, handler); return () => {}; } }, registry, { holdMs: 500, pollMs: 20 });
+    const result = await handlers.get("agent_before_settle")({ entries: [] }, { mode: "tui" });
+    process.stdout.write("HOLD_SETTLED:" + String(result?.continue));
+  `;
+  const output = execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "-e", script],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+  assert.match(output, /HOLD_SETTLED:true/);
 });

@@ -89,11 +89,18 @@ function resultsSummary(count: number, done: TaskSnapshot[]): string {
   return `${head} all finished: ${items}${missing}.${tail}`;
 }
 
-/** Resolve after `ms`; unref'd so a hold timer never keeps an otherwise-finished process alive. */
+/**
+ * Resolve after `ms`.
+ *
+ * The timer stays **ref'd** on purpose: this sleep is what the held boundary is currently awaiting,
+ * so it is the thing keeping the run (and the handler's continuation) alive. An `unref()` here let
+ * the event loop drain in a process with nothing else pending, and node:test then cancelled the
+ * whole suite with "Promise resolution is still pending but the event loop has already resolved"
+ * (CI node 22, 0.4.0). The footer refresh below is cosmetic and stays unref'd.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, Math.max(0, ms));
-    timer.unref?.();
+    setTimeout(resolve, Math.max(0, ms));
   });
 }
 
