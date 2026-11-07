@@ -37,7 +37,20 @@ Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that 
 
 `watch: { intervalMs, timeoutMs, success_when, failure_when, blind_checks }`
 
-- Polling interval is at least 1000 ms. The match window is the trailing **64K characters** of output, not bytes — early output scrolls out of it.
+A complete spec — every condition carries a `type` discriminator, and `intervalMs`/`timeoutMs` are required:
+
+```json
+{ "intervalMs": 1000, "timeoutMs": 60000,
+  "success_when": [{ "type": "stdout_contains", "value": "READY" }],
+  "failure_when": [{ "type": "exit_code", "equals": 1 },
+                   { "type": "output_matches", "regex": "(fatal|panic)" }] }
+```
+
+Payload per `type`: `stdout_contains`/`stderr_contains` take `value` (a literal substring), `json_path_exists` takes `path`, `output_matches` takes `regex`, `exit_code` takes `equals`.
+
+Two shapes that are rejected before any task is created: `output_matches` regexes with inline flags (`(?i)READY` — JavaScript has no inline flags here, the pattern is compiled with `m` only; write `[Rr][Ee][Aa][Dd][Yy]` or use `stdout_contains`), and `delayMs` without `mode: "delayed"`.
+
+- Polling interval is at least 1000 ms, and both `intervalMs` and `timeoutMs` are required. The match window is the trailing **64K characters** of output, not bytes — early output scrolls out of it.
 - Conditions inside a group are OR-ed: the first match wins. There is no AND mode; when you need a conjunction, use one condition with a richer `stdout_contains` value.
 - A `success_when` match does **not** kill the process: the task is marked `completed`, and process lifetime stays with `taskTimeoutMs` / `async_kill`.
 - `blind_checks` counts only infrastructure failures (unreadable output, malformed check) and defaults to 3. "Not yet decidable" is a pending state and does not accumulate.

@@ -19,12 +19,23 @@ export const MAX_OUTPUT_MATCH_BYTES = 64 * 1024;
  */
 const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*]\)\s*[+*]/;
 
+/**
+ * Global inline flags — `(?i)` / `(?m)` / `(?s)` / `(?x)`. JavaScript has no such syntax for a
+ * whole pattern (only ES2025 modifier groups, `(?i:...)`), so these always throw `Invalid group`
+ * while the fix is mechanical: a character class. Matched here so the error can name the fix
+ * instead of echoing V8's opaque "Invalid group". See the `(?i)` incident in #48 follow-up.
+ */
+const INLINE_FLAGS = /\(\?[imsx]+\)/;
+
 function rejectDangerousRegex(regex: string): string | undefined {
   if (NESTED_QUANTIFIER.test(regex)) {
     return "regex has nested quantifiers (ReDoS risk); simplify or use stdout_contains";
   }
   return undefined;
 }
+
+/** Compile-explanation shared by both invalid-regex errors: flags are fixed, never caller-chosen. */
+const REGEX_COMPILE_NOTE = 'compiled as new RegExp(regex, "m")';
 
 function matchSubject(output: string): string {
   if (output.length <= MAX_OUTPUT_MATCH_BYTES) return output;
@@ -79,8 +90,16 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
           }
           try {
             compiledRegexes.set(condition, new RegExp(condition.regex, "m"));
-          } catch {
-            return invalid(`${location}: invalid regex`);
+          } catch (error) {
+            // Never collapse the reason: V8 distinguishes "Unterminated character class" from
+            // "Invalid group" (inline flags), and the caller can only fix what it is told.
+            const shown = JSON.stringify(condition.regex);
+            const reason = error instanceof Error ? (error.message.split(": ").pop() ?? error.message) : String(error);
+            return invalid(
+              INLINE_FLAGS.test(condition.regex)
+                ? `${location}: invalid regex ${shown}: ${reason}; ${REGEX_COMPILE_NOTE} and JavaScript takes no inline flags — drop the flag and use a character class (e.g. [Ff][Aa][Tt][Aa][Ll]) or stdout_contains`
+                : `${location}: invalid regex ${shown}: ${reason} (${REGEX_COMPILE_NOTE})`,
+            );
           }
           break;
         default:

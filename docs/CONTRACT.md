@@ -118,7 +118,7 @@ shutdown 先 drain 再退出。
 
 ```ts
 interface WatchSpec {
-  intervalMs: number;                 // 默认 30_000，min 1_000
+  intervalMs: number;                 // 必填无默认，min 1_000（schema 与 validateWatchSpec 均强校验）
   timeoutMs: number;                  // watch 必填：watch 期限（schema enforce）
   success_when: Condition[];          // 任一命中 → 任务完成语义（不干预进程，见下）
   failure_when: Condition[];          // 任一命中 → kill(kind=watch_failure)
@@ -130,7 +130,7 @@ type Condition =
   | { type: "stdout_contains"; value: string }
   | { type: "stderr_contains"; value: string }
   | { type: "json_path_exists"; path: string }        // 必须以 $ 开头，如 $.a.b[0]；启动前校验；tool schema 含 pattern/description（#12）
-  | { type: "output_matches"; regex: string }         // 合并输出流匹配（设备码等）；编译带 m（^/$ 按行）
+  | { type: "output_matches"; regex: string }         // 合并输出流匹配（设备码等）；编译带 m（^/$ 按行）；不支持内联标志 (?i)
 ```
 
 - `success_when` 命中 → **不杀进程**：任务标 completed，通知带命中详情；进程按 taskTimeoutMs/kill 自然管理。
@@ -154,7 +154,11 @@ type Condition =
     （`blind_exhausted` / `watch_timeout`）。三条都杀进程，用 status+failureKind 区分语义。
 - **REV-10 裁决（#48）**：`output_matches` 以 `new RegExp(regex, "m")` 编译（validate 与求值同）。
   契约原先要求锚定（`^READY$`）防止过早匹配，但无 `m` 时 `^`/`$` 只锚整段输出，多行流上锚定
-  永不相交。加 `m` 使锚定与意图一致；整段匹配请用不含 `^`/`$` 的模式或显式 `\A`/`\z` 等价写法。
+  永不相交。加 `m` 使锚定与意图一致；整段匹配请用不含 `^`/`$` 的模式。**JS 没有 `\A`/`\z`**（会被当作字面
+  量 `A`/`z`，静默失效——比报错更难查）；跨行整段匹配用 `[\s\S]*` 或改用 `stdout_contains`。
+  同理，`regex` 不接受内联标志：`(?i)`/`(?m)`/`(?s)` 会抛 `Invalid group`（编译只带固定的 `m`，
+  没有调用方可选的 flags）；大小写无关请用字符类 `[Rr][Ee][Aa][Dd][Yy]`。启动前校验会回显原始
+  正则与 V8 原因，映射回具体的修复动作。
 
 ## 5. async_wait（唤醒原语，冻结）
 
@@ -585,3 +589,107 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   `jq -e`、`taskTimeoutMs`、`blind_checks`）与发布清单。
 - **回退开关**：无（skill 缺失自动降级为「没有 skill」，工具面不受影响）。
 
+
+## 18. 0.4.0 提醒与续期（REV-23，冻结）
+
+起因：`taskTimeoutMs` 只有硬杀一档，杀掉正在跑的长构建比不杀更糟；而没有硬期限的 background
+任务跑飞了又没人管，agent 会卡在等待或忘记自己还挂着活。裁决：**提醒 ≠ 杀**。提醒是注意力信号，
+杀是进程生命周期决策，两者分离。
+
+### 18.1 旋钮
+
+```ts
+// async_run 新增可选字段
+remindAfterMs?: number   // 首次提醒的运行时长；0 = 关闭；缺省见 18.2
+```
+
+`taskTimeoutMs` 语义**不动**：仍是 agent 主动可选配置的硬杀，**不设默认**。
+
+### 18.2 默认策略（REV-23 裁决）
+
+有效间隔 `effectiveRemindMs` 在任务**开始运行时**求值，按顺序：
+
+1. 显式 `remindAfterMs` 优先（`0` = 关闭）。
+2. 否则任务带 `watch` → 关闭（watch 的 `timeoutMs` 已是期限，避免同一个超时出现两种终态语义）。
+3. 否则 → **20 分钟**（`1_200_000` ms）。
+4. 若 `task.timeoutAt` 存在且 `now + effectiveRemindMs >= task.timeoutAt` → **不布防**
+   （硬期限必然先到，不做注定迟到的提醒）。
+
+`notifyOnCompletion: false` → 提醒一并静默（单一「打扰面」开关）。
+
+### 18.3 提醒消息形状
+
+- `customType: "async-task-reminder"`，`deliverAs: "followUp"`，`triggerTurn: true`（与完成通知同通道）。
+- XML 字段：`task-id` / `name` / `status` / `elapsed-ms` / `remind-count` / `output-file` /
+  `summary`（tail）/ `guidance`。
+- 只带 tail 切片（与完成通知同一日志读取路径，8 KiB / tail），**绝不带全量输出**：提醒会烧 token
+  并触发新 turn。
+- `guidance` 固定语义：还在跑、没有硬期限、不会被自动杀；`async_extend` 续期或 `async_kill` 停止。
+
+### 18.4 重复策略
+
+- 首次 `now + effectiveRemindMs`；之后每次触发按 **2 倍退避**重布防（20m → 40m → 80m）。
+- 最多 **3 次**（对齐 settle-guard 的 `maxReminders`）。用尽后不再布防、不杀、不写终态，任务继续运行。
+- 任意一次 `async_extend` 重置计数与间隔。
+
+### 18.5 绝不杀（REV-23 裁决）
+
+提醒路径**不得**调用 `kill`、不得改 `status`、不得写 `failureKind`。进程生命周期只由
+`taskTimeoutMs` / `async_kill` / watch 失败路径决定。提醒只履行告知义务。
+
+### 18.6 抑制条件
+
+触发时逐条检查，任一成立则跳过**且不重布防**：
+
+1. 任务已终态；
+2. `outputConsumed === true`（agent 已收割，不必再吵）；
+3. `metadata.notifyOnCompletion === false`；
+4. registry 已 closed / suspended。
+
+### 18.7 `async_extend` 工具
+
+```ts
+async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
+```
+
+- `taskId` 接受 taskId 或 name（REV-15 同款）；未知 → 抛 `Unknown task or name: ...`。
+- 两者都不传 → 抛 `async_extend needs remindAfterMs or taskTimeoutMs`。
+- 终态任务 → 返回 `{ taskId, name, status, alreadyTerminal: true, elapsedMs }`，**不报错**
+  （对齐 `async_kill`）。
+- `remindAfterMs`：置 `task.remindAt = now + remindAfterMs`，`remindCount = 0` 并布防；
+  `0` → 清除 `remindAt` 并 disarm。
+- `taskTimeoutMs`：置 `task.timeoutAt = now + taskTimeoutMs` 并重布防硬杀；`0` → 清 `timeoutAt` 并 disarm。
+- 返回 `{ taskId, name, status, elapsedMs, remindAt?, remindCount, timeoutAt? }`。
+- **必须带 `promptSnippet`**（REV-20：没有 snippet 的工具不进系统提示）。
+
+### 18.8 持久化与 reload
+
+- `TaskSnapshot` 新增 `remindAt?: number`（绝对时刻）与 `remindCount?: number`。
+- reload 按剩余时间重布防（对齐 `timeoutAt` 的 D-03 做法，`registry.ts:746`）。`remindAt` 已过期 →
+  立即触发一次并继续退避。
+- 与 `timeoutAt` 同样 `unref`：从磁盘恢复的提醒定时器不得单独撑住宿主进程。
+
+### 18.9 与 settle-guard 的边界
+
+- reminder 只在任务**运行中**投递；settle-guard 只在 turn **settle 边界**投递。两者内容不同
+  （reminder 带 elapsed + extend 动作；settle advisory 只说有任务没收），**不互删、不去重**。
+- 提醒**不计入** settle-guard 的 `maxReminders`。
+- 禁止为提醒复活 `setInterval`（D-12 事故：timer 里持有 stale ctx 抛错 → `uncaughtException` 崩溃）。
+  只用一次性 `setTimeout`，回调内 `registry.get(taskId)` 重读状态，`try/catch` 包住，失败仅 `console.error`。
+
+### 18.10 与 watch 的边界
+
+带 `watch` 的任务**不默认**开提醒；显式传 `remindAfterMs` 才开。
+
+### 18.11 验收清单
+
+- 默认布防：background + 无 watch → `remindAt ≈ start + 1_200_000`。
+- `remindAfterMs: 0` → 无 `remindAt`、无定时器。
+- 显式值覆盖默认；带 watch 时默认不布防、显式仍可开。
+- 触发 → `sendMessage` 收到 `customType: "async-task-reminder"`，含 `elapsed-ms` 与 `remind-count`。
+- 退避：第 2 次为 2×、第 3 次为 4×，之后停。
+- **提醒不改变 `status`、不杀进程**。
+- `outputConsumed` / `notifyOnCompletion:false` / 终态 → 跳过且不重布防。
+- `async_extend` 移动 `remindAt`、重置计数；终态返回 `alreadyTerminal`；两参数都不传报错。
+- reload 后按剩余预算重布防。
+- 工具清单断言与 `docs/CONTRACT.md` §17「5 个工具」的表述同步更新为 6 个。

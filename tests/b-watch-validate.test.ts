@@ -40,6 +40,23 @@ test("rejects invalid regular expressions before scheduling with grouped conditi
   if (!failureResult.ok) assert.match(failureResult.error, /failure_when\[1\].*regex/);
 });
 
+test("invalid regex errors name the fix instead of collapsing into one opaque sentence", () => {
+  // `(?i)` is the natural guess for case-insensitivity and JavaScript rejects it outright.
+  // The old message was a bare `invalid regex`, which told the caller nothing actionable.
+  const inlineFlags = validateWatchSpec(validSpec({ success_when: [{ type: "output_matches", regex: "(?i)ready" }] }));
+  assert.equal(inlineFlags.ok, false);
+  if (!inlineFlags.ok) {
+    assert.match(inlineFlags.error, /inline flags/, "must say inline flags are unsupported");
+    assert.match(inlineFlags.error, /\(\?i\)ready/, "must echo the offending regex");
+    assert.match(inlineFlags.error, /character class/, "must name the replacement");
+  }
+
+  // The V8 reason is the difference between "typo in my pattern" and "unsupported feature".
+  const unterminated = validateWatchSpec(validSpec({ success_when: [{ type: "output_matches", regex: "[" }] }));
+  assert.equal(unterminated.ok, false);
+  if (!unterminated.ok) assert.match(unterminated.error, /Unterminated character class/, "must keep V8's reason");
+});
+
 test("enforces interval and watch timeout boundaries", () => {
   for (const intervalMs of [0, 999, 1_000.5, Number.POSITIVE_INFINITY]) {
     assert.equal(validateWatchSpec(validSpec({ intervalMs })).ok, false);

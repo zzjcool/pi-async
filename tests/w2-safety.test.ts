@@ -302,7 +302,7 @@ test("async_run rejects timeoutMs on background and delayMs on sync (#42)", asyn
   try {
     const run = tools.get("async_run")!;
     await assert.rejects(run.execute("c", { command: "true", mode: "background", timeoutMs: 1000 }), /timeoutMs is only valid/);
-    await assert.rejects(run.execute("c", { command: "true", mode: "sync", timeoutMs: 1000, delayMs: 5 }), /delayMs is only valid/);
+    await assert.rejects(run.execute("c", { command: "true", mode: "sync", timeoutMs: 1000, delayMs: 5 }), /delayMs is only valid for delayed mode \(pass mode: "delayed"/);
   } finally {
     await registry.shutdown();
     rmSync(dir, { recursive: true, force: true });
