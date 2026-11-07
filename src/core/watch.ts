@@ -9,8 +9,13 @@ export interface WatchOutput {
   stderr: string;
 }
 
-/** Cap regex subject size so catastrophic patterns cannot grow without bound (#24). */
-export const MAX_OUTPUT_MATCH_BYTES = 64 * 1024;
+/**
+ * Cap the regex subject so catastrophic patterns cannot grow without bound (#24).
+ *
+ * The value is a count of **UTF-16 code units** (`String.length` / `String.prototype.slice`), not
+ * bytes — the old name `MAX_OUTPUT_MATCH_BYTES` claimed otherwise and was misleading.
+ */
+export const MAX_MATCH_CHARS = 64 * 1024;
 
 /**
  * Classic exponential-backtracking shape: a group that itself ends with a
@@ -38,8 +43,8 @@ function rejectDangerousRegex(regex: string): string | undefined {
 const REGEX_COMPILE_NOTE = 'compiled as new RegExp(regex, "m")';
 
 function matchSubject(output: string): string {
-  if (output.length <= MAX_OUTPUT_MATCH_BYTES) return output;
-  return output.slice(-MAX_OUTPUT_MATCH_BYTES);
+  if (output.length <= MAX_MATCH_CHARS) return output;
+  return output.slice(-MAX_MATCH_CHARS);
 }
 
 export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; error: string } {

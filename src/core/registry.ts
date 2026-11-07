@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { killTree, spawnDetached, streamPaths } from "./spawn.ts";
 import { stripLogControls, truncateUtf8Bytes } from "./output.ts";
@@ -45,6 +45,16 @@ const REMIND_BACKOFF = 2;
 const DEFAULT_LOG_BYTES = 50 * 1024;
 /** Defensive ceiling for a single `logs` read: an accidental huge window is clamped, not honoured. */
 const MAX_LOG_WINDOW = 8 * 1024 * 1024;
+/**
+ * How much trailing output one watch tick reads (REV-25).
+ *
+ * A watch decides on the tail, so the read is bounded by the same defensive ceiling as any other
+ * output read rather than loading the whole file: a marker that scrolled beyond this window is
+ * invisible to the check, and a multi-GB log costs one bounded read per interval instead of a full
+ * load. `output_matches` is then narrowed again to `MAX_MATCH_CHARS` (64K UTF-16 units) for ReDoS
+ * containment — two different bounds for two different reasons.
+ */
+const WATCH_READ_BYTES = MAX_LOG_WINDOW;
 /** Artifacts owned by one task; migrated wholesale between data dirs. */
 const ARTIFACT_SUFFIXES = [".json", ".output", ".stdout", ".stderr"] as const;
 
@@ -567,13 +577,20 @@ export class TaskRegistry {
   private readWatchOutput(taskId: string): WatchOutput {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`Unknown task id: ${taskId}`);
-    const outputFile = this.assertInsideDataDir(String(task.metadata.outputFile ?? this.live.get(taskId)?.outputFile ?? join(this.config.dataDir, `${taskId}.output`)));
-    // Missing primary output must throw so WatchLoop blind_checks can fire (#37/#68 + CONTRACT).
-    // stripLogControls: ANSI + bare C0 for model/watch paths (#18); streams stay distinct (#4).
-    const output = stripLogControls(readFileSync(outputFile, "utf8"));
-    const { stdout, stderr } = streamPaths(outputFile);
-    const readSide = (file: string): string => existsSync(file) ? stripLogControls(readFileSync(file, "utf8")) : "";
-    return { output, stdout: readSide(stdout), stderr: readSide(stderr) };
+    // Bounded tail reads: the watch only ever decides on recent output, and a multi-GB log must
+    // not be loaded once per polling tick. `logs()` opens the file, reads the requested window and
+    // strips control characters — the same path every other output read uses.
+    //
+    // Two behaviours have to be preserved exactly: a path outside the data dir must throw (D-11),
+    // and a *missing merged file* must throw so `blind_checks` can count it as an infrastructure
+    // failure (#37/#68). `logs()` reports a missing file instead of throwing, so that case is
+    // turned back into a throw here. The side streams keep the lenient empty-string behaviour.
+    const merged = this.logs(taskId, { maxBytes: WATCH_READ_BYTES, tail: true });
+    if (merged.missing) throw new Error(`Task output file is missing: ${merged.fullPath}`);
+    const stdout = this.logs(taskId, { maxBytes: WATCH_READ_BYTES, tail: true, stream: "stdout" });
+    const stderr = this.logs(taskId, { maxBytes: WATCH_READ_BYTES, tail: true, stream: "stderr" });
+    // Streams stay distinct (#4); merged is the concatenation the watch has always evaluated.
+    return { output: merged.text, stdout: stdout.text, stderr: stderr.text };
   }
 
   private syncResult(task: TaskSnapshot, promoted: boolean): SyncResult {
