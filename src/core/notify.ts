@@ -78,6 +78,19 @@ export interface ReminderPayload {
 export const REMINDER_GUIDANCE =
   "Still running with no hard deadline, so it will not be killed automatically. Renew it with async_extend (remindAfterMs or taskTimeoutMs), or stop it with async_kill.";
 
+/**
+ * Guidance for a task that *does* carry a hard deadline (CONTRACT §18.12).
+ *
+ * The plain sentence above would be a lie here — the process is killed at `taskTimeoutMs` — and a
+ * reminder that misstates the deadline is worse than no reminder: it invites the agent to ignore a
+ * real kill. Honesty wins over a stable string.
+ */
+export function reminderGuidance(timeoutAt?: number, now = Date.now()): string {
+  if (timeoutAt === undefined) return REMINDER_GUIDANCE;
+  const remainingSec = Math.max(0, Math.round((timeoutAt - now) / 1000));
+  return `Still running. A hard deadline (taskTimeoutMs) kills it in ${remainingSec}s. Remind me sooner with async_extend (remindAfterMs), move the deadline (taskTimeoutMs), or stop it with async_kill.`;
+}
+
 export function buildReminderXml(p: ReminderPayload): string {
   const fields: Array<[string, unknown]> = [
     ["task-id", p.taskId], ["name", p.name], ["status", p.status],
@@ -139,7 +152,7 @@ export async function sendReminder(
     outputFile: String(snapshot.metadata.outputFile ?? ""),
     ...(outputTail ? { summary: outputTail } : {}),
     ...(truncated || snapshot.metadata.capped === true ? { summaryTruncated: true } : {}),
-    guidance: REMINDER_GUIDANCE,
+    guidance: reminderGuidance(snapshot.timeoutAt),
   };
   // SAFETY: same runtime feature-detection as the completion path (sendMessage is optional/void in older hosts).
   const target = pi as unknown as { sendMessage?: (message: unknown, options: unknown) => unknown };

@@ -32,7 +32,7 @@ pi-async/
 │   │   ├── notify.ts       # 完成通知/唤醒、抑制闩（每任务一条，不合并）
 │   │   └── bus.ts          # 预留 eventbus + OSC activity 上报
 │   ├── tools/
-│   │   └── index.ts        # 5 个工具的注册与 schema
+│   │   └── index.ts        # 6 个工具的注册与 schema
 │   ├── tui/
 │   │   ├── rail.ts         # 任务轨道图 widget（≤4 行，含汇总行）
 │   │   ├── panel.ts        # 百分比尺寸面板（列表+详情）
@@ -109,7 +109,7 @@ shutdown 先 drain 再退出。
 **工具集（5 个）**：`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill`。
 命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。
 
-**可发现性面（REV-20/21/22）**：5 个工具各带一条 `promptSnippet`（逐字见 §17），`async_run` 另带 3 条
+**可发现性面（REV-20/21/22）**：6 个工具各带一条 `promptSnippet`（逐字见 §17），`async_run` 另带 3 条
 `promptGuidelines`；check 纪律不再拼进 description，移入随包分发的 skill（§17 REV-22）。
 运行时另有两条情境注入：`bash` 长命令返回后追加一行 `tool_result` 建议，以及每次请求前（有活跃任务时）
 一行 `<async-state>`。两者都 best-effort，`PI_ASYNC_NUDGE=0` 关闭。
@@ -694,3 +694,17 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
 - `async_extend` 移动 `remindAt`、重置计数；终态返回 `alreadyTerminal`；两参数都不传报错。
 - reload 后按剩余预算重布防。
 - 工具清单断言与 `docs/CONTRACT.md` §17「5 个工具」的表述同步更新为 6 个。
+
+### 18.12 实现补充（REV-23a，冻结）
+
+实现期间补齐三处契约留白：
+
+1. **guidance 必须随硬期限变化**。§18.3 的固定 `guidance` 只在任务**没有** `taskTimeoutMs` 时成立；
+   有硬期限时声称「不会被自动杀」是假话，会诱导 agent 忽略真实的 kill。故拆成两版：
+   无硬期限 → 原文（保持 `REMINDER_GUIDANCE` 逐字不变）；有硬期限 → 带剩余秒数并点名 `taskTimeoutMs`。
+   **状态面不说谎优先于文案稳定。**
+2. **`async_extend` 的「重置」只在传了 `remindAfterMs` 时发生**（把 §18.4「任意一次 extend 重置计数与
+   间隔」精确化）。只传 `taskTimeoutMs` 属于延期，不重置提醒计数——否则「我只想推迟硬期限」会顺带
+   把提醒预算洗白。
+3. **`summary-truncated` 是诚实标记**：提醒的 tail 切片被截断、或输出总量已 `capped` 时，带
+   `<summary-truncated>true</summary-truncated>`，语义与完成通知一致；提醒同样不得暗示「你看到了全部」。

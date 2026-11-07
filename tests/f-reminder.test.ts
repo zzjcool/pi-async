@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
-import { buildReminderXml, REMINDER_GUIDANCE, sendReminder } from "../src/core/notify.ts";
+import { buildReminderXml, REMINDER_GUIDANCE, reminderGuidance, sendReminder } from "../src/core/notify.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { killTree, spawnDetached } from "../src/core/spawn.ts";
 import type { TaskSnapshot } from "../src/core/task.ts";
@@ -420,5 +420,42 @@ test("§18.3 end-to-end through init(): the extension delivers the reminder via 
   } finally {
     await hooks.get("session_shutdown")?.();
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("§18.12 guidance tells the truth about a hard deadline", () => {
+  // Without a deadline the frozen sentence holds: nothing kills the process.
+  assert.match(REMINDER_GUIDANCE, /no hard deadline/);
+  assert.doesNotMatch(REMINDER_GUIDANCE, /kills it in/, "the no-deadline variant must not claim a kill");
+
+  // With a deadline the same sentence would be a lie, so the variant names the remaining time.
+  const soon = reminderGuidance(Date.now() + 45_000);
+  assert.match(soon, /kills it in 4[45]s/, "must state the remaining budget");
+  assert.match(soon, /taskTimeoutMs/, "must name the knob that kills it");
+  assert.doesNotMatch(soon, /no hard deadline/, "must not claim there is no deadline");
+  assert.match(reminderGuidance(), /no hard deadline/, "absent deadline falls back to the frozen sentence");
+});
+
+test("§18.12 a delayed-only renewal does not launder the reminder budget", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-async-extend-budget-"));
+  const registry = new TaskRegistry({ dataDir: dir });
+  try {
+    const receipt = registry.submit({
+      command: "sleep 30", mode: "background", remindAfterMs: 60_000,
+    } as never);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const afterRemind = registry.extend(receipt.taskId, { remindAfterMs: 60_000 });
+    const count = afterRemind.remindCount ?? 0;
+    assert.equal(count, 0, "an explicit remindAfterMs resets the count");
+
+    // Only moving the hard deadline is a postponement: the reminder budget must survive it.
+    const task = registry.get(receipt.taskId)!;
+    task.remindCount = 2;
+    const afterTimeout = registry.extend(receipt.taskId, { taskTimeoutMs: 120_000 });
+    assert.equal(afterTimeout.remindCount, 2, "taskTimeoutMs alone must not reset the reminder count");
+    assert.ok(afterTimeout.timeoutAt, "the new hard deadline is reported back");
+  } finally {
+    await registry.shutdown();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
