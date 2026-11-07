@@ -515,17 +515,18 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 基线 `main @ 5d77350`（0.3.0）。计划文档：`docs/PLAN-CONTEXT.md`。本节取代 0.3.0 的 D-17
 （「只有 async_run 带 snippet」）与 D5 的「仅 failed 带 guidance」。
 
-### REV-20（5 个工具全部进系统提示）
+### REV-20（6 个工具全部进系统提示；0.4.0 增补 `async_extend`，见 §18）
 
 - **原因**：宿主只把带 `promptSnippet` 的工具列进系统提示的 Available tools 段（pi 1.5.0
   `dist/core/system-prompt.js:84-85`）。0.3.0 只给 `async_run` 挂了 snippet，`async_wait` /
   `async_logs` / `async_status` / `async_kill` 在模型主视觉区缺席，且该不对称被测试冻结。
-- **影响面**：5 个工具各带一条 snippet（逐字）：
+- **影响面**：6 个工具各带一条 snippet（逐字）：
   - `async_run`：`Run a long or gating shell command detached (build/test over a minute, server, watcher); returns a taskId, not output.`
   - `async_wait`：`Block until async tasks finish or the budget expires; results land in context. Never kills.`
   - `async_logs`：`Read the bounded, ANSI-stripped output of an async task, including while it is still running.`
   - `async_status`：`List active async tasks with elapsed time; includeHistory for recent finished ones.`
   - `async_kill`：`Stop an async task and its whole process group.`
+  - `async_extend`：`Renew a running task: move its reminder and/or hard-timeout deadline. Never kills; use async_kill to stop.`
 - `async_run.description` 收缩为两句：
   `Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.`
   check 纪律从 description 移除（见 REV-22）；模式/超时语义下沉到字段级 description。

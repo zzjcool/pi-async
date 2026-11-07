@@ -54,6 +54,8 @@ export interface RunOptions {
   taskTimeoutMs?: number;
   notifyOnCompletion?: boolean;
   triggerOnCompletion?: boolean;
+  /** 0.4.0 (REV-23): running-time ms before the first reminder; 0 disables; omitted → CONTRACT §18.2 default. */
+  remindAfterMs?: number;
   env?: Record<string, string>;
   watch?: WatchSpec;
   /** 0.3.0: directory the task runs in; defaults to the registry/session cwd, then process.cwd(). */
@@ -110,6 +112,10 @@ export interface TaskSnapshot {
   watchDeadline?: number;
   /** Number of completion-notification attempts so far (honesty accounting, no retries). */
   notifyAttempts?: number;
+  /** Absolute time of the next runtime reminder (REV-23 / CONTRACT §18.8); absent = no reminder pending. */
+  remindAt?: number;
+  /** Reminders delivered so far; capped at 3, reset by `async_extend` (REV-23 / §18.4). */
+  remindCount?: number;
   /** Process liveness seen when the snapshot was produced (false once finalized). */
   processAlive?: boolean;
 }

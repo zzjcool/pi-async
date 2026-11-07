@@ -26,12 +26,18 @@ Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that 
 - `async_logs` reads output while the task is still running (bounded to 50 KiB by default, ANSI stripped).
 - `async_status` lists active tasks; `includeHistory: true` shows recent finished ones (newest first).
 - `async_kill` terminates the task and its whole process group.
+- `async_extend` moves a running task's next reminder and/or its hard-timeout deadline (`0` clears either). It never kills.
 
-## Timeouts are three different knobs
+## Reminders are not kills
+
+A background task with no `watch` gets a runtime reminder after **20 minutes** by default (`remindAfterMs` overrides it, `0` disables it); reminders back off 2× and stop after three. When one arrives the task is still running and **will not be killed automatically** — either renew it with `async_extend` (moving `remindAfterMs` and/or `taskTimeoutMs`) or stop it with `async_kill`. Ignoring a reminder only means the task keeps running unobserved.
+
+## Timeouts are four different knobs
 
 - `timeoutMs` (sync only): how long *you* wait before the task is promoted to background. The task keeps running.
 - `onTimeout: "promote"` (default) returns while the task continues; `onTimeout: "abort"` stops waiting only — the task keeps running and still notifies. Neither one kills the process.
 - `taskTimeoutMs` (any mode): kills the task after that many milliseconds. Use it for a hard deadline, not as a way to avoid blocking.
+- `remindAfterMs` (any mode): when to be reminded that the task is still running (default 20 minutes for a background task without `watch`; `0` disables). A reminder never kills and never changes the task's status.
 
 ## Watch conditions
 

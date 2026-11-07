@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { clearTaskActivity, raiseTaskActivity, reportActivity } from "../src/core/bus.ts";
-import { sendCompletionNotification } from "../src/core/notify.ts";
+import { sendCompletionNotification, sendReminder } from "../src/core/notify.ts";
 import { registerNudges } from "../src/context/nudges.ts";
 import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
@@ -258,6 +258,18 @@ export async function init(pi: PiCtx): Promise<void> {
       if (isTerminal(snapshot.status)) clearTaskActivity(pi, snapshot.taskId);
       else raiseTaskActivity(pi, snapshot.taskId);
       if (tui) initStatus(pi, registry);
+    },
+    // REV-23 (§18.3): the reminder is delivered on the completion channel (followUp + a turn),
+    // but it is not a completion — no claim, no `notified` latch, and the registry has already
+    // applied §18.2/§18.4/§18.6 before calling this hook. The registry owns the policy; this
+    // owns the delivery, exactly like `onFinalize` above.
+    onReminder: (snapshot) => {
+      if (tui) initStatus(pi, registry);
+      void sendReminder(pi, registry, snapshot)
+        .then((outcome) => {
+          if (outcome === "failed") console.error(`pi-async: reminder delivery failed for ${snapshot.taskId}`);
+        })
+        .catch((error: unknown) => console.error(`pi-async: reminder delivery failed for ${snapshot.taskId}`, error));
     },
   });
 

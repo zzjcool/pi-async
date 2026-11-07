@@ -14,7 +14,8 @@ test("tool schemas enforce sync/wait timeout requirements and output byte budget
   const registry = new TaskRegistry({ dataDir: dir, maxTasks: 1 });
   try {
     registerTools(pi as never, registry);
-    assert.equal(tools.size, 5);
+    // 0.4.0 (REV-23): the surface grew to six tools — async_extend renews reminder/timeout deadlines.
+    assert.equal(tools.size, 6);
     assert.ok(tools.get("async_wait")?.parameters.required?.includes("timeoutMs"));
     await assert.rejects(tools.get("async_run")!.execute("call", { command: "true", mode: "sync" }), /timeoutMs is required/);
     // 0.3.0: onTimeout is a sync-only knob; non-sync calls must be rejected, not silently ignored.

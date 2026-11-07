@@ -1,8 +1,19 @@
 # 提案：软超时提醒 + 续期（reminder / renewal）
 
-状态：**待裁决**（未实现，未改契约）
+状态：**已裁决并实现**（见 `docs/CONTRACT.md` §18 REV-23，实现落在 0.4.0）
 起因：真实使用反馈——任务跑久了没人管，agent 卡在等待或忘了还挂着活；现有 `taskTimeoutMs`
 只有硬杀一档，杀掉一个正在跑的长构建比不杀更糟。
+
+## 0. 裁决结果（冻结于 CONTRACT §18）
+
+| 决策点 | 裁决 |
+|---|---|
+| 默认策略 | background 且**无 `watch`** 的任务默认 **20 分钟**（`1_200_000` ms）提醒一次；显式 `remindAfterMs` 优先（`0` 关闭）；带 `watch` 默认不提醒；硬期限（`timeoutAt`）会先到时**不布防** |
+| 提醒本身 | **绝不杀**：提醒路径不调 `kill`、不改 `status`、不写 `failureKind`；按 2 倍退避，最多 3 次，用尽后静默、任务继续运行 |
+| 续期入口 | **新工具 `async_extend`**（工具面从 5 个变 6 个）：`{ taskId, remindAfterMs?, taskTimeoutMs? }`，任一次续期重置计数与间隔 |
+
+补充裁决：`notifyOnCompletion: false` 一并静默提醒（单一「打扰面」开关）；`taskTimeoutMs` 语义不变，
+仍是 agent 主动可选配置的硬杀、**不设默认**。
 
 ## 1. 要解决的问题
 
@@ -69,7 +80,10 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
 正文只带一句动作指引：`Call async_extend to keep waiting, or async_kill to stop it.`
 **只带 tail，不带全量输出**（提醒会烧 token 并触发新 turn）。
 
-## 4. 待裁决的决策点
+## 4. 决策点（已裁决，以上表与 CONTRACT §18 为准）
+
+> 下面保留提案原文，便于对照裁决差异（例如默认间隔从建议的 10 分钟定为 20 分钟；
+> 「未领取提醒堆积」由「同一任务只有一个一次性 timer + 计数上限」解决，不引入待领取队列）。
 
 1. **默认是否开启**：建议「background 任务、无 `taskTimeoutMs`、无 `watch`」时默认 10 分钟提醒一次。
    理由：这正是「跑飞了没人管」的唯一形态；有 watch 或硬期限的任务已有兜底。

@@ -63,7 +63,7 @@ const DEFAULT_STATUS_LIMIT = 50;
 /**
  * One-line snippets shown in the default system prompt's "Available tools" section (D-C1).
  *
- * The host only lists tools that carry a `promptSnippet`, so all five must have one — each is
+ * The host only lists tools that carry a `promptSnippet`, so all six must have one — each is
  * single-line and <=140 chars because the host squeezes it into a bullet line.
  */
 const PROMPT_SNIPPETS = {
@@ -72,6 +72,7 @@ const PROMPT_SNIPPETS = {
   async_logs: "Read the bounded, ANSI-stripped output of an async task, including while it is still running.",
   async_status: "List active async tasks with elapsed time; includeHistory for recent finished ones.",
   async_kill: "Stop an async task and its whole process group.",
+  async_extend: "Renew a running task: move its reminder and/or hard-timeout deadline. Never kills; use async_kill to stop.",
 } as const;
 
 /** Guidelines appended to the default system prompt while async_run is active (D-C3). */
@@ -146,8 +147,13 @@ function byRecency(a: TaskSnapshot, b: TaskSnapshot): number {
   return (b.finishedAt ?? b.createdAt) - (a.finishedAt ?? a.createdAt);
 }
 
+/** Elapsed run time: live tasks count to now, terminal ones to their finish (REV-23 §18.7 report field). */
+function elapsedMsOf(task: TaskSnapshot, now = Date.now()): number {
+  return Math.max(0, (task.finishedAt ?? now) - (task.startedAt ?? task.createdAt));
+}
+
 /**
- * Register the frozen five-tool surface.
+ * Register the frozen six-tool surface.
  *
  * `ensureConfigured` lets the extension wire a lazy, once-only
  * `registry.configure({dataDir, cwd})` before the first tool call — tools may
@@ -184,6 +190,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
       timeoutMs: { type: "number", minimum: 0, maximum: maxSyncTimeoutMs, description: `sync only: how long to wait before promoting to background (max ${maxSyncTimeoutMs} ms, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).` },
       delayMs: { type: "number", minimum: 0, description: "delayed only: milliseconds to wait before starting." },
       taskTimeoutMs: { type: "number", minimum: 0, description: "Kill the task after this many ms, in any mode." },
+      remindAfterMs: { type: "number", minimum: 0, description: "Remind me once the task has run this many ms (backs off 2x, at most 3 times; never kills). 0 disables; default is 20 minutes, or off when watch is set." },
       onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote", description: "sync only: promote (default) returns while the task keeps running; abort stops waiting only — the task keeps running and still notifies." },
       notifyOnCompletion: { type: "boolean", description: "Send a completion notification (default true)." },
       triggerOnCompletion: { type: "boolean", description: "Start a new turn when the task finishes (default true)." },
@@ -206,6 +213,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
         cwd: sessionCwd(ctx),
         ...(typeof params.name === "string" ? { name: params.name } : {}),
         ...(typeof params.taskTimeoutMs === "number" ? { taskTimeoutMs: params.taskTimeoutMs } : {}),
+        ...(typeof params.remindAfterMs === "number" ? { remindAfterMs: params.remindAfterMs } : {}),
         ...(typeof params.notifyOnCompletion === "boolean" ? { notifyOnCompletion: params.notifyOnCompletion } : {}),
         ...(typeof params.triggerOnCompletion === "boolean" ? { triggerOnCompletion: params.triggerOnCompletion } : {}),
         ...(params.env && typeof params.env === "object" ? { env: params.env as Record<string, string> } : {}),
@@ -332,6 +340,43 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
         processAlive: registry.isProcessAlive(taskId),
         ...(warning ? { warning } : {}),
       }, Boolean(warning && after?.status !== "killed"));
+    },
+  });
+  api.registerTool({
+    name: "async_extend", label: "Renew async task",
+    description: "Renew a task (taskId or name) without touching its process: move the next reminder (remindAfterMs) and/or the hard kill deadline (taskTimeoutMs); either value resets its clock, 0 clears it. A finished task returns alreadyTerminal instead of an error.",
+    promptSnippet: PROMPT_SNIPPETS.async_extend,
+    parameters: schema({
+      taskId: stringField,
+      remindAfterMs: { type: "number", minimum: 0, description: "New reminder delay from now; resets the reminder count and backoff. 0 disarms reminders." },
+      taskTimeoutMs: { type: "number", minimum: 0, description: "New hard deadline from now; the task is killed when it passes. 0 removes the task timeout." },
+    }, ["taskId"]),
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      configure(ctx);
+      // Unknown id/name throws here (registry message: "Unknown task or name: ...") → host isError result.
+      const resolved = registry.resolveTaskId(String(params.taskId));
+      const remindAfterMs = typeof params.remindAfterMs === "number" ? params.remindAfterMs : undefined;
+      const taskTimeoutMs = typeof params.taskTimeoutMs === "number" ? params.taskTimeoutMs : undefined;
+      // A renewal with no knob would report success while changing nothing.
+      if (remindAfterMs === undefined && taskTimeoutMs === undefined) throw new Error("async_extend needs remindAfterMs or taskTimeoutMs");
+      const before = registry.get(resolved.taskId) ?? resolved;
+      // §18.7: renewing a finished task is not an error — report the terminal shape (aligned with async_kill).
+      if (isTerminal(before.status)) {
+        return toolResult({ taskId: resolved.taskId, name: before.name, status: before.status, alreadyTerminal: true, elapsedMs: elapsedMsOf(before) });
+      }
+      const task = registry.extend(resolved.taskId, {
+        ...(remindAfterMs === undefined ? {} : { remindAfterMs }),
+        ...(taskTimeoutMs === undefined ? {} : { taskTimeoutMs }),
+      });
+      return toolResult({
+        taskId: task.taskId,
+        name: task.name,
+        status: task.status,
+        elapsedMs: elapsedMsOf(task),
+        ...(task.remindAt === undefined ? {} : { remindAt: task.remindAt }),
+        remindCount: task.remindCount ?? 0,
+        ...(task.timeoutAt === undefined ? {} : { timeoutAt: task.timeoutAt }),
+      });
     },
   });
 }
