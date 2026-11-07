@@ -101,8 +101,7 @@ async_run({
 `{ ...receipt, exitCode?, outputTail, promoted }`。`promoted: true` = sync 等待超时且任务已转
 background 继续跑（`status: "running"`）；`false` = 正常结束或 `abort` 超时。**sync 超时（promote/abort）
 不是工具错误**（REV-19）：`isError` 只在任务真的以非 0 状态结束时为 true。所有任务**同步启动**：spawn 成功即返回 `running`；
-spawn 失败立即抛错，无重试等待。admission 检查为 closed / `suspend()` 之后（错误文案
-`Async task admission is closed (registry suspended)`）/ maxTasks / 空命令，均同步完成。
+spawn 失败立即抛错，无重试等待。admission 检查为 closed / `suspend()` 之后（见 §19 的两条可操作文案）/ maxTasks / 空命令，均同步完成。
 shutdown 先 drain 再退出。
 （**REV-6 裁决**：原「≤30s admission 预检」从未实现且与同步 spawn 设计冲突，改为描述现状；见 #29。）
 
@@ -708,3 +707,55 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
    把提醒预算洗白。
 3. **`summary-truncated` 是诚实标记**：提醒的 tail 切片被截断、或输出总量已 `capped` 时，带
    `<summary-truncated>true</summary-truncated>`，语义与完成通知一致；提醒同样不得暗示「你看到了全部」。
+
+## 19. 0.4.0 代际交接：工具必须解析活跃 registry（REV-24，冻结）
+
+### 19.1 事故面
+
+会话中出现永久不可恢复的状态：`async_run` 持续报
+`Async task admission is closed (registry suspended)`，且工具 schema 停留在旧版本。
+必须重启会话才能恢复。
+
+### 19.2 根因
+
+宿主对**同名工具跨 extension 是 first-wins**（`dist/core/extensions/runner.js:411`），而
+`init()` 在同一模块实例上二次执行时会把前代 registry `suspend()`（`extensions/index.ts:144`，
+REV-17 设计）。两者叠加 → 存活下来的工具闭包指向**已被退役的那一代**：
+
+- `suspended` 无重置路径（`registry.ts:783` 是唯一致值点，全仓无 `= false`）
+- `configure()` 不会清 `suspended`，且工具闭包里的 `ensureConfigured` 还会把旧一代标成
+  `configured = true`
+- admission 在 `submit` / `scheduleDelayed` / `runSync` 三条路径前置，所以新工作**确定性失败**
+
+注意：`async_logs` / `async_status` 这类只读工具**不会**报错——它们读的是退役代的**内存快照**，
+返回的是「看起来正常但已经过时」的世界。这比报错更危险。
+
+### 19.3 裁决
+
+1. **工具在调用期解析 registry，而不是注册期闭包捕获**。
+   `registerTools(pi, registrySource, ...)` 的第二个参数接受 `TaskRegistry | (() => TaskRegistry)`；
+   传函数时每个 `execute` 先调 `resolveRegistry()`。传实例保持旧行为（嵌入方与既有测试不受影响）。
+2. **extension 侧传解析器**：`registerTools(pi, () => activeRegistry ?? registry, ensureConfigured)`。
+   回退到闭包实例是**有意的**：`activeRegistry` 在 shutdown 时被清空，此时没有活代数可路由，
+   让退役代自己报出可操作的错误。
+3. **`ensureConfigured` 必须配置活代数**：`const target = activeRegistry ?? registry`，仅当
+   `target === registry`（自己的代）时才走一次性短路。否则经旧闭包进来的调用会让新代在
+   **没有 dataDir / cwd** 的情况下开工。`configure()` 幂等，重复进入无害。
+4. **禁止在退役代上重置 `suspended`**。退役是单向的；让调用改道，而不是让失效的代复活。
+
+### 19.4 admission 文案（状态面不说谎）
+
+```
+Async task admission is closed (this session shut down; start a new session to run async tasks)
+Async task admission is closed (registry suspended: a reload or resume retired this generation
+  and a newer one owns new work; reload the session if this tool still points here)
+```
+
+两条都必须说明**为什么**与**怎么办**；只报「closed」是本次事故的次生伤害。
+
+### 19.5 验收清单
+
+- 同一 tool 对象在解析器目标切换后服务新目标（单元级）。
+- 二次 `init()` 之后，仍持有前代工具对象的调用方：`async_run` **成功**，且新任务归新代所有。
+- 无活代数时（`shutdown` 之后），同一调用报出带「reload the session」指引的可操作错误。
+- `registerTools(pi, registry)` 直接传实例的旧签名继续可用。

@@ -2,6 +2,23 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 未发布 — 代际交接（REV-24）
+
+### Fixed
+
+- **扩展代际切换后 `async_run` 永久拒绝准入**：宿主对同名工具是「首次注册胜」，而二次 `init()`
+  会把前代 registry `suspend()`（REV-17）。两者叠加时，存活的工具闭包指向已退役的一代，`async_run`
+  持续报 `admission is closed`，只能重启会话恢复。现在工具在**调用期**解析活跃 registry。
+- **过时的只读快照**（同根因、更难发现）：`async_status` / `async_logs` 在退役代上不报错，
+  返回旧一代的内存快照——一个「看起来正常但已经过时」的世界。同样由 19.3 修复。
+- 经由旧闭包进来的调用现在会把 **dataDir / cwd 配到活代数**上，不再让新代带着空配置开工。
+- admission 的两条错误文案补上原因与出路（关闭 / 被 reload-resume 退役），不再只报 `closed`。
+
+### Added
+
+- `registerTools(pi, TaskRegistry | (() => TaskRegistry))`：传解析器时每次 `execute` 现取活代数；
+  传实例保持旧行为。加 `tests/g-generation-handoff.test.ts`（三个回归：解析器改道、跨代接管、无活代时报可操作错误）。
+
 ## 未发布 — 报错可操作性
 
 主题：**报错要能直接指向修复动作**。起因是一次真实使用：`output_matches` 写 `(?i)fatal` 只收到
