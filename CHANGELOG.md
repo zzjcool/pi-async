@@ -2,6 +2,53 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 未发布 — 报错可操作性
+
+主题：**报错要能直接指向修复动作**。起因是一次真实使用：`output_matches` 写 `(?i)fatal` 只收到
+`invalid regex`，`delayMs` 缺 `mode` 只收到「不合法」，两次都要靠猜才能改对。
+
+### Fixed
+
+- `output_matches` 的正则编译失败不再折叠成一句 `invalid regex`：现在回显原始正则、保留 V8 的
+  原因（`Invalid group` / `Unterminated character class`），并在内联标志（`(?i)` / `(?m)` / `(?s)` / `(?x)`）
+  时明确指出「编译固定带 `m`，JS 没有内联标志」+ 给出替代写法（字符类或 `stdout_contains`）。
+- `delayMs is only valid for delayed mode` 补上修复动作：`(pass mode: "delayed" to schedule it, or omit delayMs)`；
+  `delayMs is required for delayed mode` 补上单位示例。
+- `docs/CONTRACT.md` 删掉了 `\A` / `\z` 的错误建议——JS 把这两个当字面量 `A` / `z`，
+  **不报错但锚定静默失效**，比报错更难查；改为 `[\s\S]*` 或 `stdout_contains` 的指引。
+- `docs/CONTRACT.md` 的 `intervalMs` 注释从「默认 30_000」改为「必填无默认」（与 schema、
+  `validateWatchSpec` 的实际行为一致）。
+
+### Added
+
+- `watch` schema 补齐字段级 description：`intervalMs` / `timeoutMs` / `success_when` / `failure_when` /
+  `blind_checks` 以及各 condition 的 `value` / `equals` / `regex`。其中 `blind_checks` 此前是裸字段，
+  而它的语义（只计基础设施失败、默认 3、pending 不累计）恰恰是最容易误用的一项。
+- `SKILL.md` 增加一个可复制粘贴的完整 `watch` 示例（含 `type` 判别字段与各 payload），
+  并列出两种启动前即被拒的写法。
+- 回归测试：内联标志与未闭合字符类必须分别给出可操作的报错（`tests/b-watch-validate.test.ts`）。
+
+### Added — 0.4.0 运行期提醒与续期（REV-23，CONTRACT §18）
+
+主题：**提醒 ≠ 杀**。`taskTimeoutMs` 只有硬杀一档，杀掉正在跑的长构建比不杀更糟；而没有硬期限的
+background 任务跑飞了又没人管。提醒是注意力信号，杀是进程生命周期决策，两者分开。
+
+- **默认提醒**：`async_run` 新增 `remindAfterMs`（运行时长；`0` = 关闭）。background 且无 `watch`
+  的任务默认 **20 分钟**（`1_200_000` ms）后收到一条 `async-task-reminder`（`deliverAs: followUp` +
+  触发新 turn，只带 8 KiB tail 切片）。带 `watch` 默认不提醒（`watch.timeoutMs` 已是期限），
+  显式传 `remindAfterMs` 才开；`timeoutAt` 会先到时**不布防**。`notifyOnCompletion: false` 一并静默提醒。
+- **提醒绝不改变任务**：不调 `kill`、不改 `status`、不写 `failureKind`；按 **2 倍退避**（1× → 2× → 4×）
+  最多 3 次，用尽后不再布防、任务继续运行。抑制在**触发时**求值（已终态 / 输出已收割 /
+  `notifyOnCompletion: false` / registry 已 closed 或 suspended），跳过时不重布防。
+- **新工具 `async_extend`（工具面 5 → 6）**：`{ taskId, remindAfterMs?, taskTimeoutMs? }` 续期提醒和/或
+  硬期限，任一次续期重置计数与间隔，`0` 清除对应期限；两者都不传报错；终态任务返回 `alreadyTerminal`
+  而不是错误（对齐 `async_kill`）。带 `promptSnippet`，否则不进系统提示（REV-20）。
+- **reload 安全**：`TaskSnapshot` 新增 `remindAt`（绝对时刻）/ `remindCount`；`/reload` 按剩余预算重布防
+  并 `unref`（不会单独撑住宿主进程），已过期的 `remindAt` 立即触发一次并继续退避。一次性 `setTimeout`、
+  回调内重读 registry、`try/catch` 包住——不复活 D-12 的 `setInterval`。
+- `SKILL.md` 增加一条纪律：默认 20 分钟提醒，收到提醒要么 `async_extend` 续期要么 `async_kill` 停止；
+  提醒本身不杀进程。工具清单断言与 `CONTRACT §17` 的计数同步为 6 个。
+
 ## 0.3.1 — 2026-11-07（可发现性层）
 
 主题是**让模型重新发现这些能力**。0.3.0 把「状态面不说谎」做扎实了，但模型在系统提示里只看得到

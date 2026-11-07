@@ -26,7 +26,7 @@ pi -e ./extensions/index.ts
 
 ## Tools and commands
 
-The extension registers five tools:
+The extension registers six tools:
 
 | Tool | Purpose |
 |---|---|
@@ -34,13 +34,14 @@ The extension registers five tools:
 | `async_wait` | Wait for task completion or return a `notReady` result on timeout. |
 | `async_logs` | Read bounded, ANSI-stripped captured output (`merged` / `stdout` / `stderr`). |
 | `async_status` | List tasks and their current state. |
+| `async_extend` | Renew a running task: move its reminder and/or hard-timeout deadline. Never kills. |
 | `async_kill` | Terminate a task and its process group. |
 
-`async_wait`, `async_logs`, and `async_kill` accept a task **name** as well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown ids/names are an error instead of a silent success.
+`async_wait`, `async_logs`, `async_extend`, and `async_kill` accept a task **name** as well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown ids/names are an error instead of a silent success.
 
 ### How the model finds these tools
 
-All five tools carry a one-line `promptSnippet`, so the host lists every one of them in the system prompt's
+All six tools carry a one-line `promptSnippet`, so the host lists every one of them in the system prompt's
 tools section — `async_run` is not the only entry point the model can see.
 
 `async_run` additionally ships three `promptGuidelines` in the system prompt: when to reach for it instead

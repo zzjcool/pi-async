@@ -63,7 +63,7 @@ const DEFAULT_STATUS_LIMIT = 50;
 /**
  * One-line snippets shown in the default system prompt's "Available tools" section (D-C1).
  *
- * The host only lists tools that carry a `promptSnippet`, so all five must have one — each is
+ * The host only lists tools that carry a `promptSnippet`, so all six must have one — each is
  * single-line and <=140 chars because the host squeezes it into a bullet line.
  */
 const PROMPT_SNIPPETS = {
@@ -72,6 +72,7 @@ const PROMPT_SNIPPETS = {
   async_logs: "Read the bounded, ANSI-stripped output of an async task, including while it is still running.",
   async_status: "List active async tasks with elapsed time; includeHistory for recent finished ones.",
   async_kill: "Stop an async task and its whole process group.",
+  async_extend: "Renew a running task: move its reminder and/or hard-timeout deadline. Never kills; use async_kill to stop.",
 } as const;
 
 /** Guidelines appended to the default system prompt while async_run is active (D-C3). */
@@ -95,20 +96,25 @@ const commandField = { type: "string", description: "Shell command to execute (/
 const nameField = { type: "string", description: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars)." };
 const conditionSchema = {
   oneOf: [
-    { type: "object", properties: { type: { const: "exit_code" }, equals: { type: "number" } }, required: ["type", "equals"], additionalProperties: false },
-    ...["stdout_contains", "stderr_contains"].map((type) => ({ type: "object", properties: { type: { const: type }, value: stringField }, required: ["type", "value"], additionalProperties: false })),
+    { type: "object", properties: { type: { const: "exit_code" }, equals: { type: "number", description: "Exit code that matches; evaluated only once the process has exited." } }, required: ["type", "equals"], additionalProperties: false },
+    ...["stdout_contains", "stderr_contains"].map((type) => ({ type: "object", properties: { type: { const: type }, value: { type: "string", description: "Literal substring — no regex syntax, so no escaping needed." } }, required: ["type", "value"], additionalProperties: false })),
     { type: "object", properties: {
       type: { const: "json_path_exists" },
       path: { type: "string", pattern: "^\\$", description: "JSONPath rooted at $; e.g. $.ready or $.items[0].state (bare names like \"ready\" are rejected)" },
     }, required: ["type", "path"], additionalProperties: false },
-    { type: "object", properties: { type: { const: "output_matches" }, regex: stringField }, required: ["type", "regex"], additionalProperties: false },
+    { type: "object", properties: {
+      type: { const: "output_matches" },
+      regex: { type: "string", description: "JavaScript regex, compiled with the m flag only. Inline flags such as (?i) are rejected at validation — use a character class for case-insensitivity." },
+    }, required: ["type", "regex"], additionalProperties: false },
   ],
 };
 const watchSchema = {
   type: "object", properties: {
-    intervalMs: { type: "number", minimum: 1000 }, timeoutMs: { type: "number", minimum: 1 },
-    success_when: { type: "array", items: conditionSchema }, failure_when: { type: "array", items: conditionSchema },
-    blind_checks: { type: "number", minimum: 1 },
+    intervalMs: { type: "number", minimum: 1000, description: "Poll interval in ms; required, at least 1000." },
+    timeoutMs: { type: "number", minimum: 1, description: "Watch deadline in ms from start; required. On expiry the task is marked failed and its process group is killed — use taskTimeoutMs to bound process lifetime instead." },
+    success_when: { type: "array", items: conditionSchema, description: "OR-ed: the first match marks the task completed and leaves the process running." },
+    failure_when: { type: "array", items: conditionSchema, description: "OR-ed: the first match marks the task failed and kills the process group." },
+    blind_checks: { type: "number", minimum: 1, description: "Consecutive infrastructure failures tolerated before the watch gives up (default 3). Only unreadable output or a malformed check counts; 'not yet decidable' is pending and never accumulates." },
   }, required: ["intervalMs", "timeoutMs", "success_when", "failure_when"], additionalProperties: false,
   description: "Poll output (>=1s) for success_when/failure_when; conditions are OR-ed, first match wins, and checks must not swallow errors (no `|| true`).",
 };
@@ -141,8 +147,13 @@ function byRecency(a: TaskSnapshot, b: TaskSnapshot): number {
   return (b.finishedAt ?? b.createdAt) - (a.finishedAt ?? a.createdAt);
 }
 
+/** Elapsed run time: live tasks count to now, terminal ones to their finish (REV-23 §18.7 report field). */
+function elapsedMsOf(task: TaskSnapshot, now = Date.now()): number {
+  return Math.max(0, (task.finishedAt ?? now) - (task.startedAt ?? task.createdAt));
+}
+
 /**
- * Register the frozen five-tool surface.
+ * Register the frozen six-tool surface.
  *
  * `ensureConfigured` lets the extension wire a lazy, once-only
  * `registry.configure({dataDir, cwd})` before the first tool call — tools may
@@ -179,6 +190,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
       timeoutMs: { type: "number", minimum: 0, maximum: maxSyncTimeoutMs, description: `sync only: how long to wait before promoting to background (max ${maxSyncTimeoutMs} ms, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).` },
       delayMs: { type: "number", minimum: 0, description: "delayed only: milliseconds to wait before starting." },
       taskTimeoutMs: { type: "number", minimum: 0, description: "Kill the task after this many ms, in any mode." },
+      remindAfterMs: { type: "number", minimum: 0, description: "Remind me once the task has run this many ms (backs off 2x, at most 3 times; never kills). 0 disables; default is 20 minutes, or off when watch is set." },
       onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote", description: "sync only: promote (default) returns while the task keeps running; abort stops waiting only — the task keeps running and still notifies." },
       notifyOnCompletion: { type: "boolean", description: "Send a completion notification (default true)." },
       triggerOnCompletion: { type: "boolean", description: "Start a new turn when the task finishes (default true)." },
@@ -191,16 +203,17 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
       if (mode !== "background" && mode !== "sync" && mode !== "delayed") throw new Error(`Unsupported async_run mode: ${mode}`);
       const command = String(params.command ?? "");
       if (mode === "sync" && params.timeoutMs === undefined) throw new Error("timeoutMs is required for sync mode");
-      if (mode === "delayed" && params.delayMs === undefined) throw new Error("delayMs is required for delayed mode");
+      if (mode === "delayed" && params.delayMs === undefined) throw new Error("delayMs is required for delayed mode (milliseconds, e.g. 60000 for one minute)");
       if (params.watch !== undefined && mode === "sync") throw new Error("watch is only supported for background and delayed modes");
       if (mode !== "sync" && params.timeoutMs !== undefined) throw new Error("timeoutMs is only valid for sync mode (use taskTimeoutMs to bound background/delayed tasks)");
       if (mode !== "sync" && params.onTimeout !== undefined) throw new Error("onTimeout is only valid for sync mode");
-      if (mode !== "delayed" && params.delayMs !== undefined) throw new Error("delayMs is only valid for delayed mode");
+      if (mode !== "delayed" && params.delayMs !== undefined) throw new Error('delayMs is only valid for delayed mode (pass mode: "delayed" to schedule it, or omit delayMs)');
       const options = {
         command,
         cwd: sessionCwd(ctx),
         ...(typeof params.name === "string" ? { name: params.name } : {}),
         ...(typeof params.taskTimeoutMs === "number" ? { taskTimeoutMs: params.taskTimeoutMs } : {}),
+        ...(typeof params.remindAfterMs === "number" ? { remindAfterMs: params.remindAfterMs } : {}),
         ...(typeof params.notifyOnCompletion === "boolean" ? { notifyOnCompletion: params.notifyOnCompletion } : {}),
         ...(typeof params.triggerOnCompletion === "boolean" ? { triggerOnCompletion: params.triggerOnCompletion } : {}),
         ...(params.env && typeof params.env === "object" ? { env: params.env as Record<string, string> } : {}),
@@ -327,6 +340,43 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
         processAlive: registry.isProcessAlive(taskId),
         ...(warning ? { warning } : {}),
       }, Boolean(warning && after?.status !== "killed"));
+    },
+  });
+  api.registerTool({
+    name: "async_extend", label: "Renew async task",
+    description: "Renew a task (taskId or name) without touching its process: move the next reminder (remindAfterMs) and/or the hard kill deadline (taskTimeoutMs); either value resets its clock, 0 clears it. A finished task returns alreadyTerminal instead of an error.",
+    promptSnippet: PROMPT_SNIPPETS.async_extend,
+    parameters: schema({
+      taskId: stringField,
+      remindAfterMs: { type: "number", minimum: 0, description: "New reminder delay from now; resets the reminder count and backoff. 0 disarms reminders." },
+      taskTimeoutMs: { type: "number", minimum: 0, description: "New hard deadline from now; the task is killed when it passes. 0 removes the task timeout." },
+    }, ["taskId"]),
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      configure(ctx);
+      // Unknown id/name throws here (registry message: "Unknown task or name: ...") → host isError result.
+      const resolved = registry.resolveTaskId(String(params.taskId));
+      const remindAfterMs = typeof params.remindAfterMs === "number" ? params.remindAfterMs : undefined;
+      const taskTimeoutMs = typeof params.taskTimeoutMs === "number" ? params.taskTimeoutMs : undefined;
+      // A renewal with no knob would report success while changing nothing.
+      if (remindAfterMs === undefined && taskTimeoutMs === undefined) throw new Error("async_extend needs remindAfterMs or taskTimeoutMs");
+      const before = registry.get(resolved.taskId) ?? resolved;
+      // §18.7: renewing a finished task is not an error — report the terminal shape (aligned with async_kill).
+      if (isTerminal(before.status)) {
+        return toolResult({ taskId: resolved.taskId, name: before.name, status: before.status, alreadyTerminal: true, elapsedMs: elapsedMsOf(before) });
+      }
+      const task = registry.extend(resolved.taskId, {
+        ...(remindAfterMs === undefined ? {} : { remindAfterMs }),
+        ...(taskTimeoutMs === undefined ? {} : { taskTimeoutMs }),
+      });
+      return toolResult({
+        taskId: task.taskId,
+        name: task.name,
+        status: task.status,
+        elapsedMs: elapsedMsOf(task),
+        ...(task.remindAt === undefined ? {} : { remindAt: task.remindAt }),
+        remindCount: task.remindCount ?? 0,
+        ...(task.timeoutAt === undefined ? {} : { timeoutAt: task.timeoutAt }),
+      });
     },
   });
 }

@@ -26,18 +26,37 @@ Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that 
 - `async_logs` reads output while the task is still running (bounded to 50 KiB by default, ANSI stripped).
 - `async_status` lists active tasks; `includeHistory: true` shows recent finished ones (newest first).
 - `async_kill` terminates the task and its whole process group.
+- `async_extend` moves a running task's next reminder and/or its hard-timeout deadline (`0` clears either). It never kills.
 
-## Timeouts are three different knobs
+## Reminders are not kills
+
+A background task with no `watch` gets a runtime reminder after **20 minutes** by default (`remindAfterMs` overrides it, `0` disables it); reminders back off 2× and stop after three. When one arrives the task is still running and **will not be killed automatically** — either renew it with `async_extend` (moving `remindAfterMs` and/or `taskTimeoutMs`) or stop it with `async_kill`. Ignoring a reminder only means the task keeps running unobserved.
+
+## Timeouts are four different knobs
 
 - `timeoutMs` (sync only): how long *you* wait before the task is promoted to background. The task keeps running.
 - `onTimeout: "promote"` (default) returns while the task continues; `onTimeout: "abort"` stops waiting only — the task keeps running and still notifies. Neither one kills the process.
 - `taskTimeoutMs` (any mode): kills the task after that many milliseconds. Use it for a hard deadline, not as a way to avoid blocking.
+- `remindAfterMs` (any mode): when to be reminded that the task is still running (default 20 minutes for a background task without `watch`; `0` disables). A reminder never kills and never changes the task's status.
 
 ## Watch conditions
 
 `watch: { intervalMs, timeoutMs, success_when, failure_when, blind_checks }`
 
-- Polling interval is at least 1000 ms. The match window is the trailing **64K characters** of output, not bytes — early output scrolls out of it.
+A complete spec — every condition carries a `type` discriminator, and `intervalMs`/`timeoutMs` are required:
+
+```json
+{ "intervalMs": 1000, "timeoutMs": 60000,
+  "success_when": [{ "type": "stdout_contains", "value": "READY" }],
+  "failure_when": [{ "type": "exit_code", "equals": 1 },
+                   { "type": "output_matches", "regex": "(fatal|panic)" }] }
+```
+
+Payload per `type`: `stdout_contains`/`stderr_contains` take `value` (a literal substring), `json_path_exists` takes `path`, `output_matches` takes `regex`, `exit_code` takes `equals`.
+
+Two shapes that are rejected before any task is created: `output_matches` regexes with inline flags (`(?i)READY` — JavaScript has no inline flags here, the pattern is compiled with `m` only; write `[Rr][Ee][Aa][Dd][Yy]` or use `stdout_contains`), and `delayMs` without `mode: "delayed"`.
+
+- Polling interval is at least 1000 ms, and both `intervalMs` and `timeoutMs` are required. The match window is the trailing **64K characters** of output, not bytes — early output scrolls out of it.
 - Conditions inside a group are OR-ed: the first match wins. There is no AND mode; when you need a conjunction, use one condition with a richer `stdout_contains` value.
 - A `success_when` match does **not** kill the process: the task is marked `completed`, and process lifetime stays with `taskTimeoutMs` / `async_kill`.
 - `blind_checks` counts only infrastructure failures (unreadable output, malformed check) and defaults to 3. "Not yet decidable" is a pending state and does not accumulate.

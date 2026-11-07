@@ -10,6 +10,12 @@ import { evalConditions, validateWatchSpec, WatchLoop, type WatchOutput } from "
 export interface RegistryEvents {
   onFinalize(snapshot: TaskSnapshot): void;
   onStateChange(snapshot: TaskSnapshot): void;
+  /**
+   * Runtime reminder (REV-23 / CONTRACT §18.3). Optional on purpose: existing mocks and
+   * embedders keep compiling, and a registry without a listener still evaluates the policy
+   * (arming, backoff, suppression) instead of silently skipping it.
+   */
+  onReminder?(snapshot: TaskSnapshot): void;
 }
 export interface RegistryConfig { dataDir: string; cwd?: string; maxTasks?: number; maxOutputBytes?: number; retentionMs?: number; retentionCount?: number; }
 export interface ListOptions { includeHistory?: boolean; status?: TaskStatus | "active"; name?: string; limit?: number; }
@@ -21,7 +27,7 @@ export type RegistryEvent =
   | { type: "state"; snapshot: TaskSnapshot }
   | { type: "finalize"; snapshot: TaskSnapshot };
 
-interface LiveTask { outputFile: string; exit?: Promise<{ code: number }>; timer?: ReturnType<typeof setTimeout>; delayTimer?: ReturnType<typeof setTimeout>; watcher?: ReturnType<typeof setInterval>; killKind?: KillKind; processExited?: boolean; }
+interface LiveTask { outputFile: string; exit?: Promise<{ code: number }>; timer?: ReturnType<typeof setTimeout>; delayTimer?: ReturnType<typeof setTimeout>; reminderTimer?: ReturnType<typeof setTimeout>; watcher?: ReturnType<typeof setInterval>; killKind?: KillKind; processExited?: boolean; }
 interface Waiter { ids: Set<string>; resolve: () => void; }
 const DEFAULT_MAX_OUTPUT = 20 * 1024 * 1024;
 const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -29,6 +35,12 @@ const DEFAULT_RETENTION_COUNT = 100;
 const MAX_LIST_LIMIT = 50;
 const DEFAULT_RESEND_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RESEND_MAX_ATTEMPTS = 2;
+/** CONTRACT §18.2 rule 3: a background task with no watch is reminded after 20 minutes. */
+const DEFAULT_REMIND_MS = 20 * 60 * 1000;
+/** CONTRACT §18.4: at most three reminders per run, then silence (never a kill). */
+const MAX_REMINDERS = 3;
+/** CONTRACT §18.4: every re-arm doubles the interval (1× → 2× → 4×). */
+const REMIND_BACKOFF = 2;
 /** Default read window for `logs`; callers (tools/TUI) own the policy above this. */
 const DEFAULT_LOG_BYTES = 50 * 1024;
 /** Defensive ceiling for a single `logs` read: an accidental huge window is clamped, not honoured. */
@@ -158,7 +170,13 @@ export class TaskRegistry {
       createdAt, dueAt: createdAt + delayMs, taskTimeoutMs: opts.taskTimeoutMs, notified: false, outputConsumed: false,
       cwd: opts.cwd ?? this.config.cwd ?? process.cwd(),
       ...(opts.watch ? { watch: opts.watch } : {}),
-      metadata: { notifyOnCompletion: opts.notifyOnCompletion ?? true, triggerOnCompletion: opts.triggerOnCompletion ?? true, outputFile, ...(opts.env ? { delayedEnv: opts.env } : {}) },
+      metadata: {
+        notifyOnCompletion: opts.notifyOnCompletion ?? true, triggerOnCompletion: opts.triggerOnCompletion ?? true, outputFile,
+        ...(opts.env ? { delayedEnv: opts.env } : {}),
+        // REV-23 §18.2: the interval is evaluated when the task actually starts, so the explicit
+        // knob has to survive the pending window (and a reload of it).
+        ...(opts.remindAfterMs !== undefined ? { remindAfterMs: opts.remindAfterMs } : {}),
+      },
     };
     this.tasks.set(taskId, task);
     const live: LiveTask = { outputFile };
@@ -345,6 +363,9 @@ export class TaskRegistry {
       task.timeoutAt = task.timeoutAt ?? Date.now() + opts.taskTimeoutMs;
       live.timer = this.armTaskTimeout(task, Math.max(1, task.timeoutAt - Date.now()));
     }
+    // REV-23 (§18.2): the reminder interval is evaluated here — at start, never at createdAt —
+    // and after `timeoutAt` exists so rule 4 can compare the two deadlines.
+    this.armReminderForStart(task, live, opts.remindAfterMs);
     this.persist(task);
     this.emitState(task);
     const watch = this.watchLoops.get(task.taskId);
@@ -366,6 +387,158 @@ export class TaskRegistry {
     return timer;
   }
 
+  /**
+   * Effective first-reminder interval for a task (CONTRACT §18.2), in order:
+   * explicit knob (`0` = off) → a `watch` already owns a deadline, so off → 20 minutes.
+   */
+  private evaluateRemindMs(task: TaskSnapshot, explicit: number | undefined): number | undefined {
+    const stored = task.metadata.remindAfterMs;
+    const requested = explicit ?? (typeof stored === "number" ? stored : undefined);
+    if (requested !== undefined) return Number.isFinite(requested) && requested > 0 ? requested : undefined;
+    if (task.watch) return undefined;
+    return DEFAULT_REMIND_MS;
+  }
+
+  /** Base interval recorded when the task started; undefined = reminders off for this task. */
+  private reminderBaseMs(task: TaskSnapshot): number | undefined {
+    const stored = task.metadata.remindIntervalMs;
+    return typeof stored === "number" && Number.isFinite(stored) && stored > 0 ? stored : undefined;
+  }
+
+  /**
+   * Arm the one-shot reminder timer (CONTRACT §18.9 / D-12).
+   *
+   * Never `setInterval`: the callback closes over the task **id** only and re-reads the registry,
+   * so a retired generation cannot fire against a stale snapshot, and `fireReminder` cannot leak
+   * an exception into the event loop.
+   */
+  private armReminder(taskId: string, delayMs: number, opts: { unref?: boolean } = {}): void {
+    const live = this.live.get(taskId);
+    if (live?.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
+    const timer = setTimeout(() => {
+      try { this.fireReminder(taskId); }
+      catch (error) { console.error(`pi-async: reminder for task ${taskId} failed`, error); }
+    }, Math.max(0, delayMs));
+    // §18.8: a reminder restored from disk must not be the only thing keeping the host alive.
+    if (opts.unref) timer.unref?.();
+    if (live) live.reminderTimer = timer;
+  }
+
+  /** §18.2 at start time: evaluate, apply rule 4, and arm. Also the single place that clears stale state. */
+  private armReminderForStart(task: TaskSnapshot, live: LiveTask, explicit: number | undefined): void {
+    const base = this.evaluateRemindMs(task, explicit);
+    const now = Date.now();
+    // Rule 4: when the hard deadline lands first, a reminder is a message nobody can act on.
+    const beatenByDeadline = base !== undefined && task.timeoutAt !== undefined && now + base >= task.timeoutAt;
+    if (base === undefined || beatenByDeadline) {
+      delete task.remindAt;
+      delete task.metadata.remindIntervalMs;
+      return;
+    }
+    task.metadata.remindIntervalMs = base;
+    task.remindCount = 0;
+    task.remindAt = now + base;
+    if (live.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
+    this.armReminder(task.taskId, base);
+  }
+
+  /**
+   * Deliver one runtime reminder for `taskId` (CONTRACT §18.3–§18.6).
+   *
+   * §18.5 is this method's invariant: it never kills, never writes `status` and never writes
+   * `failureKind`. Suppression (§18.6) both skips the delivery and disarms — a reminder that
+   * arrives after the agent collected the output is noise, and re-arming would only make more.
+   */
+  private fireReminder(taskId: string): void {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    const live = this.live.get(taskId);
+    if (live?.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
+    const suppressed = this.closed || this.suspended || task.status !== "running"
+      || task.outputConsumed || task.metadata.notifyOnCompletion === false;
+    if (suppressed) {
+      // §18.6: skipped AND not re-armed; clearing the past deadline keeps the surface honest.
+      delete task.remindAt;
+      try { this.persist(task); } catch (error) { console.error(`pi-async: cannot persist suppressed reminder for task ${taskId}`, error); }
+      return;
+    }
+    const count = (task.remindCount ?? 0) + 1;
+    task.remindCount = count;
+    const base = this.reminderBaseMs(task);
+    if (base === undefined || count >= MAX_REMINDERS) {
+      // §18.4: budget spent — stop arming, keep running, write no terminal state.
+      delete task.remindAt;
+    } else {
+      // Backoff: the re-arm after reminder N waits base × 2^N (1× → 2× → 4×).
+      const delay = base * REMIND_BACKOFF ** count;
+      task.remindAt = Date.now() + delay;
+      this.armReminder(taskId, delay);
+    }
+    try { this.persist(task); } catch (error) { console.error(`pi-async: cannot persist reminder state for task ${taskId}`, error); }
+    // Delivered last, with the next schedule already settled so a listener reads post-fire state.
+    try { this.events.onReminder?.(task); } catch (error) { console.error(`pi-async: reminder listener failed for task ${taskId}`, error); }
+  }
+
+  /**
+   * Renew a live task (CONTRACT §18.7 `async_extend`): move the reminder schedule and/or the hard
+   * kill deadline, resetting the reminder count. Terminal tasks come back untouched — renewing a
+   * finished task is not an error (same shape as `async_kill` on one).
+   */
+  extend(taskId: string, opts: { remindAfterMs?: number; taskTimeoutMs?: number }): TaskSnapshot {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`Unknown task id: ${taskId}`);
+    if (isTerminal(task.status)) return task;
+    const live = this.live.get(taskId);
+    const now = Date.now();
+    if (opts.remindAfterMs !== undefined) {
+      if (live?.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
+      if (Number.isFinite(opts.remindAfterMs) && opts.remindAfterMs > 0) {
+        // Any renewal resets both the count and the interval (§18.4, last line).
+        task.metadata.remindAfterMs = opts.remindAfterMs;
+        task.metadata.remindIntervalMs = opts.remindAfterMs;
+        task.remindCount = 0;
+        task.remindAt = now + opts.remindAfterMs;
+        // A pending delayed task is armed by startTask, which re-evaluates §18.2 at the real start.
+        if (live && task.status === "running") this.armReminder(taskId, opts.remindAfterMs);
+      } else {
+        // `0` disarms: no deadline, no timer, no count to carry into a later renewal.
+        delete task.remindAt;
+        delete task.metadata.remindAfterMs;
+        delete task.metadata.remindIntervalMs;
+        task.remindCount = 0;
+      }
+    }
+    if (opts.taskTimeoutMs !== undefined) {
+      if (live?.timer) { clearTimeout(live.timer); live.timer = undefined; }
+      if (Number.isFinite(opts.taskTimeoutMs) && opts.taskTimeoutMs > 0) {
+        task.taskTimeoutMs = opts.taskTimeoutMs;
+        task.timeoutAt = now + opts.taskTimeoutMs;
+        if (live && task.status === "running") live.timer = this.armTaskTimeout(task, opts.taskTimeoutMs);
+      } else {
+        // `0` clears the hard deadline and its timer without touching the process.
+        delete task.timeoutAt;
+        delete task.taskTimeoutMs;
+      }
+    }
+    this.emitState(task);
+    return task;
+  }
+
+  /**
+   * Re-arm a reminder restored from disk (CONTRACT §18.8): remaining budget only, `unref` so the
+   * adopted timer cannot keep the host alive. An expired deadline fires once immediately and then
+   * continues the normal backoff; a spent budget stays spent.
+   */
+  private rearmReminderFromDisk(task: TaskSnapshot): void {
+    if ((task.remindCount ?? 0) >= MAX_REMINDERS) { delete task.remindAt; return; }
+    const base = this.reminderBaseMs(task);
+    if (base === undefined || task.outputConsumed || task.metadata.notifyOnCompletion === false) { delete task.remindAt; return; }
+    // No absolute deadline on disk is only possible for a snapshot written before arming.
+    const delay = task.remindAt === undefined ? base : Math.max(0, task.remindAt - Date.now());
+    task.remindAt = Date.now() + delay;
+    this.armReminder(task.taskId, delay, { unref: true });
+  }
+
   private scheduleDelayedStart(task: TaskSnapshot, delayMs: number): void {
     const live = this.live.get(task.taskId);
     if (!live || task.status !== "pending") return;
@@ -380,6 +553,7 @@ export class TaskRegistry {
         ...(rawEnv && typeof rawEnv === "object" ? { env: rawEnv as Record<string, string> } : {}),
         ...(task.watch ? { watch: task.watch } : {}),
         ...(task.cwd !== undefined ? { cwd: task.cwd } : {}),
+        ...(typeof task.metadata.remindAfterMs === "number" ? { remindAfterMs: task.metadata.remindAfterMs } : {}),
       };
       try { this.startTask(task, opts); }
       catch (error) {
@@ -611,6 +785,7 @@ export class TaskRegistry {
       const live = this.live.get(task.taskId);
       if (live?.delayTimer) { clearTimeout(live.delayTimer); live.delayTimer = undefined; }
       if (live?.timer) { clearTimeout(live.timer); live.timer = undefined; }
+      if (live?.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
       if (live?.watcher) { clearInterval(live.watcher); live.watcher = undefined; }
       this.watchLoops.get(task.taskId)?.stop();
       this.watchLoops.delete(task.taskId);
@@ -747,6 +922,8 @@ export class TaskRegistry {
               const anchor = snapshot.timeoutAt ?? (snapshot.startedAt ?? snapshot.createdAt) + snapshot.taskTimeoutMs;
               live.timer = this.armTaskTimeout(snapshot, Math.max(1, anchor - Date.now()), { unref: true });
             }
+            // §18.8: re-arm the reminder from its absolute deadline (same shape as D-03 above).
+            if (snapshot.status === "running") this.rearmReminderFromDisk(snapshot);
             // D-03: restore the watch window from the persisted absolute deadline.
             if (snapshot.status === "running" && snapshot.watch) this.attachWatch(snapshot.taskId, snapshot.watch, snapshot.watchDeadline);
           } else if (snapshot.status === "running") {
@@ -800,6 +977,7 @@ export class TaskRegistry {
     const live = this.live.get(task.taskId);
     if (live?.timer) clearTimeout(live.timer);
     if (live?.delayTimer) clearTimeout(live.delayTimer);
+    if (live?.reminderTimer) clearTimeout(live.reminderTimer);
     if (live?.watcher) clearInterval(live.watcher);
     this.live.delete(task.taskId);
     this.watchLoops.get(task.taskId)?.stop();
@@ -826,6 +1004,9 @@ export class TaskRegistry {
     task.processAlive = false;
     const live = this.live.get(task.taskId);
     if (live?.delayTimer) { clearTimeout(live.delayTimer); live.delayTimer = undefined; }
+    // §18.5: a terminal task has no next reminder — drop the timer and the deadline, not the count.
+    if (live?.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
+    delete task.remindAt;
     const watch = this.watchLoops.get(task.taskId); watch?.stop(); this.watchLoops.delete(task.taskId);
     if (live?.watcher) clearInterval(live.watcher);
     // D4: watch success settles the observed task but leaves the process under its task timeout.

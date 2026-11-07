@@ -47,7 +47,7 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
 
   try {
     await init(pi as never);
-    assert.deepEqual([...tools.keys()].sort(), ["async_kill", "async_logs", "async_run", "async_status", "async_wait"]);
+    assert.deepEqual([...tools.keys()].sort(), ["async_extend", "async_kill", "async_logs", "async_run", "async_status", "async_wait"]);
 
     const run = tools.get("async_run")!.execute;
     const wait = tools.get("async_wait")!.execute;
