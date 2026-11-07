@@ -98,6 +98,9 @@ The rail's first row summarizes running, pending, elapsed, completed, and failed
 | `PI_ASYNC_ENV_INHERIT` | `safe` | Child env policy: `safe` strips credential-like variables and rejects dangerous explicit keys; `all` restores full inheritance (explicit dangerous-key overrides are still rejected in every policy); `none` passes only a minimal allowlist (`PATH`, `HOME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TMPDIR`, `USER`). |
 | `PI_ASYNC_SETTLE_GUARD` | `on` | Set `0` to disable the settle guard entirely (no `agent_before_settle` reminder, no `agent_settled` backstop). |
 | `PI_ASYNC_NUDGE` | `on` | Set `0` to disable the runtime context nudges (the long-command hint and the `<async-state>` line). |
+| `PI_ASYNC_HOLD` | `on` | Set `0` to disable the settle hold entirely (no `agent_before_settle` handler is registered). |
+| `PI_ASYNC_HOLD_MS` | `600000` (10 min) | Upper bound for one settle hold; `≤ 0` disables the feature (a negative value is not replaced by the default, and non-integer values fall back to the default). |
+| `PI_ASYNC_HOLD_POLL_MS` | `1000` | How often the task list is re-read while the run is being held. |
 | `PI_ASYNC_FOOTER` | `off` | Set `1` to also render a one-line task summary through the host's `setStatus` footer (only when the host exposes `setStatus`). The rail's first row is the default status surface. |
 | `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
@@ -118,6 +121,58 @@ Completion notifications are **best-effort**. `pi.sendMessage` returns `void` �
 - `notifyOnCompletion: false` opts a task out entirely.
 - A delayed task whose start failed records `metadata.startError`; the failure notification's `guidance` includes it as `Start error: ...`, so the cause (missing `cwd`, rejected `env` key, spawn failure) is visible without an extra `async_logs` call.
 - A task killed by `taskTimeoutMs` stays `killed`, but its notification carries `guidance` (grow `taskTimeoutMs` or use `watch`) — it is the one `killed` shape where the next step matters. `completed` notifications stay pure information.
+
+## Settle hold (default on)
+
+Settling is what flips the terminal OSC 7501 status from `working` to `done`. When an interactive TUI
+session reaches the end of a turn while async tasks that **will wake it** are still running, pi-async
+holds the run at the `agent_before_settle` boundary instead of settling, so the run keeps reporting
+`working` for the whole wait.
+
+- Only *wakeable* **`running`** tasks are waited for: `notifyOnCompletion !== false` **and**
+  `triggerOnCompletion !== false`. `pending` tasks (a `mode: "delayed"` run) are never held — their
+  `dueAt` can be arbitrarily far away, so waiting for one would burn the whole budget at every turn
+  end. The set is snapshotted when the boundary opens, so a task started while it waits is not waited
+  for.
+- Bounded: at most `PI_ASYNC_HOLD_MS` per run (default 600000 ms = 10 min, measured on a monotonic
+  clock) and one hold per run (`agent_start` re-arms it). The loop has exactly two exits — every task
+  in the snapshot is terminal, or the budget ran out; it never probes the host's message queue, because
+  a notification queued during the hold lands on `agent.followUpQueue` while `ctx.hasPendingMessages()`
+  only counts the session-level user queues. On timeout the run settles exactly as before — nothing is
+  consumed, killed, or suppressed.
+- When every task in the snapshot finished, the boundary returns one
+  `async-task-settle-results` draft (name, status, exit code — **never** the output tail, use
+  `async_logs`) plus `continue: true`, so the outcome reaches the transcript even if the wake-up was
+  dropped. That cannot loop: the next boundary sees only terminal tasks and returns nothing.
+- Only an interactive TUI session holds. `print` / `json` would delay the process exit, `rpc` aborts
+  under a client-side timeout, and legion child sessions keep their own bounded reminder channel —
+  none of them are affected.
+- While it waits the footer shows `waiting for N tasks <elapsed>`, refreshed every 15 s, whenever the
+  host exposes `setStatus`.
+
+| Environment variable | Default | Description |
+|---|---:|---|
+| `PI_ASYNC_HOLD` | `on` | Set `0` to disable the hold entirely (no handler is registered at all). |
+| `PI_ASYNC_HOLD_MS` | `600000` (10 min) | Upper bound for one hold; **≤ 0** disables the feature (a negative value is not replaced by the default; non-integer values fall back to the default). |
+| `PI_ASYNC_HOLD_POLL_MS` | `1000` | How often the task list is re-read while holding. |
+
+Start long-lived services (a dev server, a watcher you keep across turns) with
+`notifyOnCompletion: false`: such a task is still running at every turn end, so with the default it
+would hold **every** turn until `PI_ASYNC_HOLD_MS`.
+
+Pressing Esc during a hold does **not** interrupt it — the host only marks the run aborted and cannot
+signal the boundary (`ctx.signal` is gone by then), so the hold keeps waiting and can run up to
+`PI_ASYNC_HOLD_MS` before the run settles as aborted. Two different things then happen to the wake-ups:
+
+- a task that **finished during the hold and before the Esc** had its completion notification queued and
+then cleared by the host's `clearAllQueues()`; because `notified` is already latched it is never re-sent,
+so that task will not wake you — its outcome is still written into the transcript by the
+`async-task-settle-results` draft, so the next turn you start can act on it;
+- a task that **finishes after the Esc** is not affected: its notification is delivered normally and
+still wakes the session.
+
+Fixing the first case means changing the single-delivery semantics of `notify.ts` (or finding a host
+signal the boundary can read), which is out of scope for this feature.
 
 ## Watches
 
@@ -148,6 +203,19 @@ In a legion child session, collect task results with `async_wait` before returni
 
 - Crash-durability is not guaranteed: metadata is atomically replaced, but captured output is not fsynced. After a crash, orphaned running tasks are marked `failed`/`lost` on the next start, and pending delayed tasks are restored with their remaining delay by whichever session next loads the same data directory (process identity does not matter). Recovery inside the same process is complete for `/reload` (`cwd`, `taskTimeoutMs` deadline, and watch deadline are rebuilt from disk).
 - Cross-turn wake-up in legion children depends on the host delivering follow-up messages (upstream pi-legion issue [#156](https://github.com/zzjcool/pi-legion/issues/156)); the extension does not patch Pi or legion.
+- The settle hold keeps the OSC 7501 status and the footer line in `working`, but it does **not** relight
+  the TUI working spinner: pi's harness already cleared it at `agent_end` and the extension has no API to
+  bring it back. Pressing Esc during a hold only marks the run aborted (pi does not interrupt the
+  awaiting handler) and the hold cannot observe it, so the hold **waits out its budget** (up to
+  `PI_ASYNC_HOLD_MS`) before the run settles as aborted. Wake-ups are lost only for tasks that finished
+  **during** the hold and **before** the Esc: their notifications were cleared with the agent queues and
+  `notified` is already latched, so they will not wake you — their outcome still reaches the transcript
+  through the settle-result draft. Tasks that finish **after** the Esc wake the session normally. Input
+  is not frozen.
+- Because a hold keeps the run busy, `waitForIdle()` waits for it too: any command that does
+  `await session.abort()` waits up to `PI_ASYNC_HOLD_MS` while a hold is in progress (e.g. `/tree`
+  navigation — `interactive-mode.js:4758` → `agent-session.js:1999`). Esc itself is `void abort()`, stays
+  non-blocking, and does not take that path.
 - TUI rail and panel are available only in the main TUI session, not in RPC/print/child contexts.
 - `pi --print` notification delivery requires an available configured provider. If no provider is available, end-to-end print-mode verification remains pending a user run.
 
