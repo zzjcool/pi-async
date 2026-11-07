@@ -38,20 +38,47 @@ function toolResult(payload: unknown, isError = false): { content: Array<{ type:
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], details: { payload }, isError };
 }
 
-const promptGuidelines = "Check commands must not swallow errors with || true; map unknown states to failure; prefer structured output and jq -e; anchor output_matches regexes (compiled with multiline `m`: ^/$ are line boundaries) to avoid premature matches; prefer stdout_contains for simple cases and avoid nested quantifiers.";
+/**
+ * Per-call notification exception (PLAN-CONTEXT §D-C5, revised).
+ *
+ * The general rule ("a completion notification wakes you") lives in the system prompt and in the
+ * `<async-state>` line; repeating it in every receipt would bill the same sentence on every call.
+ * Only the exception is per-call truth, so only the exception is reported here.
+ */
+function notificationException(params: Record<string, unknown>): { willNotify?: false; willWake?: false; hint: string } | undefined {
+  if (params.notifyOnCompletion === false) {
+    return { willNotify: false, hint: "Notifications are off for this task; collect it with async_wait or async_logs." };
+  }
+  if (params.triggerOnCompletion === false) {
+    return { willWake: false, hint: "This task will notify but will not start a new turn; collect it with async_wait if you need the result now." };
+  }
+  return undefined;
+}
+
 const MAX_LOG_BYTES = 50 * 1024;
 const DEFAULT_MAX_SYNC_TIMEOUT_MS = 600_000;
 const MAX_STATUS_LIMIT = 50;
 const DEFAULT_STATUS_LIMIT = 50;
 
-/** One-line snippet shown in the default system prompt's "Available tools" section (D-17). */
-const ASYNC_RUN_PROMPT_SNIPPET = "Run a shell command in the background, with optional watch conditions and completion notification.";
+/**
+ * One-line snippets shown in the default system prompt's "Available tools" section (D-C1).
+ *
+ * The host only lists tools that carry a `promptSnippet`, so all five must have one — each is
+ * single-line and <=140 chars because the host squeezes it into a bullet line.
+ */
+const PROMPT_SNIPPETS = {
+  async_run: "Run a long or gating shell command detached (build/test over a minute, server, watcher); returns a taskId, not output.",
+  async_wait: "Block until async tasks finish or the budget expires; results land in context. Never kills.",
+  async_logs: "Read the bounded, ANSI-stripped output of an async task, including while it is still running.",
+  async_status: "List active async tasks with elapsed time; includeHistory for recent finished ones.",
+  async_kill: "Stop an async task and its whole process group.",
+} as const;
 
-/** Guidelines appended to the default system prompt while async_run is active (D-17). */
+/** Guidelines appended to the default system prompt while async_run is active (D-C3). */
 const ASYNC_RUN_PROMPT_GUIDELINES = [
-  "Use async_run for long-running commands (servers, watchers, builds over a minute) instead of a blocking bash call; short commands belong in bash.",
-  "Collect background work with async_wait, inspect it with async_logs, and use async_status to see what is still active before ending a turn.",
-  "Pass name so later async_wait/async_logs/async_kill calls can address the task by name instead of its opaque taskId.",
+  "Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.",
+  "Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.",
+  "Pass name so later calls address the task by name, and read output with async_logs (works while running) instead of re-running the command.",
 ];
 
 /** `PI_ASYNC_MAX_SYNC_TIMEOUT_MS`, defaulting to 10 minutes when unset/invalid. */
@@ -63,6 +90,9 @@ function resolveMaxSyncTimeoutMs(): number {
 const schema = (properties: Record<string, unknown>, required: string[] = [], allOf: unknown[] = []) => ({ type: "object", properties, required, additionalProperties: false, ...(allOf.length ? { allOf } : {}) });
 const stringField = { type: "string" };
 const timeoutField = { type: "number", minimum: 0 };
+/** `async_run` fields that carry their own description instead of the bare `stringField` (D-C2). */
+const commandField = { type: "string", description: "Shell command to execute (/bin/sh -c) in the session cwd." };
+const nameField = { type: "string", description: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars)." };
 const conditionSchema = {
   oneOf: [
     { type: "object", properties: { type: { const: "exit_code" }, equals: { type: "number" } }, required: ["type", "equals"], additionalProperties: false },
@@ -80,6 +110,7 @@ const watchSchema = {
     success_when: { type: "array", items: conditionSchema }, failure_when: { type: "array", items: conditionSchema },
     blind_checks: { type: "number", minimum: 1 },
   }, required: ["intervalMs", "timeoutMs", "success_when", "failure_when"], additionalProperties: false,
+  description: "Poll output (>=1s) for success_when/failure_when; conditions are OR-ed, first match wins, and checks must not swallow errors (no `|| true`).",
 };
 
 /** Number of the clamped `async_status` limit: default 50, clamped to 1–50 (D-08). */
@@ -137,19 +168,21 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
 
   api.registerTool({
     name: "async_run", label: "Run async command",
-    description: `Run a background, delayed, or synchronous shell command. mode=sync requires timeoutMs; mode=delayed requires delayMs. onTimeout (sync only): "promote" (default) hands the still-running task to background and returns; "abort" stops WAITING only — the command keeps running in the background and will still notify on completion (Esc semantics; does not kill). ${promptGuidelines}`,
-    promptSnippet: ASYNC_RUN_PROMPT_SNIPPET,
+    description: "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.",
+    promptSnippet: PROMPT_SNIPPETS.async_run,
     promptGuidelines: ASYNC_RUN_PROMPT_GUIDELINES,
     // Mode-conditional required fields + mode-scoped rejects enforced in execute (#45/#42),
     // not allOf/then (host validator emits opaque "must match then schema").
     parameters: schema({
-      command: stringField, name: stringField,
-      mode: { type: "string", enum: ["background", "sync", "delayed"], default: "background" },
-      timeoutMs: { type: "number", minimum: 0, maximum: maxSyncTimeoutMs, description: `Sync-mode wait budget in ms (max ${maxSyncTimeoutMs}, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).` },
-      delayMs: timeoutField, taskTimeoutMs: timeoutField,
-      onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote" },
-      notifyOnCompletion: { type: "boolean" }, triggerOnCompletion: { type: "boolean" },
-      env: { type: "object", additionalProperties: { type: "string" } },
+      command: commandField, name: nameField,
+      mode: { type: "string", enum: ["background", "sync", "delayed"], default: "background", description: "background (default) returns a taskId now; sync waits up to timeoutMs; delayed starts after delayMs." },
+      timeoutMs: { type: "number", minimum: 0, maximum: maxSyncTimeoutMs, description: `sync only: how long to wait before promoting to background (max ${maxSyncTimeoutMs} ms, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).` },
+      delayMs: { type: "number", minimum: 0, description: "delayed only: milliseconds to wait before starting." },
+      taskTimeoutMs: { type: "number", minimum: 0, description: "Kill the task after this many ms, in any mode." },
+      onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote", description: "sync only: promote (default) returns while the task keeps running; abort stops waiting only — the task keeps running and still notifies." },
+      notifyOnCompletion: { type: "boolean", description: "Send a completion notification (default true)." },
+      triggerOnCompletion: { type: "boolean", description: "Start a new turn when the task finishes (default true)." },
+      env: { type: "object", additionalProperties: { type: "string" }, description: "Extra environment variables for the child process (safe policy applied)." },
       watch: watchSchema,
     }, ["command"]),
     execute: async (_id, params, signal, _onUpdate, ctx) => {
@@ -186,17 +219,32 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
         // the payload still carries the full SyncResult (status/promoted/exitCode/outputTail).
         const ended = result.status === "completed" || result.status === "failed" || result.status === "killed";
         const isError = ended && (result.status !== "completed" || (result.exitCode !== undefined && result.exitCode !== 0));
-        return toolResult(result, isError);
+        // A promoted task now lives in the background, so the same per-call exception applies.
+        const note = result.promoted ? notificationException(params) : undefined;
+        const payload = note
+          ? { ...result, ...(note.willNotify === false ? { willNotify: false as const } : {}), ...(note.willWake === false ? { willWake: false as const } : {}), outputHint: note.hint }
+          : result;
+        return toolResult(payload, isError);
       }
       const task = mode === "delayed"
         ? registry.scheduleDelayed(options, Number(params.delayMs))
         : registry.submit({ ...options, mode: "background" });
-      return toolResult({ taskId: task.taskId, name: task.name, status: task.status, mode: task.mode, outputHint: `Use async_logs with taskId ${task.taskId} to inspect early output.` });
+      const note = notificationException(params);
+      return toolResult({
+        taskId: task.taskId,
+        name: task.name,
+        status: task.status,
+        mode: task.mode,
+        ...(note?.willNotify === false ? { willNotify: false } : {}),
+        ...(note?.willWake === false ? { willWake: false } : {}),
+        outputHint: note?.hint ?? `Use async_logs with taskId ${task.taskId} to inspect early output.`,
+      });
     },
   });
   api.registerTool({
     name: "async_wait", label: "Wait for async tasks",
     description: "Wait for tasks (taskId or name) to finish or return notReady; waiting does not kill tasks.",
+    promptSnippet: PROMPT_SNIPPETS.async_wait,
     parameters: schema({ taskIds: { type: "array", items: stringField }, timeoutMs: timeoutField }, ["taskIds", "timeoutMs"]),
     execute: async (_id, params, signal, _onUpdate, ctx) => {
       configure(ctx);
@@ -208,6 +256,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
   api.registerTool({
     name: "async_logs", label: "Read async output",
     description: "Read bounded, ANSI-stripped task output (taskId or name). stream selects merged/stdout/stderr.",
+    promptSnippet: PROMPT_SNIPPETS.async_logs,
     parameters: schema({
       taskId: stringField,
       maxBytes: { type: "number", minimum: 0, maximum: MAX_LOG_BYTES },
@@ -226,6 +275,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
   api.registerTool({
     name: "async_status", label: "Async task status",
     description: "List async tasks and current status. Defaults to active (running/pending) only; pass includeHistory:true (or an explicit status) for up to 50 recent tasks, newest first.",
+    promptSnippet: PROMPT_SNIPPETS.async_status,
     parameters: schema({
       includeHistory: { type: "boolean" },
       status: { type: "string", enum: [...TASK_STATUSES, "active"] },
@@ -252,6 +302,7 @@ export function registerTools(pi: PiCtx, registry: TaskRegistry, ensureConfigure
   });
   api.registerTool({
     name: "async_kill", label: "Kill async task", description: "Terminate an async task (taskId or name) and its process group.",
+    promptSnippet: PROMPT_SNIPPETS.async_kill,
     parameters: schema({ taskId: stringField }, ["taskId"]),
     execute: async (_id, params, _signal, _onUpdate, ctx) => {
       configure(ctx);
