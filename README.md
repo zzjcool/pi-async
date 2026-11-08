@@ -44,11 +44,13 @@ The extension registers six tools:
 All six tools carry a one-line `promptSnippet`, so the host lists every one of them in the system prompt's
 tools section — `async_run` is not the only entry point the model can see.
 
-`async_run` additionally ships three `promptGuidelines` in the system prompt: when to reach for it instead
+`async_run` additionally ships four `promptGuidelines` in the system prompt: when to reach for it instead
 of `bash`, that ending a turn with running tasks is expected (the completion notification wakes the
-session), and that `name` + `async_logs` beat re-running a command.
+session), that `name` + `async_logs` beat re-running a command, and that independent long commands should
+be launched together in one batch and collected with a single `async_wait`.
 
-The procedural detail — check-writing discipline, watch semantics, promote vs. abort, legion collection —
+The procedural detail — when **not** to use async at all, how to plan a batch of independent long
+commands up front, check-writing discipline, watch semantics, promote vs. abort, legion collection —
 ships as an Agent Skill (`skills/async-tasks/SKILL.md`, advertised through `resources_discover`), so it
 costs one routing line until the task actually needs it.
 
@@ -75,10 +77,10 @@ Tool notes:
 
 | Command / key | Action |
 |---|---|
-| `/async` | Open the task panel. The panel is a singleton: running it again while open only shows an `Async panel is already open` notice and does not stack another overlay — the open panel refreshes itself from registry events. |
+| `/async` | Open the task panel. The panel is a singleton: running it again while open only shows an `Async panel is already open` notice and does not stack another overlay — the open panel refreshes itself from registry events plus a 1 Hz ticker, so a running task's output is live while you watch it. |
 | `/async-clear` | Clear completed-task history badges. |
-| `↑` / `↓` / `j` / `k` | Select tasks; in task details, scroll output. |
-| `Enter` | Open selected task details. |
+| `↑` / `↓` / `j` / `k` | Select tasks; in task details, scroll output (new output does not move a view you scrolled up). |
+| `Enter` | Open selected task details: the detail body gives the command's stdout the height that command and metadata do not take, at least 8 rows (on a short terminal the command and metadata collapse into `… (+K lines)` instead), labelled `output (live):` while the task still runs. |
 | `h` | Toggle history in the task list. |
 | `x` (or `K`) | Kill a running task (press again to confirm). |
 | `R` | Rerun the selected task command in that task's original `cwd`. |
@@ -86,7 +88,7 @@ Tool notes:
 | `Esc` | Close rail-clicked details; return from list-opened details to the list. |
 | `q` | Close the panel. |
 
-The rail's first row summarizes running, pending, elapsed, completed, and failed/killed task counts; pending and failed/killed counts are shown only when nonzero. **Mouse support (wheel, click) exists only in fullscreen / alt-screen TUI mode** — pi only enables mouse reporting there; in regular mode use `/async` and the keyboard. The panel and rail are only enabled in the main Pi TUI session; RPC, print, and child contexts retain the tool surface without TUI entrypoints.
+The rail's first row summarizes running, pending, elapsed, completed, and failed/killed task counts; pending and failed/killed counts are shown only when nonzero. The rail is not filtered by mode: a `mode=sync` run is a real registered task too, so it appears there and counts as running until it ends. **Mouse support (wheel, click) exists only in fullscreen / alt-screen TUI mode** — pi only enables mouse reporting there; in regular mode use `/async` and the keyboard. The panel and rail are only enabled in the main Pi TUI session; RPC, print, and child contexts retain the tool surface without TUI entrypoints.
 
 ## Configuration
 

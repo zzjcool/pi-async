@@ -75,11 +75,12 @@ const PROMPT_SNIPPETS = {
   async_extend: "Renew a running task: move its reminder and/or hard-timeout deadline. Never kills; use async_kill to stop.",
 } as const;
 
-/** Guidelines appended to the default system prompt while async_run is active (D-C3). */
+/** Guidelines appended to the default system prompt while async_run is active (D-C3, plus D-34 in 0.4.1). */
 const ASYNC_RUN_PROMPT_GUIDELINES = [
   "Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.",
   "Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.",
   "Pass name so later calls address the task by name, and read output with async_logs (works while running) instead of re-running the command.",
+  "Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.",
 ];
 
 /** `PI_ASYNC_MAX_SYNC_TIMEOUT_MS`, defaulting to 10 minutes when unset/invalid. */

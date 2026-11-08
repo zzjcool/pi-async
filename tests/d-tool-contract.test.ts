@@ -85,10 +85,15 @@ const D_C1_SNIPPETS: Record<string, string> = {
 
 const D_C2_DESCRIPTION = "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.";
 
+/**
+ * D-34 (0.4.1): the batch-planning guideline joined the three D-C3 ones, so the always-on prompt
+ * now pushes "plan the batch / launch together in one message" instead of only "~60s means async".
+ */
 const D_C3_GUIDELINES = [
   "Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.",
   "Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.",
   "Pass name so later calls address the task by name, and read output with async_logs (works while running) instead of re-running the command.",
+  "Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.",
 ];
 
 const MAX_SNIPPET_CHARS = 140;
@@ -107,10 +112,15 @@ test("all five tools carry a single-line promptSnippet verbatim from D-C1", asyn
   } finally { await cleanup(); }
 });
 
-test("async_run promptGuidelines equal the three D-C3 guidelines", async () => {
+test("async_run promptGuidelines equal the four D-C3 + D-34 guidelines, each a single line", async () => {
   const { tools, cleanup } = makeRegistry();
   try {
-    assert.deepEqual(tool(tools, "async_run").promptGuidelines, D_C3_GUIDELINES);
+    const guidelines = tool(tools, "async_run").promptGuidelines;
+    assert.deepEqual(guidelines, D_C3_GUIDELINES);
+    for (const guideline of guidelines ?? []) {
+      assert.doesNotMatch(guideline, /[\r\n]/, `guideline must stay one line: ${guideline}`);
+    }
+    assert.equal(guidelines?.length, 4, "0.4.1 adds D-34 as the fourth always-on guideline");
   } finally { await cleanup(); }
 });
 

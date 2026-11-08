@@ -260,7 +260,7 @@ test("output is read through registry.logs, never from metadata.outputFile", () 
   panel.component.handleInput("\r");
   const detail = (panel.component.render(100) as string[]).join("\n");
   assert.equal(detail.includes("TOPSECRET"), false, "the detail must not read outputFile directly");
-  assert.match(detail, /output:/, "the output section still renders (empty) when reads are refused");
+  assert.match(detail, /output \(live\):/, "the output section still renders (empty) when reads are refused; D-33 labels a running task live");
   assert.match(detail, /x kill/);
   assert.ok(panel.logsCalls.length >= 2, "both list and detail ask the registry for output");
   for (const id of panel.logsCalls) assert.equal(id, "task-1");
