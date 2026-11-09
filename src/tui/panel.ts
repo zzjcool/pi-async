@@ -46,8 +46,15 @@ const UI_TAIL_BYTES = 128 * 1024;
 /** The list shows one live output line per task — a small tail window is enough (§2.9). */
 const LIST_TAIL_BYTES = 16 * 1024;
 const PANEL_ROWS = 12;
-/** PageUp/PageDown step for the detail body. */
-const PAGE_SCROLL = PANEL_ROWS;
+/**
+ * D-30: PageUp/PageDown move one whole output window. The detail body sets this to the
+ * live `outputRows` on every render; PANEL_ROWS is only the initial value.
+ */
+let pageStep = PANEL_ROWS;
+/** R2-3: floor for the output window — a taller chrome must not leave less than this many rows. */
+const MIN_OUTPUT_ROWS = 8;
+/** D-31: the panel repaints itself while a task runs (same 1Hz pattern as rail.ts). */
+const PANEL_REFRESH_MS = 1000;
 /** Identity lines kept above the `… (+K lines)` marker when the detail body overflows. */
 const DETAIL_HEADER_LINES = 2;
 /** 0.3.0 §2.9: kill moved off `k` (which now scrolls up) onto `x`/`X`/`K`. */
@@ -108,8 +115,17 @@ export function metadataSection(metadata: Record<string, unknown>, theme: Theme 
   return [label, ...rows];
 }
 
-export function outputSection(tail: string[], truncated: boolean, theme: Theme | null | undefined, budget: number): string[] {
-  const label = paint(theme, "dim", `output${truncated ? " (tail truncated)" : ""}:`);
+export function outputSection(
+  tail: string[],
+  truncated: boolean,
+  theme: Theme | null | undefined,
+  budget: number,
+  live = false,
+): string[] {
+  // D-33: live = the task is still producing output. The 5th argument is optional, so the
+  // original 4-argument call sites keep their exact label.
+  const marks = [live ? "live" : undefined, truncated ? "tail truncated" : undefined].filter(Boolean);
+  const label = paint(theme, "dim", `output${marks.length > 0 ? ` (${marks.join(", ")})` : ""}:`);
   const rows = tail.map((line) => paint(theme, "dim", truncateToWidth(visible(line), Math.max(0, budget))));
   return [label, ...rows];
 }
@@ -220,6 +236,10 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
   const release = (): void => {
     if (panelOpen === token) panelOpen = undefined;
   };
+  // R2-2: a rejecting/throwing custom() cannot reach the factory closure, so the factory
+  // publishes its own teardown here as soon as it exists. The host may also reject before
+  // the factory ever ran — then this stays undefined and release() alone is enough.
+  let killWidget: (() => void) | undefined;
   const snapshots = (): TaskSnapshot[] => registry.list({ includeHistory: true }).filter((task) => survivesClearCutoff(task));
   const custom = host.ui.custom;
   const kind = initialTaskId ? "detail" : "list";
@@ -234,6 +254,11 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     let scroll = 0;
     let listScroll = 0;
     let follow = true;
+    /** D-32: output-line count of the last detail render, used to keep a scrolled-up view still. */
+    let lastOutputCount = 0;
+    /** R2-1: window height of the last detail render — 0 while nothing was scrolled out of view. */
+    let lastOutputRows = 0;
+    let lastTaskId: string | undefined;
     let width = 100;
     let height = process.stdout.rows ?? 24;
     let lastLines: string[] = [];
@@ -249,10 +274,16 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         // A dead overlay host must not break the render loop.
       }
     };
+    // D-31: while a task runs the registry publishes no state events, so the panel repaints
+    // itself at 1Hz — the output window then keeps up with the growing log. `requestRender()`
+    // keeps its `closed` guard, and teardown() is the single owner of the timer.
+    const ticker = setInterval(() => requestRender(), PANEL_REFRESH_MS);
+    (ticker as { unref?: () => void }).unref?.();
     /** Single teardown path for done / dispose / custom() failure — keeps the subscription leak-free. */
     const teardown = (): void => {
       if (closed) return;
       closed = true;
+      clearInterval(ticker);
       release();
       const off = unsubscribe;
       unsubscribe = undefined;
@@ -263,6 +294,8 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         // Registry may already be torn down (reload/quit); unsubscribing is best-effort.
       }
     };
+    // R2-2: exposed to openPanel so a rejecting custom() kills the ticker too.
+    killWidget = teardown;
     const close = (value?: unknown): void => {
       teardown();
       done(value);
@@ -327,22 +360,61 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       if (!task) return ["Task not found", `${origin === "rail" ? "Esc close" : "Esc return"} · q close`];
       const output = readUiOutput(task, registry);
       const outputLines = output.text.split(/\r?\n/).filter((line) => line.length > 0);
-      scroll = Math.min(scroll, Math.max(0, outputLines.length - PANEL_ROWS));
-      const tail = outputLines.slice(Math.max(0, outputLines.length - PANEL_ROWS - scroll), outputLines.length - scroll);
+      // D-32: output that arrives while the user is scrolled up must not push the lines they
+      // are reading out of the window — shift the offset by the delta instead. `follow` still
+      // pins the window to the tail; a task switch restarts the anchor (another task's count
+      // says nothing about this window).
+      if (lastTaskId !== task.taskId) {
+        lastTaskId = task.taskId;
+        lastOutputCount = 0;
+        lastOutputRows = 0;
+      } else if (lastOutputCount <= lastOutputRows) {
+        // R2-1: the previous window hid nothing, so the view *was* the tail. A key that cannot
+        // scroll anything (→/k/PageUp on a log shorter than the window) must not leave a phantom
+        // offset behind: D-32 would then anchor the view to the lines visible at keypress time
+        // and the newest output would never appear again.
+        scroll = 0;
+        follow = true;
+      } else if (!follow && outputLines.length > lastOutputCount) {
+        scroll += outputLines.length - lastOutputCount;
+      }
+      lastOutputCount = outputLines.length;
       const lineBudget = Math.max(1, Math.floor(width) - 4);
       const killHint = task.status === "pending"
         ? "Cancel this pending task? press x again to confirm; any other key cancels"
         : "Kill this task? press x again to confirm; any other key cancels";
       const divider = sectionDivider(theme, lineBudget);
+      const commandLines = commandSection(task.command, theme, lineBudget);
+      const metadataLines = metadataSection(task.metadata as Record<string, unknown>, theme, lineBudget);
+      // D-30: the output window is whatever the fixed chrome leaves, not a fixed 12 rows.
+      const chrome = 1 // title
+        + 1 // status
+        + 1 // divider
+        + commandLines.length
+        + 1 // divider
+        + metadataLines.length
+        + 1 // divider
+        + 1 // output label
+        + (actionError ? 1 : 0)
+        + (confirmKill ? 1 : 0)
+        + 1; // footer
+      const outputRows = Math.max(MIN_OUTPUT_ROWS, budget - chrome);
+      lastOutputRows = outputRows;
+      pageStep = outputRows;
+      const live = task.status === "running" || task.status === "pending";
+      scroll = Math.min(scroll, Math.max(0, outputLines.length - outputRows));
+      // R2-1: clamping back to the tail means we follow again (same invariant as move()/wheel/page).
+      if (scroll === 0) follow = true;
+      const tail = outputLines.slice(Math.max(0, outputLines.length - outputRows - scroll), outputLines.length - scroll);
       return withBodyBudget([
         ...detailTitleLines(task, theme),
         ...detailStatusLines(task, theme, Date.now()),
         divider,
-        ...commandSection(task.command, theme, lineBudget),
+        ...commandLines,
         divider,
-        ...metadataSection(task.metadata as Record<string, unknown>, theme, lineBudget),
+        ...metadataLines,
         divider,
-        ...outputSection(tail, output.truncated, theme, lineBudget),
+        ...outputSection(tail, output.truncated, theme, lineBudget, live),
         ...(actionError ? [paint(theme, "error", `error: ${visible(actionError)}`)] : []),
         ...(confirmKill ? [paint(theme, "warning", killHint)] : []),
         footerLine(),
@@ -409,9 +481,10 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         }
         if (data === "\r" || data === "\n") { detail = true; scroll = 0; follow = true; actionError = undefined; requestRender(); return; }
         // PLAN §2.9: PageUp/PageDown page the detail body (PageUp = older lines).
+        // D-30: one page = one output window (`pageStep`, set by the last render).
         // renderBody clamps the actual offset against the output length.
         if (detail && (data === "\u001b[5~" || data === "\u001b[6~")) {
-          scroll = Math.max(0, scroll + (data === "\u001b[5~" ? PAGE_SCROLL : -PAGE_SCROLL));
+          scroll = Math.max(0, scroll + (data === "\u001b[5~" ? pageStep : -pageStep));
           follow = scroll === 0;
           requestRender();
           return;
@@ -505,9 +578,14 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         maxHeight: kind === "detail" ? "80%" : "70%",
         anchor: "center",
       },
-    })).catch(() => release());
+    })).catch(() => {
+      // R2-2: the factory may already have started its ticker/subscription before the reject.
+      killWidget?.();
+      release();
+    });
   } catch {
     // A synchronously throwing custom() must not leave the singleton latched open.
+    killWidget?.();
     release();
   }
 }

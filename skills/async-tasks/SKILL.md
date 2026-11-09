@@ -14,10 +14,36 @@ description: Run long shell commands (builds, servers, watchers) as async tasks 
 | Quick read/grep/ls, or a command that finishes in seconds | `bash` |
 | Build, test suite, or anything that may take more than ~60s | `async_run` (default `mode=background`), then `async_wait` when you need it |
 | Dev server, watcher, `tail -f`, anything that never exits | `async_run` `mode=background` + `watch` |
-| You need the result before the next step, but not forever | `async_run` `mode=sync` with `timeoutMs` (bounded; promotes to background on expiry) |
+| You need the result before the next step, it may exceed the bash window, but not forever | `async_run` `mode=sync` with `timeoutMs` (bounded; promotes to background on expiry) |
 | Start later (cool-down, retry window) | `async_run` `mode=delayed` with `delayMs` |
 
 Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that is the pattern `async_run` + `watch` replaces.
+
+## When not to use async
+
+- Anything that finishes in seconds — a read, a grep, `ls`, `git status` — belongs in `bash`: one call,
+  output on screen. `async_run` costs a receipt plus an `async_logs` round-trip for the same text.
+- The next step needs what the command prints and it will finish within a minute — `bash` returns it
+  inline; `async_run` then `async_wait` is strictly slower.
+- Nothing else to do while it runs and it is short. Async pays only when the wait overlaps real work,
+  or when the command outlives the turn.
+- Never as an escape hatch for a command that keeps failing: a detached task hides its exit code
+  behind a receipt.
+
+## Plan the batch first
+
+Before the first edit, scan the request for commands that are (a) likely to outlive ~60s and
+(b) independent of each other: build, test suite, lint, install, `docker pull`, a watcher.
+Start them **together in one message** (several `async_run` calls in a single tool batch), then do the
+file work while they run, and collect the whole set with one `async_wait` (or let the completion
+notifications wake you; a legion child must always collect before reporting a verdict).
+
+- Two independent five-minute builds started together take five minutes, not ten.
+- Do not serialize: start the second build/test while the first still runs when nothing depends on it.
+- Do not pre-launch commands you may never need — a task you never collect still costs a notification and a rail entry.
+
+`mode=sync` also registers a real task: it shows up in the rail and counts as running until it ends.
+Use it only for a command you must finish before the next step **and** that may exceed the bash window.
 
 ## Collect, do not poll
 

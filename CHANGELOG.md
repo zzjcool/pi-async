@@ -2,6 +2,40 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.1 — 2026-11-08（面板实时输出 + 什么时候不该 async）
+
+主题是**点击任务就看得见 stdout**，以及把「只在需要时异步」「先规划批次」写进提示，而不是靠口头交代。
+
+### Added
+
+- **详情页实时输出（REV-26，CONTRACT §21.1）**：
+  - 输出窗口按剩余高度分配，**带 8 行下限**（`MIN_OUTPUT_ROWS`）：40 行终端 + 真实任务 metadata
+    从固定 12 行变为 17 行；24 行终端（xterm 默认）仍有 8 行（无下限时只剩 4 行——review R2-3 实测，
+    比改动前更差，故加下限，超发行由 `… (+K lines)` 折叠）。PageUp/PageDown 步长跟随窗口。
+  - 面板自有 **1Hz ticker** 自刷新（固定 1000ms、`unref`、`teardown()` 统一 `clearInterval`）：
+    running 任务的输出增长不产生 registry 事件，旧实现只靠事件驱动，详情尾部会冻结在打开那一刻。
+  - 上滚锚定：`follow=false` 时新输出 `scroll += delta`，正在读的那几行原地不动；输出尚未超过窗口时
+    按 ↑/`k` 不会留下幽灵 offset 把视图钉在旧行（R2-1）。
+  - output 标签新增 live 标记：`output (live):` / `output (live, tail truncated):`。
+- **「先规划批次」进常驻提示（REV-27，CONTRACT §21.2）**：`promptGuidelines` 第 4 条——独立长命令
+  放在同一条消息里一起起，用一次 `async_wait` 收。此前全仓没有「提前规划 / 并行铺开」的措辞。
+- **skill 补 `## When not to use async` + `## Plan the batch first`**：秒级命令、结果立刻要用且一分钟内
+  结束、没有可重叠的工作、拿 async 掩盖失败，都不该用 `async_run`；并明确 `mode=sync` 同样注册为真实
+  任务（因此会出现在 rail 里），只用于「下一步必须等它 **且** 可能超出 bash 窗口」。
+
+### Fixed
+
+- 点击 rail 或 `/async` 打开任务详情看不到 stdout：输出窗口过小（矮终端甚至少于 12 行）+ 运行期
+  不重绘（见上）；小终端下命令/metadata 现让位给输出（折叠为 `… (+K lines)`）。
+- `custom()` 在面板已建立后 reject 时未清理 1Hz ticker 与 registry 订阅（R2-2）。
+- `docs/CONTRACT.md` §8 补「rail 不按 mode 过滤」（sync 也计入 running），§19 的 `promptGuidelines`
+  条目从 3 条校准到 4 条；`README.md` 同步。
+
+### 已知限制
+
+- 输出超过 128KiB 尾窗后旧行滚出窗口，上滚锚定会随窗口漂移（此时 `output (tail truncated)` 同时出现），
+  要看更早的输出请用 `c` 显示的 output 路径 + `bash`。
+
 ## 0.4.0 — 2026-11-07（settle hold + 有界 watch 读取）
 
 主题是**状态与代价都不再说谎**：turn 结束不再闪一下 `done`（settle hold，默认开）；watch 不再每个轮询

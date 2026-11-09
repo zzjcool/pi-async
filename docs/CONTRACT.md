@@ -118,8 +118,8 @@ shutdown 先 drain 再退出。
 **工具集（6 个）**：`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill` / `async_extend`（REV-23，§18）。
 命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。
 
-**可发现性面（REV-20/21/22）**：6 个工具各带一条 `promptSnippet`（逐字见 §17），`async_run` 另带 3 条
-`promptGuidelines`；check 纪律不再拼进 description，移入随包分发的 skill（§17 REV-22）。
+**可发现性面（REV-20/21/22/27）**：6 个工具各带一条 `promptSnippet`（逐字见 §17），`async_run` 另带 4 条
+`promptGuidelines`（0.4.1 起含批次规划，§21.2）；check 纪律不再拼进 description，移入随包分发的 skill（§17 REV-22）。
 运行时另有两条情境注入：`bash` 长命令返回后追加一行 `tool_result` 建议，以及每次请求前（有活跃任务时）
 一行 `<async-state>`。两者都 best-effort，`PI_ASYNC_NUDGE=0` 关闭。
 
@@ -164,8 +164,8 @@ type Condition =
 - **check 纪律在随包 skill，不在工具面（REV-22）**：不 `|| true` 自吞错误、未知态映射失败、结构化输出
   优先 `jq -e`、`output_matches` 须加锚定（编译固定带 `m`，`^`/`$` 按行边界，故 `^READY$` 可命中
   多行输出中的某一行）——全文见 `skills/async-tasks/SKILL.md`；工具面只留 `watch` 的 schema
-  description 一句压缩版（OR-ed / first-match-wins / 不吞错）。`async_run` 的 3 条 `promptGuidelines`
-  讲的是**使用时机 / 收割 / 命名**，与 check 纪律无关（§17 REV-20 / REV-22）。
+  description 一句压缩版（OR-ed / first-match-wins / 不吞错）。`async_run` 的 4 条 `promptGuidelines`
+  讲的是**使用时机 / 收割 / 命名 / 批次规划**，与 check 纪律无关（§17 REV-20 / REV-22，§21.2 REV-27）。
 - **watch 失败性终态的进程处置（REV-4 裁决）**：`failure_when` 命中、blind 耗尽、watch timeout
   三条 watch 失败路径在 finalize 任务的同时**必须 kill 进程组**（与 `failure_when → killed(watch_failure)`
   同语义）；仅 `success_when`（D4）不干预进程。杀失败时响亮上报（kill 链已有 catch），
@@ -314,13 +314,17 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   {width:"80%", maxHeight:"70%", anchor:"center"}})`；从 rail 点击直入详情时为
   `{width:"85%", maxHeight:"80%", anchor:"center"}`。固定百分比尺寸，不提供环境变量开关。
   自绘 mask+frame（legion live-overlay 模式）；左列任务列表（含历史，`h` 切换），点击/Enter 进详情：
-  identity/status/elapsed/command/metadata + 输出 tail（128KiB UI 缓冲，12 行跟随滚动，上滚暂停）；
+  identity/status/elapsed/command/metadata + 输出 tail（128KiB UI 缓冲；窗口按剩余高度分配、最少 1 行，
+  跟随滚动，上滚暂停；见 §21.1）；
   键位 `x`（或 `K`）kill（二次确认）/`R` rerun/`c` **显示** output 路径（不是复制）/`q` 关闭；
   列表内 `k` 是**上移**，不是 kill（REV-18）。Esc 层级：rail 点击直入详情后 Esc 关闭；列表内进入详情后
   Esc 回落列表。面板为单例：已打开时再次 `/async` 只 `ui.notify("Async panel is already open")` 后
-  返回（不叠加 overlay、也不主动 re-render）；面板本身由 `registry.subscribe` 事件驱动刷新，
-  `dispose()` 退订；详情帧保留 header + footer 键位提示（超预算时保留最后 N 行并插
-  `… (+K lines)`）。
+  返回（不叠加 overlay、也不主动 re-render）；面板刷新 = `registry.subscribe` 事件驱动 **+ 面板自有
+  1Hz ticker**（§21.1），`dispose()` 退订并清 timer；详情帧保留 header + footer 键位提示
+  （超预算时保留最后 N 行并插 `… (+K lines)`）。
+- **rail 不按 mode 过滤**：`mode=sync` 同样注册成真实任务，因此在前台等待期间也出现在 rail 并计入
+  running（`promoted` 后 mode 翻成 background，条目不变）；任务行只渲染 `name · state · elapsed`，
+  不显示 mode，仅用配色区分（见上方任务行格式）。这是设计而非缺陷：sync 期间确实有一个受管进程在跑。
 - **running 任务在列表直接显示最新输出行**（footer pill 模式，ANSI 剥离）——设备码场景用户无需
   agent 中转即可看到输出。
 - **早期输出 peek**：`async_logs` 对 running 任务即时可读；`async_run` 返回的 receipt 带
@@ -583,10 +587,11 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - `async_run.description` 收缩为两句：
   `Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.`
   check 纪律从 description 移除（见 REV-22）；模式/超时语义下沉到字段级 description。
-- `promptGuidelines`（逐字，2–3 条，区分主会话与 child）：
+- `promptGuidelines`（逐字；0.3.0 为 3 条，0.4.1 起第 4 条见 §21.2，区分主会话与 child）：
   1. `Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.`
   2. `Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.`
   3. `Pass name so later calls address the task by name, and read output with async_logs (works while running) instead of re-running the command.`
+  4. （0.4.1 / REV-27，§21.2）`Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.`
 - **回退开关**：无（文案是产品面，不是行为开关）。
 
 ### REV-21（情境注入：bash 事后教学 / 活跃状态行 / 主会话 settle 建议 / timeout guidance）
@@ -868,3 +873,63 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 `stripLogControls`」，而 `ANSI_ESCAPE` 只修补**结尾**未闭合的序列、不修**开头**残片。
 影响仅限 >8 MiB 文件窗口头部的数十字节，对条件判定无实际意义。修它需要改动 `logs()` 的
 清洗顺序（会影响 `async_logs` 的每个窗口），收益不足，记录在此。
+
+## 21. 0.4.1 面板实时输出 + 批次规划指导（REV-26 / REV-27，冻结）
+
+### 21.1 详情页把 stdout 当主视图（REV-26）
+
+- **输出窗口按剩余高度分配（带下限）**：`outputRows = max(MIN_OUTPUT_ROWS = 8, budget - chrome)`，
+  其中 `budget = height - 2`，`chrome` = title 1 + status 1 + 分隔线 3 + command 行数 + metadata 行数 +
+  output 标签 1 + `actionError`/`killHint` + footer 1。旧实现固定 `PANEL_ROWS = 12`。
+  实测（80 列、running 任务、200 行输出）：
+
+  | 终端行数 | metadata 键数 | 渲染出的输出行 | 折叠 |
+  |---|---|---:|---|
+  | 40 | 3（真实任务的 outputFile/notifyOnCompletion/triggerOnCompletion） | 17 | 否 |
+  | 24（xterm 默认） | 3 | 8 | 是（`… (+K lines)`） |
+  | 40 / 24 | 0 | 20 / 8 | 否 / 是 |
+
+  下限存在的理由：真实任务 metadata 恒有 3 个键，24 行终端下 `budget - chrome` 只剩 3–5 行，
+  会**比旧的固定 12 行更差**（review R2-3 实测 4 行）；加下限后超发行由 `withBodyBudget` 折叠，
+  尾部正好是输出行 + footer，矮终端也能看到 ≥8 行最新输出。`PANEL_ROWS` 退化为「初始页步长」语义。
+  `withBodyBudget` 的 `… (+K lines)` 语义不变。
+- **PageUp/PageDown 步长 = 当前输出窗口行数**（模块级 `pageStep`，每次详情渲染更新），不再是固定 12。
+- **1Hz 自刷新**：面板 widget 工厂内 `setInterval(1000)` + `unref`，`teardown()` 统一 `clearInterval`
+  —— `done` / `dispose` / `custom()` 失败三条路径共用同一 teardown（前两条直接调用；`custom()` 的
+  reject/throw 发生在工厂闭包之外，通过 `killWidget` 句柄回调 `teardown`；工厂未执行时句柄为
+  `undefined`，无需清理）。理由：running 任务的输出增长不产生 `registry` 事件，纯事件驱动会把尾部
+  冻结在打开那一刻。固定 1000ms，**无环境变量开关**（与 rail ticker 同模式）。
+- **上滚锚定**：`follow=false` 且输出行数增长时 `scroll += delta`，用户正在读的行原地不动；
+  `follow=true` 仍贴尾部；切换任务时重置锚点（不拿上一个任务的计数补偿）。两条归一化防止幽灵
+  offset：夹取后 `scroll === 0 ⇒ follow = true`；上一窗口没有隐藏任何行
+  （`lastOutputCount <= lastOutputRows`）时直接 `scroll = 0; follow = true` —— 否则「输出还没超
+  窗口时按了一次 ↑/`k`」会让视图永久锚在按键那一刻的行（R2-1 回归）。
+- **output 标签**（`outputSection` 第 5 个可选参数 `live`）：`output:` / `output (tail truncated):` /
+  `output (live):` / `output (live, tail truncated):`；`live = status ∈ {running, pending}`。
+  4 参调用保持原标签，既有调用与测试不受影响。
+- 列表视图因同一 ticker 获得实时刷新（running 任务的最新输出行）。
+
+### 21.2 「什么时候不要 async」+「先规划批次」（REV-27）
+
+- **缺口**：常驻提示只有单向「>~60s 就 `async_run`」；mode 判定表在按需加载的 skill 里；
+  「提前规划 / 并行铺开 / 预估耗时」的措辞全仓不存在（grep 零命中）。
+- **`promptGuidelines` 追加第 4 条（逐字）**：
+  `Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.`
+- **`skills/async-tasks/SKILL.md` 新增两节**（位置：`## Choose the mode` 之后、`## Collect, do not poll`
+  之前）：`## When not to use async`（秒级命令、结果立刻要用且一分钟内结束、没有可重叠的工作、
+  拿 async 掩盖失败）与 `## Plan the batch first`（先扫描独立长命令 → 同一条消息里一起起 →
+  做本地工作 → 一次 `async_wait` 收），并明确 `mode=sync` 同样注册成真实任务（因此在 rail 里可见、
+  计入 running），只用于「下一步必须等它 **且** 可能超出 bash 窗口」。
+- **回退开关**：无（文案是产品面，不是行为开关）。
+
+### 21.3 验收清单
+
+- 40 行终端 + 200 行输出：详情渲染 ≥ 20 行输出；24 行终端 + 3 个 metadata 键：≥ 8 行
+  （`tests/c-panel-live.test.ts` D-30 / R2-3）。
+- 无 registry 事件时 1Hz 重绘；`q` / `dispose` 之后不再重绘，且 `dispose` 确实以被创建的 ticker 句柄
+  调用 `clearInterval`（`mock.timers` + `mock.method` 驱动，无真实等待）。
+- 输出未超窗口时按 ↑/`k` 不得留下幽灵 offset（R2-1）；上滚后新输出不顶走正在读的行；
+  `follow` 仍贴尾（D-32）。
+- `custom()` 在工厂执行后 reject 时 ticker 与订阅都被清（R2-2）。
+- 4 条 guideline 逐字冻结（`tests/d-tool-contract.test.ts`）；skill 两节存在且顺序正确
+  （`tests/e-skill.test.ts`）。
