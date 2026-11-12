@@ -2,7 +2,7 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
-## 未发布 — suspend 后的幽灵 running 任务（修复，不 bump version）
+## 0.4.2 — 2026-11-12（suspend 后的幽灵 running 任务）
 
 主题是**退役的那一代能自己回来**：宿主 retire 了扩展却没有下一代时，async 不再永久不可用。
 
