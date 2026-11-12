@@ -347,7 +347,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - detached 进程组 spawn（POSIX）；kill：SIGTERM → 3s grace → 组 SIGKILL → 有界探测；
   无法证明死亡 → 响亮报错「Descendant processes may have leaked」。
 - `session_shutdown(reason)`（REV-17）：`reload` / `resume` → `registry.suspend()`（停 timer/watch、
-  持久化快照，**不 kill 进程**，交给下一代 `configure()` 收养）；`quit` / `new` / `fork` / 未知 →
+  持久化快照，**不 kill 进程**，交给下一代 `configure()` 收养；无后继代时由同一实例的下一次
+  `configure()` 回收，见下方 REV-28a 段与 §19.6）；`quit` / `new` / `fork` / 未知 →
   `registry.shutdown()`（幂等：admission close + drain + **running 任务** kill(kind=shutdown)；
   pending（delayed 未到期）**不杀、不改状态**，仅清 delay timer/watch 并保留 pending 快照，
   以便同进程 reload 继续恢复）；
@@ -355,6 +356,47 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - reload / 重启恢复（REV-17）：同进程 `/reload` 不杀任务；新代 `configure()` 重新载入后按持久化的
   `timeoutAt` / `watchDeadline` / `cwd` 重建剩余预算（不是重置）；running 且 pid 已死/无 pid → 标 failed(lost)；
   pending delayed 在**下一个加载该 dataDir 的会话**（不区分进程）中按剩余 delay 恢复计时。
+  **0.4.2 修订（REV-28a，事故驱动）**：`suspend()` 之后若宿主**没有**重建扩展（reload/resume 无后继代），
+  同一实例的**下一次 `configure()`** 就是回收路径，且**顺序冻结**：
+  (1) `fenceRetiredHandles()`：清 `suspended`、给所有旧 `live` 句柄打 `retired`（其迟到 exit 回调与
+  仍在 `await killTree` 的旧 `kill()` 一律 no-op，绝不覆写复活后的快照）、清 timer/watcher、
+  `stopLiveness()`；
+  (2) 原样走 cwd/dataDir 的 `changed`/`migrateDataDir`/`switchDataDir` 决策——**此时非终态快照仍在内存**，
+  迁移才能重写它们的 `metadata.outputFile`（先删任务会让迁移看不到它们：任务被遗弃，或收养后
+  `logs()` 抛 `Refusing to read task output outside the async data directory`）；
+  (3) `dropForReAdoption()`：从 `tasks`/`live` 移除非终态快照并清 `notifyClaims`（终态快照留内存），
+  然后走既有的 `reloadFromDisk()` + `reapOrphans()`（此时无 id 冲突）。
+  收养后 running+活 pid → 建 100ms watcher 并按剩余预算重挂 `timeoutAt`/`remindAt`/watch；
+  running+死 pid → `failed` + `failureKind:"lost"` + `finishedAt` 并落盘。
+  磁盘快照**缺失/损坏**（`<taskId>.json` 被删或非法 JSON）时，被 `dropForReAdoption()` 删掉的对象必须
+  回填并按 `failed/lost` 结算一次：否则任务静默消失——无终态、无 state 事件、宿主 per-task activity 幽灵 spinner。
+  **kill 跨复活的语义**：`async_kill` 已经在 `await killTree()` 时，若期间发生 suspend+configure，它**不**结算
+  任务（stale 句柄闸门）——工具返回复活后的 `running` 状态（`processAlive` 按探测结果），随后由复活后的
+  watcher/巡检按 `lost` 结算。这是有意的：进程已死这件事只有复活后的所有者能诚实记录。
+  修订原因：`suspended` 此前**没有任何复位路径**，一代被退役而宿主无后继代时，退出回调永远不履约
+  （不 finalize、不落盘、不通知），任务 JSON 停在开始快照、状态永远不翻，且 admission 恒报 suspended ——
+  整个会话的 async 永久不可用。同实例的下一次 `configure()` 是该止血点。
+- **运行时存活巡检（REV-28c，0.4.2）**：注册表按 `livenessIntervalMs`（默认 5000ms，env
+  `PI_ASYNC_LIVENESS_INTERVAL_MS`，`unref()`）巡检；仅在有非终态任务时惰性启动、无则停，
+  `suspend()`/`shutdown()` 必须清除；**`<= 0` 关闭巡检**；巡检**绝不** kill 进程。
+  判据：非终态里 running 且进程组已死/无 pid，**连续两次观测**（`Map` 计数，观测到活即清零，
+  任务终态/被移除即清理）→ `failed` + `failureKind:"lost"`（与加载期同形，落盘并通知）；
+  pending **不**发明新语义（仍按加载期处理）。
+  修订原因（两条）：退出回调只在未被退役的代里履约，丢句柄/跨代路径下没有第二条收尾通道，幽灵 running
+  会无限涨计时；**两轮确认**是 0.4.2 reviewer 实测后修订的——单轮会在「OS 已退出 / Node 尚未派发 `exit`」
+  的窗口误判（注入 1ms 间隔时 40 个 `true` 任务里 33 个被误标 `failed/lost`），且 `setsid sleep &` 型
+  leader 先退、真实 exit 码是 0 的守护任务会被巡检抢先判死。
+  **胜负是结构性的，不靠两个间隔的相对大小**：巡检在 `spawnExitGraceMs > 0` 且该任务的 spawn 句柄
+  **已观测到子进程 `exit`** 时直接跳过（`SpawnHandle.exitObserved`）——exit 一旦被观测，REV-28d 的兜底
+  必然接手结算，巡检永远不抢；`spawnExitGraceMs <= 0`（兜底关闭）时巡检仍是唯一结算者。改前
+  `{livenessIntervalMs:1000, spawnExitGraceMs:5000}` 会让巡检抢赢，同一命令默认参数却是 `completed/0`。
+- **spawn 退出兜底（REV-28d，0.4.2）**：`'close'` 仍是主信号；新增 `'exit'` 兜底——子进程退出后若流在宽限窗口
+  （默认 5000ms，env `PI_ASYNC_SPAWN_EXIT_GRACE_MS`，可注入）内没全部 end（孙进程持有 fd 1/2 时 `'close'`
+  永不到达），用退出码 settle 并结束写流。宽限前已写出的输出保留，迟到输出可丢；统一 `settled` 守卫，
+  禁止重复 settle。**`<= 0` 关闭兜底**（不是「立即结算丢输出」）。
+  `<= 0` 只有两层能取到：构造函数注入（`TaskRegistry({ spawnExitGraceMs: 0 })` / `{ livenessIntervalMs: 0 }`）
+  才是「显式关闭」；env 走 `min: 0`，**负数/非法值回退默认值**，env 只能写 `0` 关闭。
+  修订原因：`close` 依赖全部 stdio 关闭，孙进程持有 fd 时收尾会永久悬挂。
 - dataDir（REV-17）：`<session dir>/pi-async/<sessionId>/`，无 sessionManager 时 `~/.pi/async/<pid>/`；
   dataDir 变更时 copy + rename 迁移 `.json/.output/.stdout/.stderr`，成功则重写快照内的
   `metadata.outputFile` 并重新 persist；失败保留旧目录 + `console.error`（`configure` 不 throw），
@@ -394,6 +436,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_RETENTION_MS` | `604_800_000`（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
 | `PI_ASYNC_RAIL_LINGER_MS` | `30_000` | 终态任务在 rail 上滞留时长 |
+| `PI_ASYNC_LIVENESS_INTERVAL_MS` | `5000` | 运行期存活巡检间隔（REV-28c）；**`0` 关闭巡检**；负数/非法值回退默认（`min:0`）；连续两次观测到进程组消失才结算，且已观测到 `exit` 的任务一律跳过 |
+| `PI_ASYNC_SPAWN_EXIT_GRACE_MS` | `5000` | `'exit'` 退出兜底宽限（REV-28d）；**`0` 关闭兜底**，回到「只听 `'close'`」（此时巡检是唯一结算者，连续两次观测到进程组消失后按 `failed`/`lost` 结算）；负数/非法值回退默认（`min:0`） |
 
 - `PI_ASYNC_HEARTBEAT_MS` **已删除**（心跳已删，见 §7）；设置它不会生效。
 - 孤儿 pending delayed 的清理窗口**只由 `PI_ASYNC_RETENTION_MS` 决定**：`dueAt` 早于 `now - retentionMs`
@@ -809,7 +853,8 @@ REV-17 设计）。两者叠加 → 存活下来的工具闭包指向**已被退
 3. **`ensureConfigured` 必须配置活代数**：`const target = activeRegistry ?? registry`，仅当
    `target === registry`（自己的代）时才走一次性短路。否则经旧闭包进来的调用会让新代在
    **没有 dataDir / cwd** 的情况下开工。`configure()` 幂等，重复进入无害。
-4. **禁止在退役代上重置 `suspended`**。退役是单向的；让调用改道，而不是让失效的代复活。
+4. **不得由工具层或解析层重置 `suspended`**。让调用改道（上三条），而不是让失效的代被"顺手"复活；
+   唯一允许的复位路径是**同一实例上的一次 `configure()`**（见 §19.6 的 REV-28a/REV-28b，0.4.2 修订）。
 
 ### 19.4 admission 文案（状态面不说谎）
 
@@ -825,8 +870,38 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 - 同一 tool 对象在解析器目标切换后服务新目标（单元级）。
 - 二次 `init()` 之后，仍持有前代工具对象的调用方：`async_run` **成功**，且新任务归新代所有。
-- 无活代数时（`shutdown` 之后），同一调用报出带「reload the session」指引的可操作错误。
 - `registerTools(pi, registry)` 直接传实例的旧签名继续可用。
+- **0.4.2 起按「退役代是否还会被 configure」分两类**（REV-28a/REV-28b，取代原先笼统的
+  「无活代数 → 一定报错」）：
+  - `session_shutdown(quit|new|fork)` 走 `shutdown()` → `closed`：**该已 shutdown 的实例自身不可复活**
+    （`closed` 不是 `suspended`，没有任何 revival 路径），同一调用报出「this session shut down;
+    start a new session」那条可操作错误。更早被 `suspend()` 的退役代不受影响——它仍可被 configure 自愈。
+  - `session_shutdown(reload|resume)` 走 `suspend()` → **无后继代时**下一个 `session_start` /
+    `message_start`（或带 ctx 的工具调用）即自愈：`async_run` 成功、任务归退役代（它已重新登记为 live），
+    被杀的子进程快照被结算为 `failed/lost`。
+  - 只有**从未再 configure** 的退役代（纯净 registry 嵌入方、直接传实例给 `registerTools`）继续报
+    `registry suspended` 那条可操作错误。
+
+### 19.6 0.4.2 修订（REV-28a/REV-28b，事故驱动）
+
+§19.3 第 4 条的「退役单向」只在**有后继代**时成立。线上事故：宿主在
+`session_shutdown(reason=reload|resume)` 之后**没有**重建扩展，于是没有新一代，退役代就是唯一一代 ——
+旧裁决下只剩「整个会话 async 永久不可用」。修订如下（未废弃 §19.2/§19.3 的 1–3 条）：
+
+1. **REV-28a：`suspend()` 仍是围栏，但同一实例的下一次 `configure()` 是合法的回收点**。
+   未被重新 configure 的退役代继续拒绝新工作（`registry.ts` 的 admission 不变、既有测试语义不变）；
+   但同一实例再次 `configure({dataDir,...})` 且自己处于 `suspended` 时，必须 un-suspend 并重新收养：
+   先给所有 `live` 句柄打 `retired` 并从 `tasks`/`live` 移除非终态快照（磁盘权威），再走
+   既有 `reloadFromDisk()` + `reapOrphans()`（详见 §10 的 0.4.2 修订）。退役 `live` 的迟到 exit 必须
+   是 no-op，**不能**覆盖 revival 后的快照（防双 finalize / 旧快照覆写新快照）；仍在 `await killTree`
+   的旧 `kill()` 同理不得结算（`registry.ts` 的 stale-object 闸门＋`retired` 句柄闸门）。
+2. **REV-28b：`ensureConfigured` 不得在 registry `suspended` 时短路**。`activeRegistry === undefined`
+   且本实例是唯一代时，把它重新登记为 live。效果：reload/resume 无后继代之后，**下一个
+   `session_start` / `message_start`（或带 ctx 的工具调用）**即自愈，不需要用户 `/reload`。
+   注意：`onLifecycle` 里的 `ensureConfigured` 必须**每次**生命周期事件都调用；一次性 `startup` 闩
+   只守 `resendUnnotified`（否则只有工具调用能自愈，与本节承诺不符）。
+3. **§19.4 的 suspended 文案保留**：它现在描述的是**从未再被 configure** 的实例（纯 registry 嵌入方、
+   或直接传实例给 `registerTools` 的路径），依然是可操作的诚实错误；不是自愈路径的失败信号。
 
 ## 20. 0.4.0 watch 读取有界 + 常量改名（REV-25，冻结）
 

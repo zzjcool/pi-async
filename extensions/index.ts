@@ -69,6 +69,17 @@ let activeNudges: (() => void) | undefined;
 /** Previous generation's settle hold (PLAN-HOLD D-1); released up front like the guard. */
 let activeHold: (() => void) | undefined;
 
+/**
+ * S7 (0.4.2) hardening: true while `init()` is awaiting the previous generation's `suspend()`.
+ *
+ * Between clearing `activeRegistry` and that await completing, "no live generation + a retired
+ * instance" is momentarily true — exactly the shape `ensureConfigured` revives on, so a lifecycle
+ * event landing in that window could start a second adoption of the same work. `suspend()` has no
+ * await points today, so the window cannot currently be entered; this sentinel keeps a future
+ * `await` inside it from creating two owners of one data dir.
+ */
+let suspending = false;
+
 /** One-line card for completion notifications (PLAN §2.8), rendered from message.details. */
 function formatDuration(ms: number): string {
   return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
@@ -153,10 +164,15 @@ export async function init(pi: PiCtx): Promise<void> {
     }
   }
   if (previousRegistry) {
+    // S7 (0.4.2): `ensureConfigured` must not revive the retired instance while this generation is
+    // still tearing down — see the `suspending` sentinel. Always reset, even on failure.
+    suspending = true;
     try {
       await previousRegistry.suspend();
     } catch (error) {
       console.error("pi-async: previous registry suspension during reload failed", error);
+    } finally {
+      suspending = false;
     }
   }
 
@@ -182,12 +198,24 @@ export async function init(pi: PiCtx): Promise<void> {
    * the registry that closure captured), so a call arriving through a stale closure must configure
    * the LIVE registry — otherwise it starts work in the new generation with no data dir or cwd
    * applied. `configure()` is idempotent, so re-entry through a stale closure is harmless.
+   *
+   * REV-28b (0.4.2): "configured" must not short-circuit a **suspended** instance. When a
+   * reload/resume retires this generation and the host never builds a successor, this registry is
+   * the only one left; the next `session_start`/`message_start`/ctx-bearing tool call configures it
+   * again, which is exactly the revival path (`configure()` re-adopts the persisted work).
+   * Registering it as the live generation again also puts the TUI and the resolver back on it.
    */
   const ensureConfigured = (ctx?: { cwd?: string; sessionManager?: SessionManagerLike }): void => {
+    // S7 (0.4.2): during another generation's teardown the retired instance is already suspended and
+    // `activeRegistry` may already be cleared; configuring here would revive it and let two
+    // generations adopt the same work. Do nothing for that window (the next event retries).
+    if (suspending) return;
     const target = activeRegistry ?? registry;
     if (target === registry) {
-      if (configured) return;
+      const retired = registry.isSuspended();
+      if (configured && !retired) return;
       configured = true;
+      if (retired && activeRegistry === undefined) activeRegistry = registry;
     }
     try {
       target.configure({ dataDir: sessionDataDir(ctx) ?? factoryDataDir, cwd: typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : undefined });
@@ -205,13 +233,18 @@ export async function init(pi: PiCtx): Promise<void> {
     registerPanelCommands(pi, registry);
   };
 
-  // First session_start / message_start: configure → resend missed notifications, and bind
-  // the TUI synchronously on the first TUI-capable ctx (pi exposes ui only on event ctxs).
-  // Idempotent: repeated events neither re-configure nor re-send.
+  // Lifecycle events: configure → (first only) resend missed notifications, and bind the TUI
+  // synchronously on the first TUI-capable ctx (pi exposes ui only on event ctxs).
+  //
+  // REV-28b (0.4.2): `ensureConfigured` must run on **every** lifecycle event, not only the first one.
+  // `startup` is a latch for the one-shot `resendUnnotified` backfill; keeping configure inside it
+  // meant the self-heal in REV-28b could only be triggered by a tool call, so a generation that had
+  // already seen a `session_start` (every real one) never revived from a session event.
+  // `configure()` is idempotent: only first / data-dir-change / revival do any work.
   let startup: Promise<void> | undefined;
   const onLifecycle = (ctx: unknown): Promise<void> => {
+    ensureConfigured(ctx as RuntimeContext);
     if (!startup) {
-      ensureConfigured(ctx as RuntimeContext);
       startup = (async () => {
         try {
           await registry.resendUnnotified();
@@ -246,10 +279,17 @@ export async function init(pi: PiCtx): Promise<void> {
       const startError = typeof snapshot.metadata.startError === "string" && snapshot.metadata.startError.length > 0
         ? snapshot.metadata.startError
         : undefined;
+      // S5 (0.4.2): a `delayed` task that never started has no process whose exit could be unknown
+      // and no output to inspect — both the "lost" note and the "read the logs" hint would be wrong.
+      const lostBeforeStart = snapshot.failureKind === "lost" && snapshot.mode === "delayed" && snapshot.startedAt === undefined;
       const failureNotes: string[] = [];
-      if (snapshot.failureKind === "lost") failureNotes.push("Exit status unknown after session reload; output may be incomplete.");
+      if (snapshot.failureKind === "lost") {
+        failureNotes.push(lostBeforeStart
+          ? "Delayed task was lost before it started; it never ran and produced no output."
+          : "Exit status unknown after session reload; output may be incomplete.");
+      }
       if (startError !== undefined) failureNotes.push(`Start error: ${startError}`);
-      if (snapshot.status === "failed") failureNotes.push(`Inspect task output with async_logs (taskId: ${snapshot.taskId}).`);
+      if (snapshot.status === "failed" && !lostBeforeStart) failureNotes.push(`Inspect task output with async_logs (taskId: ${snapshot.taskId}).`);
       // D-C8: a timeout kill is `killed`, not `failed`, but it is the case that most needs a
       // next step — say what to change instead of leaving the model with a dead end.
       if (snapshot.killKind === "timeout") failureNotes.push("Killed at taskTimeoutMs. Rerun with a larger taskTimeoutMs, or watch for a success_when condition instead of a hard deadline.");

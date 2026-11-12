@@ -2,6 +2,60 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 未发布 — suspend 后的幽灵 running 任务（修复，不 bump version）
+
+主题是**退役的那一代能自己回来**：宿主 retire 了扩展却没有下一代时，async 不再永久不可用。
+
+### Fixed
+
+- **suspend 后任务永远是 running（幽灵任务）**：宿主 `session_shutdown(reason=reload|resume)` 退役 registry
+  后若不重建扩展，子进程退出回调撞 `suspended` 围栏 → 不 finalize、不落盘、不通知，`<taskId>.json`
+  永远停在开始快照，20 分钟 reminder 也被清掉的 timer 掐死，TUI 计时永远上涨。现在**同一实例的下一次
+  `configure()`** 会 un-suspend 并从磁盘重新收养（REV-28a，CONTRACT §10 / §19.6）：先给旧 `live` 句柄打
+  `retired`、再走 dataDir 迁移（顺序保证 `metadata.outputFile` 被重写）、最后移除非终态快照并重新收养：
+  running+活 pid 重建 watcher 并按剩余预算重挂 `timeoutAt`/`remindAt`/watch，
+  running+死 pid → `failed` + `failureKind:"lost"` 并落盘；
+  退役 `live` 的迟到 exit（以及仍在 `await killTree` 的旧 `kill()`）是 no-op，不会覆写复活后的快照；
+  磁盘快照缺失/损坏时任务按 `failed/lost` 结算一次，不再静默消失。
+- **退役代永久拒绝 admission**：`ensureConfigured` 在 registry `suspended` 时短路，`activeRegistry` 被清空后
+  再没有任何代接收新工作（`Async task admission is closed (registry suspended: ...)` 到会话结束）。
+  现在下一个 `session_start` / `message_start`（或带 ctx 的工具调用）即自愈（REV-28b）——**生命周期事件本身**
+  就能触发（不再被一次性 `startup` 闩挡住）；**从未再 configure** 的退役代仍报同一条可操作错误（围栏保留）。
+- **运行时存活巡检（REV-28c）**：非终态里 running 且进程组已死/无 pid 的任务由低频存活巡检标
+  `failed` + `failureKind:"lost"`（与加载期同形，落盘并通知；默认 5000ms / `PI_ASYNC_LIVENESS_INTERVAL_MS`、
+  可注入、`unref()`、仅在有非终态任务时惰性启动，`suspend()`/`shutdown()` 清除，**`0` 关闭巡检**；
+  env 走 `min:0`，只有构造函数注入才能取 `<=0` 表示「显式关闭」）。
+  巡检从不 kill 进程，pending 语义不变。**需要连续两次观测到死**（契约修订）：单轮会在「OS 已退出 /
+  Node 尚未派发 `exit`」的窗口误判（实测 1ms 间隔下 40 个 `true` 任务误标 33 个），也会把真实 exit 0 的
+  守护任务判成 `lost`。与退出兜底的胜负是**结构性**的：巡检跳过任何「已被 spawn 句柄观测到 `exit`」的任务
+  （兜底必然接手），因此不取决于两个间隔的相对大小（旧的 `{巡检 1000ms, 兜底 5000ms}` 会让巡检抢赢）。
+- **孙进程持有 fd 1/2 时 `'close'` 永不到达 → 任务永久悬挂（REV-28d）**：`spawnDetached` 保留 `'close'`
+  为主信号，新增 `'exit'` 兜底——退出后宽限窗口（默认 5000ms / `PI_ASYNC_SPAWN_EXIT_GRACE_MS`，可注入）
+  内流未全部 end 则用退出码 settle 并结束写流；宽限前已写出的输出保留，迟到输出可丢，`settled` 守卫
+  保证只 settle 一次；**`0` 关闭兜底**（不是「立即结算丢输出」；env 负数回退默认，只有构造函数注入为
+  `<= 0` 才是「显式关闭」）。
+
+### Fixed（复审回归）
+
+- **watch-success 任务的 task timeout 不再泄漏**：退出回调原先在「终态早退」之后才清 `live.timer`，而
+  `finalize()` 对 success_when 命中且进程未退的任务**故意保留**该 timer（D4/#33）——于是进程自然退出后
+  这个 ref'd timer 无人清理，把宿主钉到 `taskTimeoutMs`，且 `metadata.capped` 的落盘变成死代码。
+  现在基础设施清理（清 timer、读 `capped`、必要时 persist）无条件先做，只有「改写 status/exitCode/watch」
+  受终态闸门保护。
+- **kill 跨复活的返回语义**：`async_kill` 在 `await killTree()` 期间遇到 suspend+configure 时不再结算任务，
+  返回复活后的 `running`（不 finalize），随后由复活后的 watcher/巡检按 `lost` 结算。
+
+### Added
+
+- 测试 `tests/g-revive-after-suspend.test.ts`：退役→死亡→revive 落盘、仍活着→watcher 收尾、
+  迟到 exit 不覆写（只 finalize 一次）、`kill()` 等待 TERM 忽略子进程跨 revive 不覆写、revive+换 dataDir
+  的迁移（含终态快照在内存）、磁盘快照缺失/损坏按 lost 结算、存活巡检、两轮确认、exit-0 守护任务
+  由兜底判 `completed`、孙进程持 fd 的 exit 兜底；
+  「watch-success 任务的 timer 释放」、复活后剩余 `taskTimeout`/delayed 计划/`remindAt` 重挂（3 条）、
+  「巡检结构性让位给退出兜底（interval ≪ grace 也不抢）」；
+  `tests/g-generation-handoff.test.ts` 的「无活代数」用例按 REV-28b 改为自愈 + 围栏断言，并新增
+  「reload 后只靠 `session_start` 自愈（不调任何工具）」用例。
+
 ## 0.4.1 — 2026-11-08（面板实时输出 + 什么时候不该 async）
 
 主题是**点击任务就看得见 stdout**，以及把「只在需要时异步」「先规划批次」写进提示，而不是靠口头交代。

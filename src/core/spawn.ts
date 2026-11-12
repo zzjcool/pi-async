@@ -7,13 +7,28 @@ import type { TaskSnapshot } from "./task.ts";
 
 export type { EnvPolicy };
 
-export interface SpawnHandle { pid: number; exit: Promise<{ code: number }>; }
+export interface SpawnHandle {
+  pid: number;
+  exit: Promise<{ code: number }>;
+  /**
+   * REV-28c/S2 (0.4.2): true once the child's `exit` was observed. The exit fallback owns the
+   * settlement from that point on, so the liveness sweep must not race it — this is a structural
+   * fact, not a comparison of two configurable intervals.
+   */
+  exitObserved(): boolean;
+}
 
 export interface SpawnOptions {
   outputFile: string;
   env?: Record<string, string>;
   cwd?: string;
   envPolicy?: EnvPolicy;
+  /**
+   * REV-28d (0.4.2): grace window after the child's `exit` before settling the exit promise anyway,
+   * for the case where a grandchild keeps fd 1/2 open so `close` never arrives. Default
+   * `DEFAULT_EXIT_GRACE_MS`; `<= 0` disables the fallback (close stays the only signal).
+   */
+  exitGraceMs?: number;
 }
 
 /** Derive per-stream sidecar paths next to the merged `.output` file. */
@@ -46,12 +61,20 @@ function assertUsableCwd(cwd: string | undefined): void {
   if (!stats.isDirectory()) throw new Error(`Working directory is not a directory: ${cwd}`);
 }
 
+/** REV-28d: default window between the child's `exit` and the fallback settle (single source). */
+export const DEFAULT_EXIT_GRACE_MS = 5000;
+
 /** Start a shell command in its own POSIX process group; capture merged + separate streams. */
 export function spawnDetached(command: string, opts: SpawnOptions): SpawnHandle {
   assertUsableCwd(opts.cwd);
   mkdirSync(dirname(opts.outputFile), { recursive: true });
   const { stdout: stdoutFile, stderr: stderrFile } = streamPaths(opts.outputFile);
   const capBytes = finiteNumber(opts.env?.[INTERNAL_MAX_OUTPUT_ENV] ?? process.env.PI_ASYNC_MAX_OUTPUT_BYTES, 20 * 1024 * 1024);
+  const requestedGrace = opts.exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
+  // REV-28d: `<= 0` disables the fallback entirely — it must never mean "settle instantly and
+  // drop the output", which would lose output for every ordinary task.
+  const exitFallback = Number.isFinite(requestedGrace) && requestedGrace > 0;
+  const exitGraceMs = exitFallback ? requestedGrace : 0;
   const env = buildChildEnv(process.env, opts.env, resolveEnvPolicy(opts.envPolicy));
   // Always pass cwd explicitly: the host process cwd is not the session cwd (REV-13).
   const child = spawn("/bin/sh", ["-c", command], { detached: true, stdio: ["ignore", "pipe", "pipe"], env, cwd: opts.cwd });
@@ -66,8 +89,12 @@ export function spawnDetached(command: string, opts: SpawnOptions): SpawnHandle 
   for (const stream of [merged, stdoutOut, stderrOut]) stream.on("error", () => undefined);
   let totalBytes = 0;
   let capReached = false;
+  // REV-28d: once the fallback has settled the exit promise the streams are ended; late chunks are dropped.
+  let stopCopy = false;
+  /** REV-28d: the exit promise settles exactly once, whatever path gets there first. */
+  let settled = false;
   const copy = (chunk: Buffer, stream: "stdout" | "stderr"): void => {
-    if (capReached) return;
+    if (capReached || stopCopy) return;
     const remaining = Math.max(0, capBytes - totalBytes);
     const accepted = chunk.subarray(0, remaining);
     if (accepted.length) {
@@ -87,23 +114,57 @@ export function spawnDetached(command: string, opts: SpawnOptions): SpawnHandle 
   };
   child.stdout?.on("data", (chunk: Buffer) => copy(Buffer.from(chunk), "stdout"));
   child.stderr?.on("data", (chunk: Buffer) => copy(Buffer.from(chunk), "stderr"));
+  // REV-28c/S2: set in the `'exit'` listener, read by the registry's liveness sweep.
+  let exitObserved = false;
   const exit = new Promise<{ code: number }>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", (code) => {
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let ending = false;
+    // REV-28d (0.4.2): one settle guard for every path — a second resolve/reject must be a no-op.
+    const settle = (code: number): void => {
+      if (settled) return;
+      settled = true;
+      stopCopy = true;
+      if (graceTimer !== undefined) { clearTimeout(graceTimer); graceTimer = undefined; }
+      resolve({ code });
+    };
+    const endStreams = (code: number): void => {
+      if (ending || settled) return;
+      ending = true;
       let pending = 3;
       const done = (): void => {
         pending--;
-        if (pending === 0) resolve({ code: code ?? 1 });
+        if (pending === 0) settle(code);
       };
       merged.end(done);
       stdoutOut.end(done);
       stderrOut.end(done);
+    };
+    child.once("error", (error: Error) => {
+      if (settled) return;
+      settled = true;
+      stopCopy = true;
+      if (graceTimer !== undefined) { clearTimeout(graceTimer); graceTimer = undefined; }
+      reject(error);
+    });
+    child.once("close", (code) => endStreams(code ?? 1));
+    // REV-28d (0.4.2): `close` waits for the stdio streams, so a grandchild that inherited fd 1/2 can
+    // keep it from ever firing and hang the task forever. `exit` always arrives: after a bounded
+    // grace window settle with the exit code and end the write streams. Output already written is
+    // kept; output that only arrives afterwards may be dropped.
+    child.once("exit", (code) => {
+      exitObserved = true;
+      if (!exitFallback || settled || graceTimer !== undefined) return;
+      graceTimer = setTimeout(() => {
+        graceTimer = undefined;
+        endStreams(code ?? 1);
+      }, exitGraceMs);
+      graceTimer.unref?.();
     });
   });
-  return { pid: child.pid, exit };
+  return { pid: child.pid, exit, exitObserved: () => exitObserved };
 }
 
-function finiteNumber(value: string | undefined, fallback: number): number {
+function finiteNumber(value: string | number | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }

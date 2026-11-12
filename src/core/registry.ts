@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, copyFileSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { killTree, spawnDetached, streamPaths } from "./spawn.ts";
+import { DEFAULT_EXIT_GRACE_MS, killTree, spawnDetached, streamPaths } from "./spawn.ts";
 import { stripLogControls, truncateUtf8Bytes } from "./output.ts";
 import { assertSafeEnvKeys, envNumber } from "./env.ts";
 import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type TaskStatus, type WatchSpec, type WaitOutcome } from "./task.ts";
@@ -17,7 +17,18 @@ export interface RegistryEvents {
    */
   onReminder?(snapshot: TaskSnapshot): void;
 }
-export interface RegistryConfig { dataDir: string; cwd?: string; maxTasks?: number; maxOutputBytes?: number; retentionMs?: number; retentionCount?: number; }
+export interface RegistryConfig {
+  dataDir: string;
+  cwd?: string;
+  maxTasks?: number;
+  maxOutputBytes?: number;
+  retentionMs?: number;
+  retentionCount?: number;
+  /** REV-28c (0.4.2): runtime liveness sweep interval; `<= 0` disables the sweep. */
+  livenessIntervalMs?: number;
+  /** REV-28d (0.4.2): spawn exit-fallback grace window; `<= 0` disables the fallback. */
+  spawnExitGraceMs?: number;
+}
 export interface ListOptions { includeHistory?: boolean; status?: TaskStatus | "active"; name?: string; limit?: number; }
 export type LogStream = "merged" | "stdout" | "stderr";
 export interface LogSlice { text: string; truncated: boolean; fullPath: string; missing?: boolean; }
@@ -27,7 +38,25 @@ export type RegistryEvent =
   | { type: "state"; snapshot: TaskSnapshot }
   | { type: "finalize"; snapshot: TaskSnapshot };
 
-interface LiveTask { outputFile: string; exit?: Promise<{ code: number }>; timer?: ReturnType<typeof setTimeout>; delayTimer?: ReturnType<typeof setTimeout>; reminderTimer?: ReturnType<typeof setTimeout>; watcher?: ReturnType<typeof setInterval>; killKind?: KillKind; processExited?: boolean; }
+interface LiveTask {
+  outputFile: string;
+  exit?: Promise<{ code: number }>;
+  timer?: ReturnType<typeof setTimeout>;
+  delayTimer?: ReturnType<typeof setTimeout>;
+  reminderTimer?: ReturnType<typeof setTimeout>;
+  watcher?: ReturnType<typeof setInterval>;
+  killKind?: KillKind;
+  processExited?: boolean;
+  /**
+   * REV-28a (0.4.2): set by `fenceRetiredHandles()` when a revival retires this handle. A late child
+   * exit or a `kill()` still awaiting the process group must then be a no-op — it may never overwrite
+   * the snapshot of the (possibly revived) owner of that id. `suspend()` itself does **not** set
+   * this: it fences through `suspended` and keeps the handles so the same instance can revive.
+   */
+  retired?: boolean;
+  /** REV-28c/S2: the spawn handle's "child exit was observed" probe (undefined for adopted tasks). */
+  exitObserved?: () => boolean;
+}
 interface Waiter { ids: Set<string>; resolve: () => void; }
 const DEFAULT_MAX_OUTPUT = 20 * 1024 * 1024;
 const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -35,6 +64,19 @@ const DEFAULT_RETENTION_COUNT = 100;
 const MAX_LIST_LIMIT = 50;
 const DEFAULT_RESEND_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RESEND_MAX_ATTEMPTS = 2;
+/**
+ * REV-28c (0.4.2): low-frequency sweep for a `running` task whose exit was never observed (the
+ * process died while a retired generation owned it, or the host lost the handle). Never kills.
+ */
+const DEFAULT_LIVENESS_INTERVAL_MS = 5000;
+/**
+ * REV-28c (0.4.2, revised): consecutive dead observations before the sweep settles a task. With
+ * one strike, a tick landing in the "OS exited / Node has not dispatched `exit` yet" window would
+ * report a healthy exit-0 task as `failed/lost` (measured: 33/40 at a 1 ms interval), and it would
+ * race the REV-28d fallback (default sweep 5 s vs. exit-code fallback 5 s after exit).
+ * Two strikes make the sweep strictly slower than the fallback at equal intervals.
+ */
+const LIVENESS_STRIKES = 2;
 /** CONTRACT §18.2 rule 3: a background task with no watch is reminded after 20 minutes. */
 const DEFAULT_REMIND_MS = 20 * 60 * 1000;
 /** CONTRACT §18.4: at most three reminders per run, then silence (never a kill). */
@@ -95,10 +137,16 @@ export class TaskRegistry {
   private readonly maxOutputBytes: number;
   private readonly retentionMs: number;
   private readonly retentionCount: number;
+  private readonly livenessIntervalMs: number;
+  private readonly spawnExitGraceMs: number;
   private config: RegistryConfig;
   private closed = false;
   /** Set by `suspend()`: this generation is retired and must not settle adopted work (REV-17). */
   private suspended = false;
+  /** REV-28c: lazy, `unref()`ed liveness sweep; only alive while there is non-terminal work. */
+  private livenessTimer?: ReturnType<typeof setInterval>;
+  /** REV-28c: consecutive "process is gone" observations per task id (two-strike settlement). */
+  private readonly livenessStrikes = new Map<string, number>();
   private reloading = false;
   private shutdownPromise?: Promise<void>;
   private configured = false;
@@ -112,6 +160,8 @@ export class TaskRegistry {
     this.maxOutputBytes = config.maxOutputBytes ?? envNumber("PI_ASYNC_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT, { integer: true, min: 0 });
     this.retentionMs = config.retentionMs ?? envNumber("PI_ASYNC_RETENTION_MS", DEFAULT_RETENTION_MS, { integer: true, min: 0 });
     this.retentionCount = config.retentionCount ?? envNumber("PI_ASYNC_RETENTION_COUNT", DEFAULT_RETENTION_COUNT, { integer: true, min: 0 });
+    this.livenessIntervalMs = config.livenessIntervalMs ?? envNumber("PI_ASYNC_LIVENESS_INTERVAL_MS", DEFAULT_LIVENESS_INTERVAL_MS, { integer: true, min: 0 });
+    this.spawnExitGraceMs = config.spawnExitGraceMs ?? envNumber("PI_ASYNC_SPAWN_EXIT_GRACE_MS", DEFAULT_EXIT_GRACE_MS, { integer: true, min: 0 });
   }
 
   setEvents(events: RegistryEvents): void { this.events = events; }
@@ -129,10 +179,22 @@ export class TaskRegistry {
    * tasks. Later calls only react to changes; a data-dir change migrates task artifacts
    * instead of dropping them. Migration failures keep the old dir and never throw (D-05):
    * this runs inside a `session_start` handler where a throw becomes extension noise.
+   *
+   * REV-28a (0.4.2): a `configure()` on a **suspended** instance is the no-successor revival path —
+   * the host retired this generation (reload/resume) but never built the next one, so this very
+   * instance takes its own work back from disk. Ordering matters and is frozen:
+   * 1. `fenceRetiredHandles()` drops the fence and retires every live handle;
+   * 2. the normal cwd/data-dir decision runs **while the non-terminal snapshots are still in memory**
+   *    (a data-dir migration rewrites their `metadata.outputFile`; dropping them first would leave
+   *    them un-migrated or pointing at the old directory);
+   * 3. `dropForReAdoption()` frees the ids right before `reloadFromDisk()`.
    */
   configure(opts: { dataDir?: string; cwd?: string }): void {
     const first = !this.configured;
     this.configured = true;
+    const revived = this.suspended;
+    if (revived) this.fenceRetiredHandles();
+    let dropped: TaskSnapshot[] = [];
     if (opts.cwd !== undefined && opts.cwd.length > 0) this.config = { ...this.config, cwd: opts.cwd };
     const nextDataDir = opts.dataDir;
     const changed = nextDataDir !== undefined && nextDataDir !== this.config.dataDir;
@@ -140,9 +202,13 @@ export class TaskRegistry {
       if (this.tasks.size > 0) {
         if (!this.migrateDataDir(nextDataDir)) {
           this.ensureDataDirQuietly();
-          if (first) {
-            void this.reloadFromDisk();
+          if (first || revived) {
+            if (revived) dropped = this.dropForReAdoption();
+            // S6 (0.4.2): never let a rejection escape silently — `reapOrphans()` and the
+            // lost-snapshot backfill below must still run, or a dropped task would be in neither memory nor disk.
+            void this.reloadFromDisk().catch((error: unknown) => console.error("pi-async: reload during revival failed", error));
             this.reapOrphans();
+            this.settleDroppedSnapshots(dropped);
           }
           return;
         }
@@ -152,13 +218,24 @@ export class TaskRegistry {
     }
     // D-04: the session data dir is created here or on first persist — never in the constructor.
     this.ensureDataDirQuietly();
-    if (first || changed) {
+    if (first || changed || revived) {
+      if (revived) dropped = this.dropForReAdoption();
       // reloadFromDisk() has no await points, so it is fully applied when it returns; reaping
       // keeps this generation from adopting snapshots whose processes are already gone (#44).
-      void this.reloadFromDisk();
+      // S6 (0.4.2): the rejection is logged, never swallowed — `reapOrphans()`/the lost-snapshot backfill still run.
+      void this.reloadFromDisk().catch((error: unknown) => console.error("pi-async: reload during revival failed", error));
       this.reapOrphans();
+      this.settleDroppedSnapshots(dropped);
     }
+    this.refreshLiveness();
   }
+
+  /**
+   * REV-28b (0.4.2): true while `suspend()` has retired this generation and no later `configure()`
+   * revoked that fence. The extension uses this to tell "already configured" from "retired with no
+   * successor": only the second case may configure (and thereby revive) this instance.
+   */
+  isSuspended(): boolean { return this.suspended; }
 
   submit(opts: RunOptions): TaskSnapshot {
     if (opts.mode && opts.mode !== "background") throw new Error("submit only accepts background mode");
@@ -335,18 +412,30 @@ export class TaskRegistry {
       outputFile: live.outputFile,
       env: { ...opts.env, PI_ASYNC_INTERNAL_MAX_OUTPUT_BYTES: String(this.maxOutputBytes) },
       cwd: task.cwd,
+      exitGraceMs: this.spawnExitGraceMs,
     });
     task.pid = handle.pid;
+    live.exitObserved = handle.exitObserved;
     live.exit = handle.exit.then(({ code }) => {
       // A retired generation no longer owns this process: the next generation adopted it via
-      // reloadFromDisk and its snapshot wins (no finalize, no persist, no emit).
-      if (this.suspended) return { code };
+      // reloadFromDisk and its snapshot wins (no finalize, no persist, no emit). REV-28a (0.4.2): a
+      // later `configure()` on this same instance revives it and retires this handle, so the
+      // guard is on the handle too — the revived owner (not this callback) settles the task.
+      if (this.suspended || live.retired) return { code };
       live.processExited = true;
+      // S1 (0.4.2): infrastructure cleanup is unconditional. `finalize()` deliberately keeps the
+      // timeout timer of a watch-success task alive while its process still runs (D4/#33), so this
+      // callback is the only place that can clear it once the process is really gone — a ref'd
+      // timer left behind would pin the host until `taskTimeoutMs` for an already settled task.
       if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
-      task.exitCode = code;
       task.metadata.capped = this.isOutputCapped(task);
       if (task.metadata.capped || task.metadata.watchSuccess !== undefined) this.persist(task);
-      if (!isTerminal(task.status) && task.watch) {
+      // S1/REV-28a (0.4.2): a terminal snapshot is the record — it was settled by the sweep or a
+      // kill while this exit was in flight. Nothing below may rewrite status/exitCode/watch; the
+      // bookkeeping above (timer, capped, output) already happened.
+      if (isTerminal(task.status)) return { code };
+      task.exitCode = code;
+      if (task.watch) {
         try {
           const streams = this.readWatchOutput(task.taskId);
           if (evalConditions(task.watch.failure_when, { ...streams, exitCode: code })) this.finalize(task, "killed", undefined, "watch_failure");
@@ -363,7 +452,7 @@ export class TaskRegistry {
       }
       return { code };
     }).catch(() => {
-      if (this.suspended) return { code: 1 };
+      if (this.suspended || live.retired) return { code: 1 };
       live.processExited = true;
       if (!isTerminal(task.status)) this.finalize(task, "failed", 1);
       return { code: 1 };
@@ -714,7 +803,8 @@ export class TaskRegistry {
   async kill(taskId: string, kind: KillKind): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task) return;
-    const live = this.live.get(taskId) ?? (task.pid !== undefined
+    const owned = this.live.get(taskId);
+    const live = owned ?? (task.pid !== undefined
       ? { outputFile: String(task.metadata.outputFile ?? join(this.config.dataDir, `${task.taskId}.output`)), processExited: !this.pidAlive(task.pid) }
       : undefined);
     if (!live) return;
@@ -729,6 +819,15 @@ export class TaskRegistry {
     if (task.pid && !live.processExited) {
       const result = await killTree(task.pid);
       confirmed = result.confirmed;
+    }
+    // REV-28a (0.4.2): `killTree` can take seconds (TERM ignored → 3s grace → KILL). If the registry was
+    // suspended+revived meanwhile, this handle no longer owns the task: the process death is the
+    // revived generation's business (its watcher / the liveness sweep settle it as `lost`), and a
+    // finalize here would clobber the adopted snapshot. Still report an unconfirmed kill.
+    const currentLive = this.live.get(taskId);
+    if (live.retired === true || (currentLive !== undefined && currentLive !== live)) {
+      if (!confirmed) throw new Error("Descendant processes may have leaked");
+      return;
     }
     // Finalize first so async_kill can always return { taskId, status } even when the
     // confirmation probe cannot prove the group is gone (#6).
@@ -791,19 +890,92 @@ export class TaskRegistry {
     return this.pidAlive(task.pid);
   }
 
+  /** Clear every timer/watcher one live handle owns (shared by `suspend()` and the revival fence). */
+  private clearLiveTimers(live: LiveTask): void {
+    if (live.delayTimer) { clearTimeout(live.delayTimer); live.delayTimer = undefined; }
+    if (live.timer) { clearTimeout(live.timer); live.timer = undefined; }
+    if (live.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
+    if (live.watcher) { clearInterval(live.watcher); live.watcher = undefined; }
+  }
+
+  /**
+   * REV-28a (0.4.2), step 1 of the revival: drop the retirement fence and retire every live handle.
+   *
+   * The non-terminal snapshots deliberately stay in `tasks` here — the data-dir decision that runs
+   * right after still has to see them so a migration rewrites their `metadata.outputFile` (see
+   * `configure()`'s frozen ordering).
+   * Retired handles keep their late exit callbacks harmless: only `dropForReAdoption()` frees the
+   * ids, immediately before `reloadFromDisk()` adopts the disk truth.
+   */
+  private fenceRetiredHandles(): void {
+    this.suspended = false;
+    this.stopLiveness();
+    for (const [taskId, live] of [...this.live]) {
+      live.retired = true;
+      this.clearLiveTimers(live);
+      this.watchLoops.get(taskId)?.stop();
+      this.watchLoops.delete(taskId);
+    }
+  }
+
+  /**
+   * REV-28a (0.4.2), step 3 of the revival: free every non-terminal id for `reloadFromDisk()`.
+   *
+   * `suspend()` already persisted these snapshots, so disk is authoritative; the returned array is
+   * what `settleDroppedSnapshots()` needs if disk cannot give one of them back. Terminal
+   * snapshots stay in memory — they are settled, and pruning owns them.
+   */
+  private dropForReAdoption(): TaskSnapshot[] {
+    const dropped: TaskSnapshot[] = [];
+    for (const [taskId, live] of [...this.live]) {
+      const task = this.tasks.get(taskId);
+      if (task !== undefined && isTerminal(task.status)) continue;
+      if (task !== undefined) dropped.push(task);
+      this.tasks.delete(taskId);
+      this.live.delete(taskId);
+      // Claims belong to the retired handle; the adopted snapshot carries `notified` from disk.
+      this.notifyClaims.delete(taskId);
+    }
+    // A non-terminal snapshot can also lack a live handle; it must be dropped too, or
+    // `reloadFromDisk()` would skip it by id and keep the stale in-memory object alive.
+    for (const task of [...this.tasks.values()]) {
+      if (isTerminal(task.status)) continue;
+      dropped.push(task);
+      this.tasks.delete(task.taskId);
+      this.notifyClaims.delete(task.taskId);
+    }
+    return dropped;
+  }
+
+  /**
+   * REV-28a (0.4.2): a dropped snapshot that disk never gave back (file deleted, unreadable or
+   * corrupt) must not vanish silently — that would leave a per-task activity spinner with no
+   * `finalize` and no terminal record. Re-register it and settle it through the normal path.
+   *
+   * A `delayed` snapshot that never started has no process whose exit could be unknown; the
+   * notification layer says so instead of claiming incomplete output (see `extensions/index.ts`).
+   */
+  private settleDroppedSnapshots(dropped: TaskSnapshot[]): void {
+    for (const snapshot of dropped) {
+      if (this.tasks.has(snapshot.taskId)) continue;
+      this.tasks.set(snapshot.taskId, snapshot);
+      snapshot.failureKind = "lost";
+      this.finalize(snapshot, "failed");
+    }
+  }
+
   /**
    * Stop every timer/watcher and persist, but never kill (REV-17 `/reload`):
    * the next generation adopts the surviving processes via `reloadFromDisk`.
+   * The same instance can also adopt them again through `configure()` (REV-28a, 0.4.2).
    */
   async suspend(): Promise<void> {
     // Retire first, so a child exit landing during teardown is already ignored.
     this.suspended = true;
+    this.stopLiveness();
     for (const task of this.tasks.values()) {
       const live = this.live.get(task.taskId);
-      if (live?.delayTimer) { clearTimeout(live.delayTimer); live.delayTimer = undefined; }
-      if (live?.timer) { clearTimeout(live.timer); live.timer = undefined; }
-      if (live?.reminderTimer) { clearTimeout(live.reminderTimer); live.reminderTimer = undefined; }
-      if (live?.watcher) { clearInterval(live.watcher); live.watcher = undefined; }
+      if (live !== undefined) this.clearLiveTimers(live);
       this.watchLoops.get(task.taskId)?.stop();
       this.watchLoops.delete(task.taskId);
       try { this.persist(task); } catch (error) { console.error(`pi-async: suspend could not persist task ${task.taskId}`, error); }
@@ -864,9 +1036,71 @@ export class TaskRegistry {
     return reaped;
   }
 
+  /**
+   * REV-28c (0.4.2): start the liveness sweep only while there is non-terminal work; never in the
+   * constructor, and `unref()`ed so an idle host is not held open by it.
+   */
+  private refreshLiveness(): void {
+    const wanted = this.hasActiveWork() && !this.closed && !this.suspended
+      && Number.isFinite(this.livenessIntervalMs) && this.livenessIntervalMs > 0;
+    if (!wanted) { this.stopLiveness(); return; }
+    if (this.livenessTimer !== undefined) return;
+    const timer = setInterval(() => this.sweepLiveness(), this.livenessIntervalMs);
+    timer.unref?.();
+    this.livenessTimer = timer;
+  }
+
+  private stopLiveness(): void {
+    this.livenessStrikes.clear();
+    if (this.livenessTimer === undefined) return;
+    clearInterval(this.livenessTimer);
+    this.livenessTimer = undefined;
+  }
+
+  /**
+   * REV-28c (0.4.2): settle a `running` task whose process group is gone but whose exit was never
+   * observed (a retired generation owned the child, or the host lost the handle). Same shape as
+   * the load-time path: `failed` + `failureKind: "lost"`. Pending work is untouched, and the sweep
+   * never kills anything.
+   *
+   * Settlement needs **two consecutive** dead observations: a single tick can land in the window
+   * where the OS already reaped the child but Node has not dispatched `exit` yet, which would report
+   * a healthy `exit 0` task as `failed/lost`. A live observation resets the count.
+   *
+   * The sweep also skips any task whose spawn handle saw the child's `exit` (REV-28d fallback owns
+   * settlement from then on). That keeps the two settlers from racing regardless of how their two
+   * intervals are configured — see `SpawnHandle.exitObserved`.
+   */
+  private sweepLiveness(): void {
+    if (this.closed || this.suspended) { this.stopLiveness(); return; }
+    for (const task of [...this.tasks.values()]) {
+      if (task.status !== "running") { this.livenessStrikes.delete(task.taskId); continue; }
+      const live = this.live.get(task.taskId);
+      if (live?.processExited) { this.livenessStrikes.delete(task.taskId); continue; }
+      if (this.spawnExitGraceMs > 0 && live?.exitObserved?.() === true) {
+        // REV-28c/S2: the child's exit was observed, so the REV-28d fallback will settle this task;
+        // the sweep must never race it. This is structural — it does not depend on how the two
+        // configurable intervals compare (grace > interval used to let the sweep win).
+        this.livenessStrikes.delete(task.taskId);
+        continue;
+      }
+      if (task.pid !== undefined && this.pidAlive(task.pid)) { this.livenessStrikes.delete(task.taskId); continue; }
+      const strikes = (this.livenessStrikes.get(task.taskId) ?? 0) + 1;
+      if (strikes < LIVENESS_STRIKES) { this.livenessStrikes.set(task.taskId, strikes); continue; }
+      this.livenessStrikes.delete(task.taskId);
+      if (live) live.processExited = true;
+      if (live?.timer) { clearTimeout(live.timer); live.timer = undefined; }
+      task.failureKind = "lost";
+      this.finalize(task, "failed");
+    }
+    for (const id of [...this.livenessStrikes.keys()]) if (!this.tasks.has(id)) this.livenessStrikes.delete(id);
+    if (!this.hasActiveWork()) this.stopLiveness();
+  }
+
   shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.closed = true;
+    this.stopLiveness();
     this.shutdownPromise = (async () => {
       // Pending delayed tasks hold no OS resources. Clear their timers but leave snapshots
       // as pending so same-process /reload can restore them (CONTRACT reload / #20).
@@ -954,6 +1188,8 @@ export class TaskRegistry {
     } finally {
       this.reloading = false;
       this.prune();
+      // REV-28c: adopting snapshots can leave this generation owning work, so the sweep may need to start.
+      this.refreshLiveness();
     }
   }
 
@@ -1015,6 +1251,12 @@ export class TaskRegistry {
     };
   }
   private finalize(task: TaskSnapshot, status: TaskSnapshot["status"], code?: number, killKind?: KillKind): void {
+    // REV-28a (0.4.2): a stale snapshot object must never settle this id. A `kill()` that awaited the
+    // process group across a revival lands here with the *old* object while the adopted snapshot
+    // owns the id — finalizing it would persist a terminal state the revived owner never agreed to
+    // and would clear the adopted handle's watcher/timer through the id lookup below.
+    const current = this.tasks.get(task.taskId);
+    if (current !== undefined && current !== task) return;
     if (isTerminal(task.status)) return;
     task.status = status; task.exitCode = code; task.killKind = killKind; task.finishedAt = Date.now();
     // D-07: a terminal snapshot never claims a live process.
@@ -1044,6 +1286,8 @@ export class TaskRegistry {
   }
   private emitState(task: TaskSnapshot): void {
     this.persist(task);
+    // REV-28c: every state mutation is the choke point for "is there work to sweep for".
+    this.refreshLiveness();
     this.events.onStateChange(task);
     this.emit({ type: "state", snapshot: task });
   }

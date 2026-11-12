@@ -148,25 +148,98 @@ test("a tool registration kept from a retired generation is served by the live o
   }
 });
 
-test("with no live generation the retired one reports an actionable admission error", async () => {
+/**
+ * REV-28b (0.4.2): the retired generation is the only one left.
+ *
+ * Before: with no live generation, a call through the retired registration reported the admission
+ * error forever — the incident's "async is permanently unavailable" state. Now the next ctx-bearing
+ * call configures that registry again, which revives it (its own persisted work comes back from
+ * disk). The fence still holds for a generation that is *never* configured again: `suspend()` alone
+ * keeps refusing new work.
+ */
+test("with no live generation the retired one revives itself instead of refusing admission", async () => {
   const base = mkdtempSync(join(tmpdir(), "pi-async-handoff-dead-"));
   const sessionId = "dead";
   const gen1 = makeGen(base, sessionId);
   const gen2 = makeGen(base, sessionId);
+  const fenced = new TaskRegistry({ dataDir: join(base, "fenced") });
   try {
     await init(gen1.pi as never);
     await gen1.dispatch("session_start", { type: "session_start", reason: "startup" });
     await init(gen2.pi as never);
     await gen2.dispatch("session_start", { type: "session_start", reason: "reload" });
-    // quit clears the live generation; gen1's registration now has nowhere to go.
+    // quit clears the live generation; gen1's registration now has nowhere else to go.
     await gen2.dispatch("session_shutdown", { type: "session_shutdown", reason: "quit" });
 
-    await assert.rejects(
-      gen1.call("async_run", { command: "echo hi", mode: "background" }),
-      /admission is closed \(registry suspended: .*reload the session/,
-      "the error must say why and what to do, not just that admission is closed",
+    const revived = await gen1.call<{ taskId: string; status: string }>("async_run", {
+      command: "sleep 5", name: "after-quit", mode: "background", notifyOnCompletion: false,
+    });
+    assert.ok(revived.taskId, "the last generation left revives itself instead of fencing the session forever");
+    const rows = await gen1.call<Array<{ taskId: string; status: string }>>("async_status", { includeHistory: true });
+    assert.ok(rows.some((row) => row.taskId === revived.taskId), "the revived generation owns the new task");
+
+    // REV-28b fence: suspend() still retires an instance that is never configured again. This is a
+    // **contract-fence assertion only** (it pins "never re-configured ⇒ still refuses admission"),
+    // not a bug-catching case for the REV-28b fix — the self-heal is covered by the test below, which
+    // deliberately uses no tool call at all.
+    await fenced.suspend();
+    assert.throws(
+      () => fenced.submit({ command: "true" }),
+      /Async task admission is closed \(registry suspended: .*reload the session/,
+      "an instance that is never configured again stays fenced",
     );
   } finally {
+    await gen1.dispatch("session_shutdown", { type: "session_shutdown", reason: "quit" }).catch(() => undefined);
+    await fenced.shutdown();
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/**
+ * REV-28b (0.4.2): the self-heal must be reachable from the lifecycle events themselves.
+ *
+ * `onLifecycle` kept `ensureConfigured` behind the one-shot `startup` latch, so a generation that had
+ * already seen a `session_start` (every real one) could only revive through a tool call. A
+ * `session_shutdown(reload)` with no successor generation then left the ghost unsettled until the
+ * user happened to run something.
+ */
+test("a session_start after a reload revives the retired generation without any tool call", async () => {
+  const base = mkdtempSync(join(tmpdir(), "pi-async-handoff-lifecycle-"));
+  const sessionId = "lifecycle";
+  const dataDir = join(base, "pi-async", sessionId);
+  const gen1 = makeGen(base, sessionId);
+  const snapshotOf = (taskId: string): { status?: string; failureKind?: string; pid?: number } =>
+    JSON.parse(readFileSync(join(dataDir, `${taskId}.json`), "utf8")) as { status?: string; failureKind?: string; pid?: number };
+  try {
+    await init(gen1.pi as never);
+    await gen1.dispatch("session_start", { type: "session_start", reason: "startup" });
+    const started = await gen1.call<{ taskId: string }>("async_run", {
+      command: "sleep 30", name: "lifecycle", mode: "background", notifyOnCompletion: false,
+    });
+    await waitForSnapshot(dataDir, started.taskId);
+    const { pid } = snapshotOf(started.taskId);
+    assert.ok(typeof pid === "number");
+
+    // reload with no successor generation: suspend only, no second init().
+    await gen1.dispatch("session_shutdown", { type: "session_shutdown", reason: "reload" });
+    try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(snapshotOf(started.taskId).status, "running", "a retired generation leaves the ghost alone");
+
+    // Only the lifecycle event — no tool call may be needed for the self-heal.
+    await gen1.dispatch("session_start", { type: "session_start", reason: "resume" });
+
+    const persisted = snapshotOf(started.taskId);
+    assert.equal(persisted.status, "failed", "the lifecycle event alone revives and settles the ghost");
+    assert.equal(persisted.failureKind, "lost");
+    // The disk assertion above already proved the point; reading memory now (with a tool call) only
+    // checks that the registration resolves to the revived snapshot rather than a stale one.
+    const rows = await gen1.call<Array<{ taskId: string; status: string; failureKind?: string }>>("async_status", { includeHistory: true });
+    const row = rows.find((task) => task.taskId === started.taskId);
+    assert.equal(row?.status, "failed");
+    assert.equal(row?.failureKind, "lost");
+  } finally {
+    await gen1.dispatch("session_shutdown", { type: "session_shutdown", reason: "quit" }).catch(() => undefined);
     rmSync(base, { recursive: true, force: true });
   }
 });
