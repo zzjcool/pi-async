@@ -849,10 +849,31 @@ export class TaskRegistry {
   }
   consume(taskId: string): void { const task = this.tasks.get(taskId); if (!task) return; task.outputConsumed = true; this.persist(task); }
 
+  /**
+   * 0.4.3 (CONTRACT §7.2): record that a tool handed this task's **terminal** state to the model.
+   *
+   * One terminal event is told once, to exactly one consumer — a consumed task must never produce a
+   * completion notification, whether it is sent now (`onFinalize`) or replayed later
+   * (`resendUnnotified`). Idempotent: the first consumer wins and the timestamp is not rewritten.
+   * Returns `true` only when it actually latched (so a caller can tell "was already told").
+   */
+  markConsumed(taskId: string): boolean {
+    const task = this.tasks.get(taskId);
+    if (!task || task.consumedAt !== undefined) return false;
+    task.consumedAt = Date.now();
+    this.persist(task);
+    return true;
+  }
+
+  /** Whether a terminal state was already delivered to the model by a tool (0.4.3 / §7.2). */
+  isConsumed(taskId: string): boolean {
+    return this.tasks.get(taskId)?.consumedAt !== undefined;
+  }
+
   /** In-memory send claim only (D-01): `notified` is owned by `markNotified`. */
   claimNotification(taskId: string): boolean {
     const task = this.tasks.get(taskId);
-    if (!task || task.notified || task.outputConsumed || this.notifyClaims.has(taskId)) return false;
+    if (!task || task.notified || task.outputConsumed || task.consumedAt !== undefined || this.notifyClaims.has(taskId)) return false;
     this.notifyClaims.add(taskId);
     return true;
   }
@@ -995,7 +1016,7 @@ export class TaskRegistry {
     let resent = 0;
     for (const task of [...this.tasks.values()]) {
       if (!isTerminal(task.status)) continue;
-      if (task.notified === true || task.outputConsumed === true) continue;
+      if (task.notified === true || task.outputConsumed === true || task.consumedAt !== undefined) continue;
       if (task.metadata.notifyOnCompletion === false) continue;
       if ((task.notifyAttempts ?? 0) >= maxAttempts) continue;
       if (now - (task.finishedAt ?? task.createdAt) > maxAgeMs) continue;

@@ -2,6 +2,67 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.3 — 2026-11-17（一个终态只播报一次；hold 可被 Esc 打断）
+
+两个主题。一是**同一个终态被重复播报**：hold 期间完成的任务先收到 `async-task-settle-results`（当场、in-run），
+38~50 秒后又收到 `async-task-notification`（宿主把流式期间的 `followUp` 压到模型停止后才投递），
+表现为「迟到的重复回执」，还会白烧一个 turn；同一机制在模型已用 `async_wait` 收下结果时再犯一次
+（实测 `2026-11-17T02-35-00-296Z_01a1e75b`：wait 之后 85–138 秒又收到通知）。二是**hold 拦住用户**：
+按 Esc 无效、界面 working 行静止像死机，只能等预算或强退。
+
+### Fixed（同一任务只播报一次）
+
+- **hold 期间由 results entry 独占播报**：hold 真正在等待时改用 `HoldNotificationRelay`
+  （`src/guard/hold-notify.ts`）接管快照内任务的终态播报权——`onFinalize` 不再为这些 id 发送通知，
+  而是扣住；hold 全部终态时由 results entry 独占播报并对这些 id 落 `notified = true`（`resendUnnotified`
+  不会在下次 `session_start` 再播一遍），超时/`dispose`/registry 抛错等其它出口立即把通知交还给
+  正常路径（**永不吞掉完成通知**）。顺序问题不是竞态：pi 在 `isStreaming` 时只把 `followUp` 入队
+  （`agent-session.js:1959-1962`），要到模型停止时才投递（`agent-loop.js:196-203`），而边界 draft
+  同步落盘（`agent-session.js:560-574`），所以 results 必先到、通知必后到。实测会话 `01a1e5b5`：
+  ln393→ln404 相差 49.586s、ln432→ln441 相差 38.226s，模型自述「重复回执／迟到回执」。
+- **settle advisory 不再笼统承诺唤醒**（CONTRACT §17 修订 1）：只有 `running` + 会通知 + 会起 turn 的
+  任务才说「their completion notifications will wake you」；混合时说明「几个会唤醒、其余用 async_wait 收」，
+  一个都不会唤醒时直接说「None of them will start a new turn」。此前 `notifyOnCompletion: false` 的任务
+  也会被同一句话许诺唤醒。
+
+### Fixed（已消费的终态不再重复通知）
+
+- **单一消费者 latch**（CONTRACT §7.2 / D-15）：`async_wait` 返回的终态行、`async_status` 列表里的
+  终态行、`async_logs` 读到的已终态任务，都会 `registry.markConsumed(taskId)` 写持久化字段
+  `consumedAt`；`claimNotification()` 与 `resendUnnotified()` 跳过已消费任务。只对**终态**行上锁，
+  读 running 任务的部分输出不会静默关掉它的完成通知。
+- **run 活动期间不再提前入队**：`onFinalize` 在 `agent_start` … `agent_settled` 之间只把发送挂进
+  `pendingNotifications`，到 `agent_before_settle`（hold 之后、guard 之前）与 `agent_settled` 再结算；
+  结算时重新检查 latch，已被 `async_wait`/`async_status`/`async_logs` 消费的直接跳过。空闲会话仍
+  立即发送并唤醒（行为不变），`triggerOnCompletion: false` / `notifyOnCompletion: false` 语义不变。
+  没有这条延后，`consumedAt` 来得太晚：0.4.2 在 finalize 就入队，而宿主直到模型停止才投递。
+
+
+### Fixed（hold 拦住用户：无法 Esc、看起来像死机）
+
+- **Esc 现在能立刻退出 hold**（CONTRACT §7.1 修订 4）：pi 对 `agent_before_settle` handler 无超时、
+  无法抢占（`runner.js:767-814`），该边界的 `ctx.signal` 恒为 `undefined`（run 的 AbortController 在
+  `before_settle` 之前已清，`pi-agent-core/dist/agent.js:216-223`），`session.abort()` 只置一个 handler
+  读不到的 flag（`agent-session.js:2073-2084`）。旧版因此只能等预算（最长 10 分钟），用户只能强退。
+  现在 hold 在等待期间订阅 `ui.onTerminalInput`，只识别单独 `\x1b`（方向键/Alt `\x1b[A` 不误判、
+  永不 consume），用 `Promise.race` 打断 sleep → **毫秒级**释放；宿主随后自行 settle 成 aborted
+  并抑制 continuation。
+- **用户入队消息让位**：`ctx.hasPendingMessages()` 为 true（TUI 里 Enter 提交的消息会进 steer 队列）
+  时，hold 在下一个 poll（≈1s）释放，消息由宿主在下一个 turn 投递 —— 不再是「输入石沉大海 10 分钟」。
+  与 0.4.0 删掉的 F2b 探针不矛盾：完成通知走 `agent.followUpQueue`，**不在**该计数里。
+- **hold 期间界面不再像死机**：`agent_end` 在 `before_settle` **之前**就清掉宿主的 working 行
+  （`interactive-mode.js:3060-3064`），而旧版只靠 15s 一次的 footer 文本。hold 现在自带一行 widget：
+  `⠋ waiting for N async task(s) 12s — Esc stops waiting`，每 250ms 换帧、每秒跳时间，`finally` 里清除
+  （不借 `setWorkingVisible`：那是会话级持久状态，会在 settle 后留下永久 spinner）。实测 16s hold 的
+  真实 TUI：widget 重绘 112 次、10 帧全出现；同期 footer 只写了 3 次。
+- **消息顺序不变**：Esc/入队/超时等非「全终态」出口一律**不带 results entry**，并释放被扣住的完成通知，
+  所以 #1 的「一个终态一次播报」在这些路径上同样成立（新增用例同时断言两件事）。
+
+### Changed
+
+- CONTRACT §7.1 修订 3 / D-14：`不抑制通知` 改为「hold 拥有快照内终态播报权」，并明确两条出口的归属规则。
+  legion child 语义不变（§7 原样：child 不 hold，仍走自己的有界 settle reminder）。
+
 ## 0.4.2 — 2026-11-12（suspend 后的幽灵 running 任务）
 
 主题是**退役的那一代能自己回来**：宿主 retire 了扩展却没有下一代时，async 不再永久不可用。

@@ -214,6 +214,35 @@ test("PI_ASYNC_SETTLE_GUARD=0 registers nothing at all", () => {
   });
 });
 
+test("the advisory only promises a wake-up for tasks that really wake (§17 修订 1)", () => {
+  withNodeId(undefined, () => {
+    // Mixed: one wakeable task and one that never notifies. The frozen sentence may not be used,
+    // because "their completion notifications will wake you" would be false for the second one.
+    const mixed = [
+      makeSnapshot({ taskId: "wakes-1", metadata: {} }),
+      makeSnapshot({ taskId: "silent-1", metadata: { notifyOnCompletion: false } }),
+    ];
+    const first = makePi();
+    new SettleGuard(first.pi as never, makeRegistry({ tasks: () => mixed }) as never).register();
+    const mixedDraft = (first.fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined)?.entries?.at(-1);
+    assert.match(String(mixedDraft?.content), /wakes-1/);
+    assert.match(String(mixedDraft?.content), /1 of them will wake you/);
+    assert.match(String(mixedDraft?.content), /async_wait/);
+    assert.doesNotMatch(String(mixedDraft?.content), /their completion notifications will wake you/);
+
+    // Nothing will wake the session at all (no notification, or no turn).
+    for (const metadata of [{ notifyOnCompletion: false }, { triggerOnCompletion: false }]) {
+      const none = makePi();
+      new SettleGuard(none.pi as never, makeRegistry({ tasks: () => [makeSnapshot({ taskId: "quiet-1", metadata })] }) as never).register();
+      const quiet = (none.fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined)?.entries?.at(-1);
+      assert.equal(
+        String(quiet?.content),
+        "1 async task(s) still running: quiet-1. None of them will start a new turn; collect them with async_wait if you need one now.",
+      );
+    }
+  });
+});
+
 test("main sessions get one advisory draft without continue, re-armed per run (D-C6)", () => {
   withNodeId(undefined, () => {
     const tasks = [makeSnapshot({ taskId: "live-1" })];

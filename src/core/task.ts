@@ -118,4 +118,10 @@ export interface TaskSnapshot {
   remindCount?: number;
   /** Process liveness seen when the snapshot was produced (false once finalized). */
   processAlive?: boolean;
+  /**
+   * 0.4.3 (CONTRACT §7.2): the terminal state was already handed to the model by a tool that
+   * returned it (`async_wait` / `async_status` / `async_logs`). One terminal event is told once, to
+   * exactly one consumer — a consumed task never produces a completion notification.
+   */
+  consumedAt?: number;
 }

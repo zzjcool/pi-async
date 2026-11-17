@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { init } from "../extensions/index.ts";
 import { registerHold } from "../src/guard/hold.ts";
+import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
@@ -383,11 +384,14 @@ test("init registers the hold before the settle guard on agent_before_settle", a
     try {
       await init(pi as never);
       const beforeSettle = handlers.get("agent_before_settle") ?? [];
-      assert.equal(beforeSettle.length, 2, "hold + guard both listen on the boundary");
-      // The hold handler is async (it may sleep); the guard's is sync. Order = registration order.
+      assert.equal(beforeSettle.length, 3, "hold + notification flush + guard listen on the boundary");
+      // The hold handler is async (it may sleep); the other two are sync. Order = registration order:
+      // the flush must see a task the results entry already latched `notified` (CONTRACT §7.2).
       const first = beforeSettle[0]({ entries: [] }, { mode: "tui" });
       assert.ok(first instanceof Promise, "the hold is registered before the settle guard");
-      assert.equal(beforeSettle[1]({ entries: [] }), undefined, "the guard runs after the hold, unchanged");
+      assert.match(String(beforeSettle[1]), /flushPendingNotifications/, "the deferred notifications are decided between hold and guard");
+      assert.equal(beforeSettle[1]({ entries: [] }), undefined, "the flush adds no entries");
+      assert.equal(beforeSettle[2]({ entries: [] }), undefined, "the guard runs after the hold, unchanged");
       assertBareResult(await first);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -647,4 +651,223 @@ test("a hold still resolves in a process with no other live handles (no unref'd 
     { encoding: "utf8", timeout: 20_000 },
   );
   assert.match(output, /HOLD_SETTLED:true/);
+});
+
+/**
+ * 0.4.2 regression (#2/#3): a hold the user cannot interrupt.
+ *
+ * `agent_before_settle` handlers are awaited by pi with **no timeout** (`runner.js:782`), the run
+ * cannot become idle before the handler returns (`session.abort()` awaits `waitForIdle`,
+ * `agent-session.js:2073-2084`), and the run's `AbortController` is already gone at this boundary —
+ * `agent-session.js:1514` awaits `agent.prompt()`, whose `finally` calls `finishRun()`
+ * (`agent.js:380-386`) before `_runBeforeSettleBoundary()` runs at `agent-session.js:1521`, so
+ * `ctx.signal` is `undefined` and `agent.abort()` (`agent.js:221-223`) is a no-op there. The two
+ * channels below are the ones that do work: raw terminal input (lone Esc) and the user's queued text.
+ * These tests therefore never hand a `signal` to the hold — the hold has no signal channel at all.
+ */
+
+/** A TUI ctx that exposes the raw-input subscription and records every progress widget write. */
+function makeInteractiveCtx(options: { queued?: () => boolean } = {}) {
+  const widgets: Array<{ key: string; content?: string[]; placement?: unknown }> = [];
+  let press: ((data: string) => undefined) | undefined;
+  /** What every raw-input handler call returned; pi-tui treats `{consume:true}` as a swallow. */
+  const returns: unknown[] = [];
+  let subscribed = 0;
+  let unsubscribed = 0;
+  const ctx = {
+    mode: "tui",
+    ...(options.queued ? { hasPendingMessages: options.queued } : {}),
+    ui: {
+      setStatus: () => undefined,
+      setWidget: (key: string, content: string[] | undefined, opts?: unknown) => {
+        widgets.push({ key, content, placement: (opts as { placement?: unknown } | undefined)?.placement });
+      },
+      onTerminalInput: (handler: (data: string) => undefined) => {
+        subscribed++;
+        press = handler;
+        return () => {
+          unsubscribed++;
+          press = undefined;
+        };
+      },
+    },
+  };
+  return {
+    ctx,
+    widgets,
+    press: (data: string) => {
+      const result = press?.(data);
+      returns.push(result);
+      return result;
+    },
+    returns: () => returns,
+    hasListener: () => press !== undefined,
+    subscribed: () => subscribed,
+    unsubscribed: () => unsubscribed,
+    progress: () => widgets.filter((entry) => entry.key === "pi-async-hold"),
+  };
+}
+
+test("Esc releases the hold immediately instead of waiting for the budget (no host abort signal)", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = makeRegistry(() => [running("A")]);
+    // A 5 s poll and a 60 s budget: only the Esc channel can make this test finish quickly.
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 5_000 });
+    const interactive = makeInteractiveCtx();
+
+    const started = performance.now();
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(interactive.subscribed(), 1, "the hold subscribes to raw terminal input while it waits");
+
+    // Arrow keys / Alt sequences also start with ESC and must NOT end the hold.
+    interactive.press("\x1b[A");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(settled, false, "\\x1b[A is an arrow key, not Esc");
+
+    interactive.press("\x1b");
+    const result = await pending;
+    const elapsed = performance.now() - started;
+    assertBareResult(result);
+    assert.ok(elapsed < 1000, `Esc must not wait for the 5 s poll or the budget (took ${Math.round(elapsed)}ms)`);
+    assert.equal(interactive.hasListener(), false, "the raw input listener is released when the hold ends");
+    assert.equal(interactive.unsubscribed(), 1);
+  });
+});
+
+test("a message the user queued during the hold releases it on the next poll", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = sequenceRegistry([[running("A")], [running("A")], [running("A")]]);
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 20 });
+    let queued = false;
+    const interactive = makeInteractiveCtx({ queued: () => queued });
+
+    const started = performance.now();
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    queued = true;
+    const result = await pending;
+    const elapsed = performance.now() - started;
+
+    assertBareResult(result);
+    assert.ok(elapsed < 1000, `the queued message ends the hold within a poll (took ${Math.round(elapsed)}ms)`);
+    assert.ok(registry.calls() <= 4, "the hold does not keep polling after the user spoke");
+  });
+});
+
+test("a message already queued when the boundary opens means no hold at all", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = makeRegistry(() => [running("A")]);
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 5000 });
+    const interactive = makeInteractiveCtx({ queued: () => true });
+
+    const started = performance.now();
+    assertBareResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+    assert.ok(performance.now() - started < 100, "no poll at all: settle immediately");
+    assert.equal(registry.calls(), 1, "the opening snapshot is the only read");
+  });
+});
+
+test("the hold renders a live progress row and clears it when it ends (§7.1 修订 4)", async () => {
+  await withEnv(CLEAN, async () => {
+    // Six running polls of 120 ms: long enough for the 250 ms frame ticker to advance at least twice.
+    const { pi, fireOne } = makePi();
+    const registry = sequenceRegistry([[running("A")], [running("A")], [running("A")], [running("A")], [running("A")], [running("A")], []]);
+    registerHold(pi as never, registry as never, { holdMs: 5000, pollMs: 120 });
+    const interactive = makeInteractiveCtx();
+
+    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    const rows = interactive.progress();
+    assert.ok(rows.length >= 3, `the row keeps ticking while the hold waits (got ${rows.length} writes)`);
+    assert.equal(rows[0]?.placement, "aboveEditor");
+    assert.match(String(rows[0]?.content?.[0]), /^⠋ waiting for 1 async task 0s — Esc stops waiting$/);
+    const frames = new Set(rows.map((row) => String(row.content?.[0] ?? "").charAt(0)));
+    assert.ok(frames.size >= 2, `the spinner really animates (frames: ${[...frames].join("")})`);
+    assert.ok(rows.some((row) => /waiting for 1 async task \d+s/.test(String(row.content?.[0]))), "elapsed seconds are shown");
+    assert.equal(rows.at(-1)?.content, undefined, "the row is removed when the hold ends");
+  });
+});
+
+test("an interrupting hold releases the intercepted notification exactly once", async () => {
+  await withEnv(CLEAN, async () => {
+    // The #1 ownership rule must survive #3: a bare (interrupted) exit hands the notification back,
+    // so the completion is announced by the notification and by nothing else.
+    const relay = new HoldNotificationRelay();
+    const { pi, fireOne } = makePi();
+    const registry = sequenceRegistry([[running("A")], [running("A")]]);
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 5000, notify: relay });
+    const interactive = makeInteractiveCtx();
+
+    let sent = 0;
+    assert.equal(relay.claim("A", () => { sent++; }), false, "nothing is owned before the hold opens");
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(relay.claim("A", () => { sent++; }), true, "the hold owns the completion while it waits");
+    interactive.press("\x1b");
+    assertBareResult(await pending);
+    assert.equal(sent, 1, "the interrupted hold releases the send instead of dropping it");
+  });
+});
+
+test("the Esc listener never consumes the keystroke, so pi still runs its own abort", async () => {
+  await withEnv(CLEAN, async () => {
+    // pi-tui feeds `inputListeners` before the focused component (`tui.js:719-731`). A handler that
+    // returned `{consume:true}` would swallow the Esc, so pi's own
+    // `restoreQueuedMessagesToEditor({abort:true})` → `_abortDuringBeforeSettle = true`
+    // (`agent-session.js:2073-2084`) would never run and the run would settle as a normal
+    // continuation instead of an aborted one — exactly the "looks fixed, breaks the host" trap.
+    const { pi, fireOne } = makePi();
+    const registry = sequenceRegistry([[running("A")], [running("A")]]);
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 5000 });
+    const interactive = makeInteractiveCtx();
+
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // An arrow key first: it must be passed through untouched as well.
+    assert.equal(interactive.press("\x1b[A"), undefined, "a non-Esc sequence is passed through unchanged");
+    interactive.press("\x1b");
+    assertBareResult(await pending);
+    assert.deepEqual(
+      interactive.returns(),
+      [undefined, undefined],
+      "every raw-input handler call returns undefined: the hold never consumes the keystroke",
+    );
+  });
+});
+
+test("the hold never reads ctx.signal, because that channel is dead at this boundary", async () => {
+  await withEnv(CLEAN, async () => {
+    // Regression guard against re-adding the phantom channel: on pi 1.5.2 `activeRun` is already
+    // cleared when `agent_before_settle` runs, so `ctx.signal` is `undefined` and an abort listener
+    // on it can never fire. A TrapSignal fails the test if the hold touches it at all.
+    const touched: string[] = [];
+    const trap = {
+      get aborted(): boolean {
+        touched.push("aborted");
+        return false;
+      },
+      addEventListener: () => {
+        touched.push("addEventListener");
+      },
+      removeEventListener: () => undefined,
+    };
+    const { pi, fireOne } = makePi();
+    const registry = sequenceRegistry([[running("A")], [running("A")]]);
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 20 });
+    const interactive = makeInteractiveCtx();
+    const ctxWithTrap = { ...interactive.ctx, signal: trap };
+
+    const pending = fireOne("agent_before_settle", { entries: [] }, ctxWithTrap) as Promise<unknown>;
+    assert.equal(interactive.hasListener(), true, "the hold armed its raw-input channel synchronously");
+    interactive.press("\x1b");
+    assertBareResult(await pending);
+    assert.deepEqual(touched, [], "the hold must not probe a signal that is undefined on the real host");
+  });
 });

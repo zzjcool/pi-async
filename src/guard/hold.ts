@@ -3,6 +3,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import { isTerminal, type TaskSnapshot } from "../core/task.ts";
 import { formatElapsedMs } from "../core/duration.ts";
 import { envNumber } from "../core/env.ts";
+import type { HoldNotificationRelay } from "./hold-notify.ts";
 
 /** Default upper bound for one hold (D-5 / D-9): ten minutes. */
 const DEFAULT_HOLD_MS = 600_000;
@@ -17,6 +18,47 @@ const DEFAULT_FOOTER_REFRESH_MS = 15_000;
 const FOOTER_KEY = "pi-async-hold";
 
 /**
+ * Progress surface (0.4.3, §7.1 修订 4).
+ *
+ * pi clears its own working row on `agent_end` (`interactive-mode.js:3060-3064`), which fires
+ * *before* `agent_before_settle` — so during a hold the screen looks idle and the user cannot tell
+ * whether anything is happening. The native working row cannot be borrowed: `setWorkingVisible`
+ * persists in the session and nothing clears it after a settle that re-shows it. An extension
+ * widget is self-owned and cancelled in `finally`, so it is the safe surface.
+ */
+const WIDGET_KEY = "pi-async-hold";
+const PROGRESS_FRAME_MS = 250;
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/**
+ * Why the hold may leave early (0.4.3, D-5 修订 3): the user always wins over the wait.
+ *
+ * 0.4.2 had exactly two exits (all terminal / budget) and deliberately no early-release heuristic.
+ * The two channels that may end a hold early are:
+ *
+ * - `ctx.hasPendingMessages()` **is** true for user text queued while the run streams (TUI Enter →
+ *   `_queueSteer`, `interactive-mode.js:2824-2831` → `agent-session.js:1880`); the host's own
+ *   notification path never touches those mirrors (`agent-session.js:1959-1965`). It counts
+ *   steering+followUp only (`agent-session.js:2056-2058`), and Esc's `clearAllQueues()` runs before
+ *   `abort()`, so this is a "the user submitted text" probe — never an "Esc was pressed" probe.
+ * - A lone Esc, through `ui.onTerminalInput` — a real, documented extension API
+ *   (`types.d.ts:92-93` "Listen to raw terminal input (interactive mode only)" →
+ *   `interactive-mode.js:2177` → `:2135-2141` → pi-tui `tui.js:605-610`). The listener runs before
+ *   the focused component's `handleInput` (`tui.js:719-731`), so it sees the keystroke even while
+ *   the hold is what the run is blocked on.
+ *
+ * There is deliberately **no** `ctx.signal` channel: at this boundary it is always `undefined`.
+ * `agent-session.js:1514` awaits `agent.prompt()`, whose `runWithLifecycle` `finally` calls
+ * `finishRun()` (`pi-agent-core/dist/agent.js:380-386`) → `activeRun = undefined`; only afterwards,
+ * at `agent-session.js:1521`, does `_runBeforeSettleBoundary()` run. So `agent.js:217 get signal()`
+ * yields `undefined` (`types.d.ts:258-259` types it `AbortSignal | undefined`) and `agent.abort()`
+ * (`agent.js:221-223`) is a no-op here. Esc's only host-side effect at this boundary is
+ * `_abortDuringBeforeSettle = true` (`agent-session.js:2080-2081`), which suppresses the
+ * continuation and is not observable by the handler. Do not re-add a signal listener: it would
+ * never fire and would only mislead the next reader.
+ */
+
+/**
  * The slice of pi's event ctx this module reads.
  *
  * `ctx` may be missing entirely (old hosts, mocks), so every field is optional and read behind
@@ -24,7 +66,13 @@ const FOOTER_KEY = "pi-async-hold";
  */
 type HoldContext = {
   mode?: unknown;
-  ui?: { setStatus?: (key: string, text: string | undefined) => void };
+  ui?: {
+    setStatus?: (key: string, text: string | undefined) => void;
+    setWidget?: (key: string, content: string[] | undefined, options?: unknown) => void;
+    onTerminalInput?: (handler: (data: string) => undefined) => unknown;
+  };
+  /** True while the user has text queued for this run (steer/follow-up). Not a notification probe. */
+  hasPendingMessages?: () => unknown;
 };
 
 /** The slice of pi's `AgentBeforeSettleEvent` this module reads; `entries` may be absent. */
@@ -125,7 +173,7 @@ function sleep(ms: number): Promise<void> {
 export function registerHold(
   pi: PiCtx,
   registry: TaskRegistry,
-  opts?: { holdMs?: number; pollMs?: number; footerRefreshMs?: number },
+  opts?: { holdMs?: number; pollMs?: number; footerRefreshMs?: number; notify?: HoldNotificationRelay },
 ): () => void {
   // D-2: `PI_ASYNC_HOLD=0` disarms the feature entirely — it registers nothing at all.
   if (process.env.PI_ASYNC_HOLD === "0") return () => undefined;
@@ -136,6 +184,10 @@ export function registerHold(
   const pollMs = Math.max(1, opts?.pollMs ?? envNumber("PI_ASYNC_HOLD_POLL_MS", DEFAULT_POLL_MS, { integer: true, min: 50 }));
   // D-8 / F5: injectable so a test can pin the refresh cadence without waiting 15 s.
   const footerRefreshMs = Math.max(1, opts?.footerRefreshMs ?? DEFAULT_FOOTER_REFRESH_MS);
+  // CONTRACT §7.1 修订 3: while a hold really waits, it owns the terminal events in its snapshot —
+  // the results entry is committed in-run, the notification would arrive as a later-turn followUp
+  // and announce the same completion twice. Absent relay (library use, tests) keeps 0.4.2 wiring.
+  const notify = opts?.notify;
 
   let disposed = false;
   /** D-3 #5: at most one hold per run; `agent_start` re-arms it. */
@@ -168,6 +220,46 @@ export function registerHold(
   };
 
   /**
+   * §7.1 修订 4: the visible "still working" row. A frame of `SPINNER_FRAMES` changes every
+   * `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the elapsed seconds tick with it.
+   * Purely cosmetic: every failure is swallowed like the footer (D-8).
+   */
+  const setProgress = (ctx: HoldContext | undefined, count: number, elapsedMs: number, tick: number): void => {
+    try {
+      const ui = ctx?.ui;
+      const setWidget = ui?.setWidget;
+      if (typeof setWidget !== "function") return;
+      const frame = SPINNER_FRAMES[tick % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
+      const line = `${frame} waiting for ${count} async task${count === 1 ? "" : "s"} ${formatElapsedMs(elapsedMs)} — Esc stops waiting`;
+      // SAFETY: `setWidget` is optional and may reject a placement; the call is inside the guard.
+      setWidget.call(ui, WIDGET_KEY, [line], { placement: "aboveEditor" });
+    } catch {
+      // Cosmetic only: an old host without setWidget must not end the hold.
+    }
+  };
+
+  const clearProgress = (ctx: HoldContext | undefined): void => {
+    try {
+      const ui = ctx?.ui;
+      const setWidget = ui?.setWidget;
+      if (typeof setWidget !== "function") return;
+      setWidget.call(ui, WIDGET_KEY, undefined);
+    } catch {
+      // Best-effort cleanup: never fatal.
+    }
+  };
+
+  /** True only while the user has text queued for this run; never true for a notification. */
+  const userIsWaiting = (ctx: HoldContext | undefined): boolean => {
+    try {
+      const probe = ctx?.hasPendingMessages;
+      return typeof probe === "function" && probe.call(ctx) === true;
+    } catch {
+      return false; // a stale ctx getter must not end (or fail) the hold
+    }
+  };
+
+  /**
    * D-6 (修订 1 / F2a, 修订 2): terminal rows for the snapshot ids, read from history when the
    * registry can still provide it. Only rows that are actually terminal are returned: a missing
    * record yields no row at all, so the results line can never claim `A (running)` as finished.
@@ -185,17 +277,22 @@ export function registerHold(
   /**
    * D-5 main loop. Returns `true` only when every task in the snapshot is terminal.
    *
-   * Exactly two exits (修订 2): everything terminal, or the budget ran out. There is deliberately
-   * no early-release heuristic — `ctx.hasPendingMessages()` counts the session-level user queues
-   * (`_steeringMessages + _followUpMessages`), while a completion notification queued during the
-   * hold goes through `agent.followUp()` (`agent-session.js:1924-1926` vs `:1877`) and is NOT in
-   * that count. The probe reads `false` on the normal path, so a heuristic built on it ended a
-   * multi-task hold right after the first task finished — dropping the results entry and the
-   * `continue` that the normal path exists to deliver.
+   * Exits (0.4.2 had two; 修订 3 adds the interactive ones — the block comment “Why the hold may
+   * leave early” above documents why the old "no early-release heuristic" rule does not apply):
+   *
+   * 1. every task terminal → the results entry owns the completion;
+   * 2. the budget ran out → bare settle, exactly as without the hold;
+   * 3. the user pressed Esc → bare settle **now**, observed through `ui.onTerminalInput` (never wait
+   *    for the budget: the host cannot preempt this handler, and the run cannot become idle until it
+   *    returns). The keystroke is never consumed, so pi still runs its own abort;
+   * 4. the user queued a message → bare settle, so the host delivers it on the next turn;
+   * 5. dispose / a throwing registry → bare settle.
+   *
+   * Every non-1 exit releases the intercepted notifications, so the completion is never lost.
    *
    * `ids` is the snapshot taken when the boundary opened — a task started while we wait is not ours
-   * to wait for. Nothing here touches task state, output, or `notified` (D-7); only `registry.list`
-   * is read, and a throw from it (registry suspended/shut down under us) ends the hold.
+   * to wait for. Nothing here changes task state or consumes output (D-7); only `registry.list` is
+   * read, and a throw from it (registry suspended/shut down under us) ends the hold.
    *
    * The budget runs on `performance.now()` (monotonic, 修订 1 / F4) so a wall-clock jump can never
    * stretch a hold past `holdMs`.
@@ -203,14 +300,53 @@ export function registerHold(
   const holdUntilSettled = async (ctx: HoldContext | undefined, ids: string[]): Promise<boolean> => {
     const startedAt = performance.now();
     let waiting = ids.length;
+
+    let interrupted = false;
+    let wake = (): void => undefined;
+    const interruptedPromise = new Promise<void>((resolve) => { wake = resolve; });
+    const interrupt = (): void => {
+      if (interrupted) return;
+      interrupted = true;
+      wake();
+    };
+
+    // 修订 3: the one host channel that can carry "the user pressed Esc" out of this boundary. It is
+    // optional and guarded — a host without it keeps the 0.4.2 behaviour (budget only).
+    const detach: Array<() => void> = [];
+    try {
+      const ui = ctx?.ui;
+      const onTerminalInput = ui?.onTerminalInput;
+      if (typeof onTerminalInput === "function") {
+        // A lone ESC (0x1b). Arrow/Alt keys arrive as `\x1b[A` / `\x1b a`, so they stay untouched;
+        // nothing is ever consumed, the host keeps its own Esc meaning (`abort()` → run aborted).
+        const off = onTerminalInput.call(ui, (data: string) => {
+          if (data === "\x1b") interrupt();
+          return undefined;
+        });
+        if (typeof off === "function") detach.push(off as () => void);
+      }
+    } catch { /* non-interactive host: no raw input */ }
+
     setFooter(ctx, waiting, 0);
+    setProgress(ctx, waiting, 0, 0);
+    let tick = 0;
     const refresh = setInterval(() => setFooter(ctx, waiting, performance.now() - startedAt), footerRefreshMs);
     refresh.unref?.();
+    const progress = setInterval(() => setProgress(ctx, waiting, performance.now() - startedAt, ++tick), PROGRESS_FRAME_MS);
+    progress.unref?.();
     try {
+      // A message queued before the hold opened is the same signal as one queued during it.
+      if (interrupted || userIsWaiting(ctx)) return false;
       while (performance.now() - startedAt < holdMs) {
-        // Never sleep past the deadline: the total cost stays holdMs + one poll (D-6).
-        await sleep(Math.min(pollMs, holdMs - (performance.now() - startedAt)));
+        // Never sleep past the deadline: the total cost stays holdMs + one poll (D-6). Race the
+        // sleep against the interrupt so Esc is honoured in milliseconds, not a poll interval.
+        await Promise.race([
+          sleep(Math.min(pollMs, holdMs - (performance.now() - startedAt))),
+          interruptedPromise,
+        ]);
         if (disposed) return false;
+        if (interrupted) return false; // Esc (lone \x1b on the raw-input channel): settle now
+        if (userIsWaiting(ctx)) return false; // the user is waiting for this turn to end
         let stillLive: TaskSnapshot[];
         try {
           stillLive = registry.list({ includeHistory: false }).filter((task) => ids.includes(task.taskId));
@@ -224,7 +360,12 @@ export function registerHold(
       return false; // timeout: the run settles exactly as it would have without the hold (D-6).
     } finally {
       clearInterval(refresh);
+      clearInterval(progress);
+      clearProgress(ctx);
       clearFooter(ctx);
+      for (const off of detach.splice(0)) {
+        try { off(); } catch { /* the host ctx may already be stale */ }
+      }
     }
   };
 
@@ -248,9 +389,13 @@ export function registerHold(
       // must not burn the run's single hold.
       heldThisGeneration = true;
       const ids = candidates.map((task) => task.taskId);
+      // Arm ownership before the first poll: `onFinalize` for these ids runs in the same tick the
+      // process exits, always before the poll that observes the terminal state can look.
+      notify?.open(ids);
       if (!(await holdUntilSettled(context, ids))) {
         // Timeout, disposal or a throwing registry: settle as before, with no entries and no
-        // `continue` (D-6).
+        // `continue` (D-6) — and hand any intercepted completion back to its normal sender.
+        notify?.release();
         return undefined;
       }
       // D-6 normal path: every task in the snapshot is terminal, so hand the outcome back and let
@@ -263,11 +408,22 @@ export function registerHold(
         // really observed as terminal (never the opening snapshot's `running`).
         content: resultsSummary(ids.length, terminalSnapshots(ids)),
       };
+      // CONTRACT §7.1 修订 3: the entry below is the one announcement of these terminal states, so
+      // the deferred notifications are dropped — and latched, or `resendUnnotified` would announce
+      // them again on the next `session_start`. The latch is guarded because library/mock registries
+      // need not implement it (the real one does: `registry.ts:867`).
+      for (const taskId of notify?.commit(ids) ?? []) {
+        try {
+          if (typeof registry.markNotified === "function") registry.markNotified(taskId);
+        } catch { /* the entry already reached the transcript; a failed latch only risks a resend */ }
+      }
       // Any drafts pi already queued for this boundary stay in front of ours.
       const queued = (event as BeforeSettleEvent | undefined)?.entries;
       return { entries: [...(Array.isArray(queued) ? queued : []), results], continue: true };
     } catch {
-      // D-6: the hold is a courtesy — any failure lets the turn settle exactly as it would have.
+      // D-6: the hold is a courtesy — any failure lets the turn settle exactly as it would have,
+      // and a notification it intercepted goes back to its normal sender instead of being lost.
+      try { notify?.release(); } catch { /* the release path is itself best-effort */ }
       return undefined;
     }
   };
@@ -276,6 +432,9 @@ export function registerHold(
     // Idempotent: a second call (and a late `session_shutdown`) is a no-op.
     if (disposed) return;
     disposed = true;
+    // A hold still in flight resolves through `holdUntilSettled` and releases its own deferrals;
+    // a hold that was never armed leaves nothing here. Belt and braces: never lose a notification.
+    notify?.release();
     for (const unsubscribe of unsubscribers.splice(0)) {
       try { unsubscribe(); } catch { /* best effort: the host ctx may already be stale */ }
     }
