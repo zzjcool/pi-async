@@ -6,6 +6,7 @@ import { envNumber } from "../core/env.ts";
 // SAFETY: `tui/width.ts` is a pure text utility (no TUI/host imports), so the guard layer may share
 // it instead of duplicating the CJK cell-width rules — the deps still point one way (tui → core).
 import { displayWidth, truncateToWidth } from "../tui/width.ts";
+import { isRailRegistered } from "../tui/surfaces.ts";
 import type { HoldNotificationRelay } from "./hold-notify.ts";
 
 /** Default upper bound for one hold (D-5 / D-9): ten minutes. */
@@ -102,6 +103,18 @@ function fitTaskList(tasks: TaskSnapshot[], budget: number): string {
     return `${truncateToWidth(items[0]!, Math.max(1, budget - displayWidth(marker)))}${marker}`;
   }
   return `${text} +${hidden} more`;
+}
+
+/**
+ * The 0.4.5 detail row: count, every waiting task's `name (status, elapsed)`, the Esc hint — used
+ * only when no rail is on screen (§7.1 修订 6). With a rail, repeating this here duplicated the
+ * rail's own `▶ name · state · elapsed` rows and put three lines of the same fact in one terminal.
+ */
+function detailedRow(frame: string, tasks: TaskSnapshot[], elapsed: string, width: number, tail: string): string {
+  const count = tasks.length;
+  const head = `${frame} ${count} async task${count === 1 ? "" : "s"} ${elapsed}`;
+  const body = fitTaskList(tasks, width - displayWidth(`${head} — `) - displayWidth(tail));
+  return body.length > 0 ? `${head} — ${body}${tail}` : `${head}${tail}`;
 }
 
 /**
@@ -294,14 +307,16 @@ export function registerHold(
   };
 
   /**
-   * §7.1 修订 4 / 修订 5: the visible "still working" row. A frame of `SPINNER_FRAMES` changes
-   * every `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the elapsed seconds tick with
-   * it.
+   * §7.1 修订 4 / 修订 5 / 修订 6: the visible "still working" row. A frame of `SPINNER_FRAMES`
+   * changes every `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the elapsed seconds
+   * tick with it.
    *
-   * 修订 5 adds the part the user missed: *which* tasks are being waited for. A count alone cannot
-   * be acted on — the user cannot tell "my watch is still running" from "some unrelated probe is
-   * hanging" — so the row lists every task as `name (status, elapsed)`, truncated to the terminal
-   * and summarised as `+N more`. It stays **one** line: a wrapping row would jitter the editor.
+   * 修订 5 listed the waiting tasks here (0.4.5); 修订 6 takes that back out when a rail is on
+   * screen — the rail's own rows already carry `name · state · elapsed`, so naming them twice said
+   * the same thing twice. What the rail cannot show is **how long this turn has been held**, which
+   * is a different number from any task's duration, so that is all the row says now. Without a rail
+   * (a host without `setWidget`) the 0.4.5 detail row remains the fallback: there the row is the
+   * only place the tasks are visible at all.
    *
    * Purely cosmetic: every failure is swallowed like the footer (D-8).
    */
@@ -311,12 +326,12 @@ export function registerHold(
       const setWidget = ui?.setWidget;
       if (typeof setWidget !== "function") return;
       const frame = SPINNER_FRAMES[tick % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
-      const count = tasks.length;
-      const head = `${frame} ${count} async task${count === 1 ? "" : "s"} ${formatElapsedMs(elapsedMs)}`;
+      const elapsed = formatElapsedMs(elapsedMs);
       const tail = " — Esc stops waiting";
       const width = terminalColumns();
-      const body = fitTaskList(tasks, width - displayWidth(`${head} — `) - displayWidth(tail));
-      const line = body.length > 0 ? `${head} — ${body}${tail}` : `${head}${tail}`;
+      const line = isRailRegistered()
+        ? `${frame} waiting ${elapsed}${tail}`
+        : detailedRow(frame, tasks, elapsed, width, tail);
       // Belt and braces: the budget above already fits, and an ellipsis here is still better than a
       // row the host wraps (the pathological case is a terminal narrower than the fixed wording).
       const clamped = displayWidth(line) > width ? truncateToWidth(line, width) : line;

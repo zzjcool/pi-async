@@ -294,14 +294,24 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
      下一个 turn 投递它。与已废弃的 F2b 探针的区别：完成通知走 `agent.followUpQueue`，**不在**该计数里
      （`agent-session.js:1959-1965`），所以这个探针对通知永远为 `false`、只对用户文本为 `true`；
   5. `dispose` / registry 抛错 → 原样 `undefined`。
-- **进度可见性（修订 4 / 修订 5）**：`agent_end` 在 `before_settle` **之前**就把宿主的 working 行清掉了
-  （`interactive-mode.js:3060-3064`），hold 期间屏幕看起来像死机。hold 因此自带一行 widget
-  （`setWidget("pi-async-hold", ["<frame> N async task(s) <elapsed> — <name> (<status>, <elapsed>) · … — Esc stops waiting"],
-  { placement: "aboveEditor" })`），每 250ms 换一帧（10 帧 braille），`finally` 里无条件清除。
-  **修订 5（0.4.5）**：只报数量时用户无法分辨「在等的是我的 watch 还是某个无关探针」，所以明细必须带
-  任务名——每项 `name (status, elapsed)`，与模型侧 `<async-state>` 同形（`src/context/nudges.ts:75`）；
-  无名/空白名用 `taskId` 前 8 位；按终端**格宽**截断（CJK 算 2 格，`src/tui/width.ts`），放不下的记
-  `+N more`，**永远单行**（换行会抖动 editor）。footer 仍是 `waiting for N task(s) <elapsed>`，细节只在 widget。
+- **进度可见性（修订 4 / 修订 5 / 修订 6）**：`agent_end` 在 `before_settle` **之前**就把宿主的 working 行清掉了
+  （`interactive-mode.js:3060-3064`），hold 期间屏幕看起来像死机。hold 因此自带一行 widget，每 250ms 换一帧
+  （10 帧 braille），`finally` 里无条件清除。
+  **修订 6（0.4.6）：明细只属于 rail。** rail 已注册（`registerRail` 真的调通了
+  `setWidget("pi-async-rail", …)`，事实记录在 `src/tui/surfaces.ts`，不靠猜）时，hold 行只写
+  `setWidget("pi-async-hold", ["<frame> waiting <hold-elapsed> — Esc stops waiting"], { placement: "aboveEditor" })`
+  ——`<hold-elapsed>` 是**这一轮被 hold 多久**，与任何任务的耗时都不是同一个数字，rail 上也看不到。
+  任务名/状态/耗时由 rail 行承担：0.4.5 把它们搬到 hold 行后，同一终端里汇总行、rail 行、hold 行
+  三行在说同一件事（用户截图报的冗余）。
+  **rail 未注册**（宿主没有 `setWidget`）时退回修订 5 的明细行，因为没有别处能看：
+  `["<frame> N async task(s) <elapsed> — <name> (<status>, <elapsed>) · … — Esc stops waiting"]`，
+  每项与模型侧 `<async-state>` 同形（`src/context/nudges.ts:75`）；无名/空白名用 `taskId` 前 8 位；
+  按终端**格宽**截断（CJK 算 2 格，`src/tui/width.ts`），放不下的记 `+N more`，**永远单行**（换行会抖动 editor）。
+  footer 仍是 `waiting for N task(s) <elapsed>`。两条分支都是 best-effort（D-8）。
+  **不要改成静态符号或中英混排（裁决，0.4.6）**：首字符必须保留 braille 动画帧（`⠋⠙⠹…`，250ms/帧）——
+  `agent_end` 已清掉宿主 working 行，静止的符号（如 `⏸`）会让 hold 看起来就是死机，换帧是这一行唯一的
+  “还活着”信号；文案必须保持英文（`waiting`）——该行其余部分（`Esc stops waiting`）与全仓 UI 文案
+  均为英文，中英混排会割裂。两点都是有意为之，不是待办。
   不借用 `setWorkingVisible`/`setWorkingMessage`：`workingVisible` 是会话级持久状态，hold 结束后没有
   任何事件会把它收回，会留下永久 spinner。
 - 返回：全部终态 → 追加一条 `custom_message`（`customType: "async-task-settle-results"`、`display: false`、
@@ -375,6 +385,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - **汇总行**：由 `summarySegments`/`formatSummary` 生成，段序为 `▶ N running · N pending · <elapsed> · ✓N · ✗N`；
   `pending` 仅在数量大于 0 时显示；`✓N` 与 `✗N` 对称，均仅在各自数量大于 0 时显示
   （全失败场景不再出现绿色的 `✓0`）；无 running 时 elapsed 为 `—`。
+  **单任务不显示时长（修订 6，0.4.6）**：`running + pending === 1` 时整段 elapsed 省略（`▶ 1 running`），
+  因为 rail 恰好只渲染那一行任务，其行尾耗时就是这个数字；0 个活任务保留 `—`（没有可重复的对象），
+  ≥2 个活任务保留汇总时长（没有单独一行能读到它）。
   `▶` 在 running/pending 非零时为 accent、否则 dim；running 数为 accent，pending/elapsed 为 dim，
   完成数为 success，失败数为 error。宽度不足时优先移除可选段并 truncate，再上色。汇总行不可点击。
   running/pending 始终计数；完成数与 failed/killed 失败数仅统计通过 `/async-clear` 共享 watermark 的终态任务。

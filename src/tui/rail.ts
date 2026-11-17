@@ -4,6 +4,7 @@ import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
 import { inRailWindow, railLingerMs, railWindowCounts, summarySegments, type SummaryCounts } from "./status.ts";
+import { markRailRegistered } from "./surfaces.ts";
 import { displayWidth, truncateToWidth } from "./width.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
@@ -233,5 +234,8 @@ export function registerRail(pi: PiCtx, registry: TaskRegistry): void {
   const bound = tuiHost();
   if (!bound) return;
   const setWidget = bound.ui["setWidget"] as ((key: string, factory: ReturnType<typeof createRailFactory> | undefined, options?: { placement: "aboveEditor" }) => void) | undefined;
-  setWidget?.("pi-async-rail", createRailFactory(pi, registry, { onOpenTask: (id) => openPanel(pi, registry, id) }), { placement: "aboveEditor" });
+  if (typeof setWidget !== "function") return; // no widget surface → no rail → the hold keeps naming tasks
+  setWidget("pi-async-rail", createRailFactory(pi, registry, { onOpenTask: (id) => openPanel(pi, registry, id) }), { placement: "aboveEditor" });
+  // §7.1 修订 6: only a rail that the host actually accepted may suppress the hold row's detail.
+  markRailRegistered();
 }

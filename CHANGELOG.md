@@ -2,6 +2,23 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.6 — 2026-11-17（明细只在 rail：hold 行与汇总行不再重复任务信息）
+
+0.4.5 把「在等哪些任务」搬进了 hold 等待条，结果同一个终端里三行在说同一件事：
+`▶ 1 running · 7m 19s`（汇总行）、`▶ watch-t4q-yamlfix · running · 7m 19s`（rail 行）、
+`⠋ 1 async task 7m 13s — watch-t4q-yamlfix (running, 7m 19s) — Esc stops waiting`（hold 行）。
+逐任务明细只有一份来源：**rail**。
+
+### Changed
+
+- **hold 行只保留「这一轮被 hold 多久」**（CONTRACT §7.1 修订 6）：rail 已注册时写
+  `⠋ waiting 7m 13s — Esc stops waiting`——hold 的 elapsed 与任务耗时不是同一个数字，rail 上没有它。
+  **回退**：rail 未注册（宿主没有 `setWidget`）时退回 0.4.5 的带名明细，因为那时没有别处能看。
+  rail 是否注册由 `src/tui/surfaces.ts` 记录的事实标志决定（`registerRail` 真的调通 widget 后才置位），不靠猜。
+- **汇总行在只有一个 running/pending 任务时不再显示时长**（CONTRACT §8）：`▶ 1 running` 就够，
+  那个数字就在唯一那行任务行的行尾；0 个活任务仍显示 `—`，≥2 个仍保留汇总时长（否则没有单行能读到）。
+- rail 行本身不变（它仍是明细来源）。宽度/截断规则不变；两处都是 best-effort（D-8）。
+
 ## 0.4.5 — 2026-11-17（等待条重新显示在等哪些任务）
 
 hold 期间屏幕上唯一的界面行只有 `N async tasks <elapsed>`，用户无法分辨在跑的是自己的 watch 还是某个
