@@ -38,6 +38,19 @@ type MessageHost = {
 const idsOf = (active: TaskSnapshot[]): string => active.map((task) => task.taskId).join(", ");
 
 /**
+ * Whether finishing really starts a new turn for the session (CONTRACT §17 修订 1).
+ *
+ * Same three conditions as the hold's `isHoldable`: a `notifyOnCompletion: false` task never
+ * notifies, a `triggerOnCompletion: false` one notifies without waking, and a `pending`/delayed task
+ * cannot finish inside a turn. Only these tasks may be described as "will wake you".
+ */
+function wakesOnCompletion(task: TaskSnapshot): boolean {
+  return task.status === "running"
+    && task.metadata?.notifyOnCompletion !== false
+    && task.metadata?.triggerOnCompletion !== false;
+}
+
+/**
  * Keeps a legion child from reporting a verdict while async tasks are still in flight.
  *
  * 0.3.0 (D-12) removed the old `setInterval` heartbeat: it only ever wrote
@@ -98,10 +111,19 @@ export class SettleGuard {
       if (!this.legionChild) {
         if (this.advisorySent) return undefined;
         this.advisorySent = true;
+        // CONTRACT §17 修订 1: the frozen sentence promises a wake-up, so it is only honest when
+        // every listed task really will wake the session. The mixed/none variants say which tasks
+        // need an `async_wait` instead of asserting a per-run fact that is false for some of them.
+        const wakeable = active.filter(wakesOnCompletion);
+        const wakeLine = wakeable.length === active.length
+          ? "If this answer does not need them, stop here — their completion notifications will wake you. Otherwise collect them with async_wait."
+          : wakeable.length === 0
+            ? "None of them will start a new turn; collect them with async_wait if you need one now."
+            : `${wakeable.length} of them will wake you when they finish; collect the other ${active.length - wakeable.length} with async_wait if you need them now.`;
         const advisory: CustomMessageDraft = {
           type: "custom_message",
           customType: "async-task-settle-advisory",
-          content: `${active.length} async task(s) still running: ${ids}. If this answer does not need them, stop here — their completion notifications will wake you. Otherwise collect them with async_wait.`,
+          content: `${active.length} async task(s) still running: ${ids}. ${wakeLine}`,
           display: false,
         };
         return { entries: [...entries, advisory] };

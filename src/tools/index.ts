@@ -56,6 +56,23 @@ function notificationException(params: Record<string, unknown>): { willNotify?: 
 }
 
 const MAX_LOG_BYTES = 50 * 1024;
+
+/**
+ * "Told once, to exactly one consumer" (CONTRACT §7.2, 0.4.3).
+ *
+ * A tool that puts a **terminal** snapshot in front of the model claims that task's single
+ * announcement: `onFinalize` will not send a completion notification for it, and `resendUnnotified`
+ * will not replay one later. Only terminal rows are latched — reading partial output of a running
+ * task (or listing it as `running`) must never silence its completion. Failures are swallowed: a
+ * tool call must not fail because the latch could not be persisted.
+ */
+function consumeTerminal(registry: TaskRegistry, snapshots: Array<{ taskId: string; status: TaskStatus }>): void {
+  for (const snapshot of snapshots) {
+    if (!isTerminal(snapshot.status)) continue;
+    try { registry.markConsumed(snapshot.taskId); } catch { /* best effort: the tool result still stands */ }
+  }
+}
+
 const DEFAULT_MAX_SYNC_TIMEOUT_MS = 600_000;
 const MAX_STATUS_LIMIT = 50;
 const DEFAULT_STATUS_LIMIT = 50;
@@ -92,8 +109,7 @@ function resolveMaxSyncTimeoutMs(): number {
 const schema = (properties: Record<string, unknown>, required: string[] = [], allOf: unknown[] = []) => ({ type: "object", properties, required, additionalProperties: false, ...(allOf.length ? { allOf } : {}) });
 const stringField = { type: "string" };
 const timeoutField = { type: "number", minimum: 0 };
-/** `async_run` fields that carry their own description instead of the bare `stringField` (D-C2). */
-const commandField = { type: "string", description: "Shell command to execute (/bin/sh -c) in the session cwd." };
+/** `async_run` fields that carry their own description instead of the bare `stringField` (D-C2). */const commandField = { type: "string", description: "Shell command to execute (/bin/sh -c) in the session cwd." };
 const nameField = { type: "string", description: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars)." };
 const conditionSchema = {
   oneOf: [
@@ -277,7 +293,11 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
       const registry = resolveRegistry();
       if (params.timeoutMs === undefined) throw new Error("timeoutMs is required");
       const taskIds = Array.isArray(params.taskIds) ? params.taskIds.map((id) => registry.resolveTaskId(String(id)).taskId) : [];
-      return toolResult(await registry.wait(taskIds, Number(params.timeoutMs), signal));
+      const outcome = await registry.wait(taskIds, Number(params.timeoutMs), signal);
+      // CONTRACT §7.2: those terminal rows are in front of the model now — the notification would
+      // repeat them (this is the 138 s "late receipt" of 2026-11-17: wait at 02:57:10, notify 02:59:23).
+      if ("results" in outcome) consumeTerminal(registry, outcome.results);
+      return toolResult(outcome);
     },
   });
   api.registerTool({
@@ -297,7 +317,11 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
       if (maxBytes > MAX_LOG_BYTES) throw new Error("maxBytes must be at most 50 KiB");
       const stream = params.stream === "stdout" || params.stream === "stderr" ? params.stream : "merged";
       const { taskId } = registry.resolveTaskId(String(params.taskId));
-      return toolResult(registry.logs(taskId, { maxBytes, tail: params.tail !== false, stream }));
+      const slice = registry.logs(taskId, { maxBytes, tail: params.tail !== false, stream });
+      // CONTRACT §7.2: reading a finished task's output is a consumer of its terminal event too.
+      const snapshot = registry.get(taskId);
+      if (snapshot !== undefined) consumeTerminal(registry, [snapshot]);
+      return toolResult(slice);
     },
   });
   api.registerTool({
@@ -326,6 +350,8 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
       });
       // D-08: history views are newest-first; the default active view keeps insertion order.
       const ordered = includeHistory || status !== undefined ? [...tasks].sort(byRecency) : tasks;
+      // CONTRACT §7.2: a terminal row that the model can read here has been told once already.
+      consumeTerminal(registry, ordered);
       return toolResult(ordered.map(redactSnapshot));
     },
   });

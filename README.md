@@ -119,7 +119,9 @@ Completion notifications are **best-effort**. `pi.sendMessage` returns `void` �
 - `notified` becomes true only after `sendMessage` returns; a failure or a missing host API leaves `notified: false` and increments `notifyAttempts`.
 - On `session_start`, pi-async **resends** terminal tasks that are still unnotified and unconsumed (within 24 h and under 2 attempts), so a missed wake-up is retried once per session start.
 - `async_wait` results are marked consumed (`outputConsumed`), which **suppresses** the completion notification for those tasks to avoid chatter. On a hybrid timeout only the completed side is consumed; not-ready tasks are left alone.
-- `async_status` exposes `notified` / `outputConsumed` / `notifyAttempts`, so an agent can check whether it already received (or suppressed) a result.
+- **One terminal event is told once, to exactly one consumer** (CONTRACT §7.2). `async_wait` (terminal rows), `async_status` (terminal rows it returns) and `async_logs` (a task that already finished) latch `consumedAt` on the task; a consumed task never produces a completion notification — `claimNotification` and `resendUnnotified` both skip it. Only **terminal** rows latch: reading the partial output of a running task, or listing it as `running`, leaves its notification armed.
+- While a run is live, the notification is **not queued at `finalize()`**: the send is decided at the run's settle boundary, after every consumer had its chance. That is what stops the "late receipt" — in 0.4.2 a task collected with `async_wait` mid-run still produced a `async-task-notification` 85–138 s later, because pi only enqueues a streaming followUp and delivers it once the model stops. If nobody consumed the result, the notification is still delivered exactly once at that boundary; when the session is idle it is sent immediately and wakes the session as before.
+- `async_status` exposes `notified` / `outputConsumed` / `consumedAt` / `notifyAttempts`, so an agent can check whether it already received (or suppressed) a result.
 - `notifyOnCompletion: false` opts a task out entirely.
 - A delayed task whose start failed records `metadata.startError`; the failure notification's `guidance` includes it as `Start error: ...`, so the cause (missing `cwd`, rejected `env` key, spawn failure) is visible without an extra `async_logs` call.
 - A task killed by `taskTimeoutMs` stays `killed`, but its notification carries `guidance` (grow `taskTimeoutMs` or use `watch`) — it is the one `killed` shape where the next step matters. `completed` notifications stay pure information.
@@ -137,21 +139,41 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
   end. The set is snapshotted when the boundary opens, so a task started while it waits is not waited
   for.
 - Bounded: at most `PI_ASYNC_HOLD_MS` per run (default 600000 ms = 10 min, measured on a monotonic
-  clock) and one hold per run (`agent_start` re-arms it). The loop has exactly two exits — every task
-  in the snapshot is terminal, or the budget ran out; it never probes the host's message queue, because
-  a notification queued during the hold lands on `agent.followUpQueue` while `ctx.hasPendingMessages()`
-  only counts the session-level user queues. On timeout the run settles exactly as before — nothing is
-  consumed, killed, or suppressed.
+  clock) and one hold per run (`agent_start` re-arms it). It never probes the host's message queue for
+  *notifications* (those land on `agent.followUpQueue`, invisible to `ctx.hasPendingMessages()`), but
+  it does yield to the **user**: a lone Esc or a message you queued ends the hold immediately, and the
+  run settles exactly as it would have without it — nothing is consumed, killed, or suppressed.
+- **The user can always get out.** pi awaits `agent_before_settle` with no timeout and cannot preempt
+  it, and the run's `AbortSignal` is already gone at this boundary — so Esc is observed through the
+  raw terminal listener (`onTerminalInput`, lone `\x1b` only; arrow/Alt sequences are left alone)
+  and releases the hold in milliseconds instead of waiting for the budget. A message submitted while
+  the hold waits (Enter queues it as steering) releases it on the next poll (~1 s), so the host can
+  deliver your message on the next turn. Programmatic aborts that do not type Esc (an extension
+  calling `ctx.abort()`, `/tree` navigation) still cannot preempt the handler; see Known limitations.
+- **It visibly moves.** pi clears its own working row at `agent_end`, i.e. before this boundary, so a
+  hold would otherwise look like a frozen screen. While it waits, the plugin renders its own row above
+  the editor — a spinning `⠋⠙⠹…` frame every 250 ms plus the elapsed seconds and `Esc stops waiting` —
+  and removes it in a `finally`. The footer line `waiting for N tasks <elapsed>` (15 s cadence) is
+  still written when the host exposes `setStatus`, but it is no longer the only sign of life.
 - When every task in the snapshot finished, the boundary returns one
   `async-task-settle-results` draft (name, status, exit code — **never** the output tail, use
   `async_logs`) plus `continue: true`, so the outcome reaches the transcript even if the wake-up was
   dropped. That cannot loop: the next boundary sees only terminal tasks and returns nothing.
+- **One terminal event, one announcement.** While the hold waits, it owns the completion of the
+  tasks in its snapshot: their `async-task-notification` is not sent, the results draft is the
+  single announcement, and those ids are latched `notified` so `resendUnnotified` cannot repeat it
+  on the next `session_start`. This matters because pi only *queues* a `followUp` while the run is
+  streaming and delivers it once the model stops — so in 0.4.2 the draft arrived first and the
+  notification a whole turn later, repeating an outcome the model had already acted on. Every hold
+  exit that does **not** produce a draft (timeout, dispose, a throwing registry) releases the
+  notifications instead, so nothing is ever swallowed.
+- The draft names each finished task by `name` (falling back to the task id), which is exactly what
+  `async_logs` accepts, and still points at `async_logs` rather than inlining a tail.
 - Only an interactive TUI session holds. `print` / `json` would delay the process exit, `rpc` aborts
   under a client-side timeout, and legion child sessions keep their own bounded reminder channel —
   none of them are affected.
 - While it waits the footer shows `waiting for N tasks <elapsed>`, refreshed every 15 s, whenever the
   host exposes `setStatus`.
-
 | Environment variable | Default | Description |
 |---|---:|---|
 | `PI_ASYNC_HOLD` | `on` | Set `0` to disable the hold entirely (no handler is registered at all). |
@@ -162,19 +184,14 @@ Start long-lived services (a dev server, a watcher you keep across turns) with
 `notifyOnCompletion: false`: such a task is still running at every turn end, so with the default it
 would hold **every** turn until `PI_ASYNC_HOLD_MS`.
 
-Pressing Esc during a hold does **not** interrupt it — the host only marks the run aborted and cannot
-signal the boundary (`ctx.signal` is gone by then), so the hold keeps waiting and can run up to
-`PI_ASYNC_HOLD_MS` before the run settles as aborted. Two different things then happen to the wake-ups:
-
-- a task that **finished during the hold and before the Esc** had its completion notification queued and
-then cleared by the host's `clearAllQueues()`; because `notified` is already latched it is never re-sent,
-so that task will not wake you — its outcome is still written into the transcript by the
-`async-task-settle-results` draft, so the next turn you start can act on it;
-- a task that **finishes after the Esc** is not affected: its notification is delivered normally and
-still wakes the session.
-
-Fixing the first case means changing the single-delivery semantics of `notify.ts` (or finding a host
-signal the boundary can read), which is out of scope for this feature.
+Pressing Esc during a hold releases it within milliseconds: the raw terminal listener sees the lone
+`\x1b`, the hold returns immediately, and pi then settles the aborted run (it suppresses the
+continuation itself, so no extra provider request runs). Because the hold owns the terminal event, it
+queues no notification for a task that finishes inside the wait, so an aborted run has nothing for
+the host's `clearAllQueues()` to drop. A task that finishes after the Esc is not affected: its
+notification is delivered normally and still wakes the session. If you had already queued text when
+you pressed Esc, the host moves it back into the editor (`restoreQueuedMessagesToEditor`), so nothing
+you typed is lost.
 
 ## Watches
 
@@ -205,19 +222,18 @@ In a legion child session, collect task results with `async_wait` before returni
 
 - Crash-durability is not guaranteed: metadata is atomically replaced, but captured output is not fsynced. After a crash, orphaned running tasks are marked `failed`/`lost` on the next start, and pending delayed tasks are restored with their remaining delay by whichever session next loads the same data directory (process identity does not matter). Recovery inside the same process is complete for `/reload` (`cwd`, `taskTimeoutMs` deadline, and watch deadline are rebuilt from disk).
 - Cross-turn wake-up in legion children depends on the host delivering follow-up messages (upstream pi-legion issue [#156](https://github.com/zzjcool/pi-legion/issues/156)); the extension does not patch Pi or legion.
-- The settle hold keeps the OSC 7501 status and the footer line in `working`, but it does **not** relight
-  the TUI working spinner: pi's harness already cleared it at `agent_end` and the extension has no API to
-  bring it back. Pressing Esc during a hold only marks the run aborted (pi does not interrupt the
-  awaiting handler) and the hold cannot observe it, so the hold **waits out its budget** (up to
-  `PI_ASYNC_HOLD_MS`) before the run settles as aborted. Wake-ups are lost only for tasks that finished
-  **during** the hold and **before** the Esc: their notifications were cleared with the agent queues and
-  `notified` is already latched, so they will not wake you — their outcome still reaches the transcript
-  through the settle-result draft. Tasks that finish **after** the Esc wake the session normally. Input
-  is not frozen.
-- Because a hold keeps the run busy, `waitForIdle()` waits for it too: any command that does
-  `await session.abort()` waits up to `PI_ASYNC_HOLD_MS` while a hold is in progress (e.g. `/tree`
-  navigation — `interactive-mode.js:4758` → `agent-session.js:1999`). Esc itself is `void abort()`, stays
-  non-blocking, and does not take that path.
+- The settle hold keeps the OSC 7501 status in `working` and now renders its own live progress row
+  (spinner + elapsed + `Esc stops waiting`) because pi cleared the built-in working row at `agent_end`.
+  Esc releases the hold through the raw terminal listener; a **programmatic** abort that produces no
+  Esc keystroke (an extension calling `ctx.abort()`, `/tree` navigation → `await session.abort()`) still
+  cannot preempt an awaiting `agent_before_settle` handler — pi's `AgentBeforeSettleEvent` carries no
+  AbortSignal and `emitBoundary` does not race the handler (`runner.js:767-814`). Such a call waits up to
+  `PI_ASYNC_HOLD_MS`; the hold still yields as soon as the user queues a message or the tasks finish.
+  Input itself is never frozen — text submitted during a hold is queued as steering.
+- Because a hold keeps the run busy, `waitForIdle()` waits for it too: a command that
+  `await session.abort()` **without** an Esc keystroke waits up to `PI_ASYNC_HOLD_MS` while a hold is in
+  progress (e.g. `/tree` navigation — `interactive-mode.js:4758` → `agent-session.js:1999`). Esc itself
+  is a keystroke, so it reaches the hold first and releases it; `void abort()` stays non-blocking.
 - TUI rail and panel are available only in the main TUI session, not in RPC/print/child contexts.
 - `pi --print` notification delivery requires an available configured provider. If no provider is available, end-to-end print-mode verification remains pending a user run.
 

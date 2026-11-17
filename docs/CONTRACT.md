@@ -278,13 +278,73 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   仅在交互 TUI 会话 hold（`ctx.mode === "tui"` 或 ctx 缺失）；军团 child（`PI_LEGION_NODE_ID` 存在）、
   `print`/`json`/`rpc` 都不 hold。
 - 行为：在边界内轮询等待（`PI_ASYNC_HOLD_POLL_MS`，默认 1000ms），直到快照内的 holdable 任务全部
-  终态或到达 `PI_ASYNC_HOLD_MS`（默认 600000ms，单调时钟计时）。只有这两条出口，不探测宿主队列。
+  终态或到达 `PI_ASYNC_HOLD_MS`（默认 600000ms，单调时钟计时）。
+- **出口（修订 4，0.4.3）**：0.4.2 的两条（全终态 / 预算耗尽）加上三条「让位于用户」的出口 ——
+  用户永远优先于等待。任何非「全终态」出口都 **不带 entries/continue** 并释放扣住的通知（见修订 3）。
+  1. **全部终态** → results entry + `continue: true`；
+  2. **预算耗尽** → 原样 `undefined`（与无 hold 时一致）；
+  3. **用户按 Esc** → 立即返回 `undefined`。宿主在 `agent_before_settle` 期间**无法抢占** handler
+     （`emitBoundary` 无超时、无 race，`runner.js:767-814`），本边界的 `ctx.signal` 恒为 `undefined`
+     （run 的 AbortController 在 `before_settle` 之前就清了，`pi-agent-core/dist/agent.js:216-223`），
+     `session.abort()` 只置一个 handler 读不到的 flag（`agent-session.js:2073-2084`）。因此 Esc 走
+     **原始终端输入**：`ui.onTerminalInput` 仅在 hold 期间订阅，只匹配单独 `\x1b`（方向键/Alt 序列
+     `\x1b[A` 等不匹配），且**永不 consume**，宿主自己的 Esc 语义不变；用 `Promise.race` 打断 sleep，
+     毫秒级生效而不是等一个 poll；
+  4. **用户已入队消息**（`ctx.hasPendingMessages() === true`）→ 本轮立即返回 `undefined`，让宿主在
+     下一个 turn 投递它。与已废弃的 F2b 探针的区别：完成通知走 `agent.followUpQueue`，**不在**该计数里
+     （`agent-session.js:1959-1965`），所以这个探针对通知永远为 `false`、只对用户文本为 `true`；
+  5. `dispose` / registry 抛错 → 原样 `undefined`。
+- **进度可见性（修订 4）**：`agent_end` 在 `before_settle` **之前**就把宿主的 working 行清掉了
+  （`interactive-mode.js:3060-3064`），hold 期间屏幕看起来像死机。hold 因此自带一行 widget
+  （`setWidget("pi-async-hold", ["<frame> waiting for N async task(s) <elapsed> — Esc stops waiting"],
+  { placement: "aboveEditor" })`），每 250ms 换一帧（10 帧 braille），`finally` 里无条件清除。
+  不借用 `setWorkingVisible`/`setWorkingMessage`：`workingVisible` 是会话级持久状态，hold 结束后没有
+  任何事件会把它收回，会留下永久 spinner。
 - 返回：全部终态 → 追加一条 `custom_message`（`customType: "async-task-settle-results"`、`display: false`、
-  不含 outputTail、指路 `async_logs`）并 **`continue: true`**；超时 → 原样 `undefined`（不带 entries/continue）。
+  不含 outputTail、指路 `async_logs`）并 **`continue: true`**；其余出口 → 原样 `undefined`（不带 entries/continue）。
   `continue` 不会成环：再次进入边界时快照内任务已终态。
-- 不 consume 输出、不动 `notified`、不抑制通知、不改任务状态、不内联 outputTail。
-- footer：`waiting for N task(s) <elapsed>`（key `pi-async-hold`），15s 刷新，结束后清除；全部 best-effort。
+- **通知归属（修订 3，0.4.3）**：hold 真正在等待时**拥有**快照内任务的终态播报权。`onFinalize` 对
+  这些 id 不再调用 `sendCompletionNotification`，而是由 `HoldNotificationRelay`（`src/guard/hold-notify.ts`）
+  扣住，等 hold 出口决定：
+  - 全终态 → results entry 是唯一播报，扣住的通知被丢弃，并对这些 id 落 `notified = true`
+    （否则下次 `session_start` 的 `resendUnnotified` 会再播一次）；
+  - 超时/`dispose`/registry 抛错 → 立即把扣住的通知交还给正常发送路径（**永不吞掉完成通知**）。
+  理由：pi 在 run 仍在流式时只把 `followUp` 入队（`agent-session.js:1959-1962`），要到模型**停止**时
+  （`agent-loop.js:196-203`）才投递，因此 results entry（边界 draft，同步落盘）必然先到，通知必然后到
+  并独占一个 turn。0.4.2 两路都发 → 会话里出现「迟到的重复回执」（实测 01a1e5b5：ln393→ln404 49.586s、
+  ln432→ln441 38.226s，模型自述「重复回执」）。顺序由宿主固定，**不是竞态**。
+- 仍然：不 consume 输出、不改任务状态、不内联 outputTail；`notified` 仅在「results entry 已播报」
+  这一种情况下由 hold 置位（修订 3 取代 0.4.2 的「不动 `notified`／不抑制通知」）。
+- footer：`waiting for N task(s) <elapsed>`（key `pi-async-hold`），15s 刷新，结束后清除；全部 best-effort
+  （0.4.3 起它只是辅助信号，主信号是上面的 250ms widget —— 实测 16s hold 只触发 3 次 footer 写）。
 - 开关：`PI_ASYNC_HOLD=0` 不注册任何 handler；`PI_ASYNC_HOLD_MS <= 0` 同样关闭。
+
+### 7.2 终态播报唯一性（0.4.3，D-15）
+
+一个终态**只播报一次，且只给一个消费者**。三个可能的消费者：
+
+1. **hold 的 results entry**（§7.1 修订 3）—— in-run、同步落盘，优先；
+2. **工具**：`async_wait` 返回的终态行、`async_status` 返回列表里的终态行、`async_logs` 读到的已终态任务；
+3. **完成通知** `async-task-notification`（followUp）。
+
+规则：
+
+- 工具把终态交给模型时调 `registry.markConsumed(taskId)`，写持久化字段 `consumedAt`；`claimNotification()`
+  与 `resendUnnotified()` 遇到 `consumedAt` 一律跳过 → 消费者 2 赢了，3 不再播。
+- **只对终态行上锁**：读 running 任务的部分输出、或列表里看到 running，绝不上锁（否则完成通知会被静默关掉）。
+- `onFinalize` 在 run 仍活动（`agent_start` … `agent_settled`）时**不立即入队**：
+  - hold 拥有该任务 → 走 §7.1 修订 3 的 relay；
+  - 否则挂进 `pendingNotifications`，在 `agent_before_settle`（hold 之后、guard 之前）与 `agent_settled`
+    结算：结算时 `sendCompletionNotification` 重新检查全部 latch，已被消费的跳过；
+  - session 空闲 → 立即 `sendMessage(followUp, triggerTurn)` 唤醒（行为不变）；
+  - `triggerOnCompletion: false` 不延后（它本来就不会多起一个 turn）。
+- 为什么必须延后：pi 在 streaming 时只把 followUp 入队，模型**停止**后才投递（`agent-session.js:1959-1962`
+  → `agent-loop.js:196-203`）。0.4.2 在 `finalize` 就入队，于是「模型已用 `async_wait` 拿到结果」之后仍
+  会在 85–138s 后收到第二条（实测会话 `2026-11-17T02-35-00-296Z_01a1e75b`：wait 02:57:10 / 02:58:16，
+  通知 02:59:23 / 02:59:35，均落在 assistant 停止后 +9–12ms）。
+- **持久化**：`consumedAt` 写进 `<taskId>.json`（重载后仍生效）；`notified` 保持「host 已接受」语义不变；
+  `outputConsumed` 保持原有「输出已读 / #15 提醒抑制」语义，两者不合并。
+- `notifyOnCompletion: false` / `triggerOnCompletion: false` 语义不变。
 
 ## 8. TUI（冻结，仅主会话）
 
@@ -488,7 +548,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | D8 | 不改 legion/pi 本体；busy-hold 走上游（#156 + 补充评论已发） |
 | D9 | delayed：reload 恢复计时；dataDir 变更（切 session）时 copy+rename 迁移 `.json/.output/.stdout/.stderr` 并重写 `metadata.outputFile`，任务不丢（§10 / REV-17） |
 | D10 | settle 守卫每 run 重武装、累计 ≤3 次，超限放行但保留未决清单提示 |
-| D-14 | settle hold（§7.1）：仅在交互 TUI 会话、且存在会唤醒会话的 **running** 任务时，在 `agent_before_settle` 内等它们全部终态再 settle（上限 `PI_ASYNC_HOLD_MS`，默认 600000ms，单调时钟；**只有两条出口**：全终态或超时）；全部终态时自带 `async-task-settle-results` entry + `continue: true`（不内联 outputTail），超时原样放行；`pending`/delayed、军团 child、`print`/`json`/`rpc` 都不 hold（修订 1 / 修订 2） |
+| D-14 | settle hold（§7.1）：仅在交互 TUI 会话、且存在会唤醒会话的 **running** 任务时，在 `agent_before_settle` 内等它们全部终态再 settle（上限 `PI_ASYNC_HOLD_MS`，默认 600000ms，单调时钟；**出口**：全终态 / 超时 / **Esc** / **用户已入队消息** / dispose，见 §7.1 修订 4）；全部终态时自带 `async-task-settle-results` entry + `continue: true`（不内联 outputTail），超时原样放行；`pending`/delayed、军团 child、`print`/`json`/`rpc` 都不 hold；**修订 3（0.4.3）**：hold 等待期间快照内任务的完成通知被扣住，全终态时由 results entry 独占播报并落 `notified`，非全终态出口则原样交还；**修订 4（0.4.3）**：Esc 经 `ui.onTerminalInput` 毫秒级释放，用户入队消息下一 poll 释放，hold 期间自带 250ms 刷新的 widget 进度行（修订 1 / 2 / 3 / 4） |
+| D-15 | 终态播报唯一性（§7.2，0.4.3）：`consumedAt` latch；`async_wait`/`async_status`/`async_logs` 交付终态即上锁；run 活动期通知不立即入队，延后到 settle 边界再裁决；`claimNotification`/`resendUnnotified` 跳过已消费任务；只对终态行上锁（修订 1） |
 
 ## 14. 验收清单（verify 门禁）
 
@@ -667,9 +728,15 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     `triggerOnCompletion: false` → `willWake: false` + `outputHint`
     `This task will notify but will not start a new turn; collect it with async_wait if you need the result now.`；
     默认情况不新增字段（不重复计费）。sync 被 promote 的任务同样适用。
-  - 主会话 `agent_before_settle`（见 §7）：`async-task-settle-advisory`，文案为
+  - 主会话 `agent_before_settle`（见 §7）：`async-task-settle-advisory`，**全部任务都会唤醒会话**时文案为
     `{n} async task(s) still running: {ids}. If this answer does not need them, stop here — their completion notifications will wake you. Otherwise collect them with async_wait.`
     每 generation 最多 1 条，**不带 `continue`**。
+    **修订 1（0.4.3）**：「会唤醒」= `running` + `notifyOnCompletion !== false` + `triggerOnCompletion !== false`
+    （与 hold 的 holdable 同一判定）。混合时改用
+    `{n} async task(s) still running: {ids}. {w} of them will wake you when they finish; collect the other {n-w} with async_wait if you need them now.`；
+    一个都不会唤醒时改用
+    `{n} async task(s) still running: {ids}. None of them will start a new turn; collect them with async_wait if you need one now.`
+    —— 不得用整句笼统断言「通知会唤醒你」（§13 的 per-task 事实原则）。
   - timeout 通知：`killKind === "timeout"` 时 guidance 为
     `Killed at taskTimeoutMs. Rerun with a larger taskTimeoutMs, or watch for a success_when condition instead of a hard deadline.`
     `buildNotificationXml` 的发送门放宽为 `(status === "failed" || killKind === "timeout") && guidance`；

@@ -8,6 +8,7 @@ import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { registerHold } from "../src/guard/hold.ts";
+import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
 import { registerTools, type ToolContext } from "../src/tools/index.ts";
 import { registerRail } from "../src/tui/rail.ts";
@@ -184,6 +185,38 @@ export async function init(pi: PiCtx): Promise<void> {
   const factoryDataDir = sessionDataDir(context) ?? fallbackDataDir();
   const registry = new TaskRegistry({ dataDir: factoryDataDir });
   activeRegistry = registry;
+  // CONTRACT §7.1 修订 3: the settle hold and the finalize hook both have to know who owns a
+  // terminal event, so they share one relay per generation (`hold-notify.ts`).
+  const holdNotify = new HoldNotificationRelay();
+  /**
+   * CONTRACT §7.2 (0.4.3): a completion decided while this session's run is live is deferred to the
+   * run's settle boundary instead of being queued as a `followUp` right away.
+   *
+   * pi only enqueues a streaming followUp and delivers it after the model stops
+   * (`agent-session.js:1959-1962` → `agent-loop.js:196-203`). That is how a task the model had
+   * already collected with `async_wait` still produced a second announcement 85–138 s later (session
+   * `2026-11-17T02-35-00-296Z_01a1e75b`: wait at 02:57:10 / 02:58:16, notifications at 02:59:23 /
+   * 02:59:35, each +9–12 ms after an assistant message stopped). By the boundary, a tool that
+   * handed the terminal state to the model has latched `consumedAt`, so the deferred send is a
+   * no-op and exactly one consumer won.
+   */
+  const pendingNotifications = new Map<string, () => void>();
+  /** Whether a run is live right now (event-driven: `agent_start` → `agent_settled`). */
+  let runActive = false;
+
+  /**
+   * §7.2: decide every deferred completion. `sendCompletionNotification` re-checks the consumer
+   * latches (`consumedAt`, `notified`, `outputConsumed`), so a task the model already collected is
+   * skipped and a task nobody saw is announced exactly once.
+   */
+  const flushPendingNotifications = (): void => {
+    if (pendingNotifications.size === 0) return;
+    const queued = [...pendingNotifications.values()];
+    pendingNotifications.clear();
+    for (const send of queued) {
+      try { void send(); } catch { /* send() already reports its own failures */ }
+    }
+  };
   // NOTE: pi's factory-time ExtensionAPI exposes no `mode`/`ui`/`sessionManager` — those live on
   // event-handler contexts (pi.on("session_start", (event, ctx) => ...)), so data dir, cwd and TUI
   // binding are resolved lazily from the first ctx.
@@ -308,13 +341,28 @@ export async function init(pi: PiCtx): Promise<void> {
       };
       // Honest notification (PLAN §2.4/§2.8): no fake retries here. A failed send keeps
       // notified=false / notifyAttempts>0 in the registry and is re-sent at the next session_start.
-      void sendCompletionNotification(pi, registry, payload, { triggerTurn: snapshot.metadata.triggerOnCompletion !== false })
+      const send = () => sendCompletionNotification(pi, registry, payload, { triggerTurn: snapshot.metadata.triggerOnCompletion !== false })
         .then((outcome) => {
           if (outcome === "failed") {
             console.error(`pi-async: completion notification failed for ${snapshot.taskId}; it will be re-sent on the next session_start`);
           }
         })
         .catch((error: unknown) => console.error(`pi-async: completion notification failed for ${snapshot.taskId}`, error));
+      // CONTRACT §7.1 修订 3: a hold already waiting for this task reports it in the in-run
+      // `async-task-settle-results` entry. pi would deliver this followUp only after the model
+      // stops, as an extra turn repeating an outcome the entry already announced — the 0.4.2
+      // "late receipt" (session 01a1e5b5 ln393→ln404, 49.6 s). The relay hands it back on every
+      // hold exit that does not produce an entry (timeout/dispose), so nothing is lost.
+      if (holdNotify.claim(snapshot.taskId, send)) return;
+      // §7.2: while a run is live, queue the decision for the settle boundary instead of the host's
+      // followUp queue — by then a consumer (wait/status/logs) may have latched the terminal state.
+      // `triggerOnCompletion: false` keeps 0.4.2 behaviour: it cannot wake anything, so there is no
+      // second turn to suppress.
+      if (runActive && snapshot.metadata.triggerOnCompletion !== false) {
+        pendingNotifications.set(snapshot.taskId, send);
+        return;
+      }
+      void send();
     },
     onStateChange: (snapshot) => {
       const active = registry.activeCount();
@@ -362,9 +410,18 @@ export async function init(pi: PiCtx): Promise<void> {
     context.on("session_start", (_event: unknown, ctx: unknown) => onLifecycle(ctx));
     context.on("message_start", (_event: unknown, ctx: unknown) => onLifecycle(ctx));
 
+    // §7.2: the run is over — every deferred completion is decided now. `agent_settled` fires after
+    // the boundary, so this also covers a task that finished between the last boundary and settle.
+    context.on("agent_start", () => { runActive = true; });
+    context.on("agent_settled", () => { runActive = false; flushPendingNotifications(); });
+
     // PLAN-HOLD D-1: the hold registers BEFORE the guard, so the settle boundary waits first and
-    // the guard's advisory still runs afterwards on the same boundary.
-    activeHold = registerHold(pi, registry);
+    // the guard's advisory still runs afterwards on the same boundary. The relay is what lets the
+    // hold own the completion of a task that finishes inside that wait (CONTRACT §7.1 修订 3).
+    activeHold = registerHold(pi, registry, { notify: holdNotify });
+    // §7.2: registered AFTER the hold, so a task the results entry owns is already latched
+    // `notified` and this flush skips it. Runs before the guard (which only reads active tasks).
+    context.on("agent_before_settle", () => { flushPendingNotifications(); return undefined; });
     // agent_settled / agent_before_settle are registered by SettleGuard itself.
     activeGuard = new SettleGuard(pi, registry);
     activeGuard.register();
@@ -375,6 +432,11 @@ export async function init(pi: PiCtx): Promise<void> {
     context.on("session_shutdown", async (event: unknown) => {
       if (!shutdownPromise) {
         shutdownPromise = (async () => {
+          // §7.2: a deferred completion is dropped here on purpose (not sent): the generation is
+          // tearing down, `notified` stays false, and the next `session_start` retries it via
+          // `resendUnnotified` instead of racing a dead host.
+          pendingNotifications.clear();
+          runActive = false;
           // D-16 / PLAN §2.8: reload + resume suspend (next generation adopts from disk);
           // quit/new/fork (and an unknown/undefined reason) shut down and kill.
           const reason = (event as { reason?: string } | undefined)?.reason;
