@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import { registerHold } from "../src/guard/hold.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { displayWidth } from "../src/tui/width.ts";
+import { markRailRegistered, resetSurfaceRegistrationForTests } from "../src/tui/surfaces.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -99,6 +100,10 @@ const completed = (taskId: string) => makeSnapshot({ taskId, status: "completed"
  */
 const named = (taskId: string, name: string, startedAt: number) =>
   makeSnapshot({ taskId, name, status: "running", startedAt, metadata: {} });
+
+// §7.1 修订 6: the hold row branches on whether a rail is registered, which is process-wide state.
+// Reset it per test so neither branch can leak into the next case (and so both are exercised).
+beforeEach(() => resetSurfaceRegistrationForTests());
 
 type EnvName = "PI_ASYNC_HOLD" | "PI_ASYNC_HOLD_MS" | "PI_ASYNC_HOLD_POLL_MS" | "PI_LEGION_NODE_ID";
 
@@ -810,11 +815,11 @@ test("the hold renders a live progress row and clears it when it ends (§7.1 修
 });
 
 /**
- * 0.4.5 regression (PLAN-HOLD 修订 5): the row used to say only "1 async task 0s", so the user could
- * not tell *which* task the turn was waiting for. Anyone who deletes the task list from the row (or
- * drops the names back to a bare count) turns this test red — that is its whole purpose.
+ * 0.4.5 regression (PLAN-HOLD 修订 5) — now the **fallback** branch (§7.1 修订 6): a host without the
+ * rail widget has nowhere else to show the tasks, so the hold row names them. The RAIL_AVAILABLE
+ * case below asserts the opposite; deleting the fallback turns this test red.
  */
-test("the progress row names every task it is waiting for (PLAN-HOLD 修订 5)", async () => {
+test("without a rail the progress row names every task it is waiting for (fallback)", async () => {
   await withEnv(CLEAN, async () => {
     const { pi, fireOne } = makePi();
     const now = Date.now();
@@ -835,6 +840,31 @@ test("the progress row names every task it is waiting for (PLAN-HOLD 修订 5)",
       row.includes("watch-t4q-run2 (running, 1m 4s) · watch-t6j-probe (running, 32s)"),
       `each task shows its status and its own elapsed time (got: ${row})`,
     );
+  });
+});
+
+/**
+ * §7.1 修订 6 (0.4.6): the rail is the one place that carries `name · state · elapsed` per task,
+ * so the hold row must not repeat it — three lines of the same fact in one terminal was the bug.
+ * What only the hold knows is how long *this turn* has been held, and that is all it says.
+ */
+test("with a rail on screen the hold row leaves the detail to the rail", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-yamlfix", now - 439_000);
+    const registry = sequenceRegistry([[watch], [watch], []]);
+    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    markRailRegistered(); // what `registerRail` does once the host accepted the widget
+    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    const row = String(interactive.progress()[0]?.content?.[0]);
+    assert.equal(row, "⠋ waiting 0s — Esc stops waiting", `the row carries only the hold's own elapsed (got: ${row})`);
+    assert.ok(!row.includes("watch-t4q-yamlfix"), `the task name is the rail's job (got: ${row})`);
+    assert.ok(!row.includes("7m"), `the task's own elapsed must not leak in — this elapsed is the hold's (got: ${row})`);
+    assert.equal(interactive.progress()[0]?.content?.length, 1, "still a single line");
   });
 });
 

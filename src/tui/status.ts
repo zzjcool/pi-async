@@ -21,11 +21,16 @@ export function summarySegments(c: SummaryCounts, now = Date.now()): SummarySegm
   const elapsed = c.running > 0 && c.longestRunningStartedAt !== undefined
     ? formatElapsedMs(now - c.longestRunningStartedAt)
     : "—";
+  // 0.4.6: with exactly one live task the rail renders exactly one task row, whose own elapsed is
+  // the same duration this summary would aggregate — so the summary drops its copy and lets the row
+  // own it. Zero live tasks keep the `—` (nothing to duplicate); two or more still need the
+  // aggregate (there is no single row to read it from).
+  const liveCount = c.running + c.pending;
   return [
     { text: "▶", token: c.running + c.pending > 0 ? "accent" : "dim" },
     { text: ` ${c.running} running`, token: "accent" },
     ...(c.pending > 0 ? [{ text: ` · ${c.pending} pending`, token: "dim" as const }] : []),
-    { text: ` · ${elapsed}`, token: "dim" },
+    ...(liveCount !== 1 ? [{ text: ` · ${elapsed}`, token: "dim" as const }] : []),
     // ✓ and ✗ are symmetric: both only appear when non-zero, so an all-failed run shows no green 0.
     ...(c.completed > 0 ? [{ text: ` · ✓${c.completed}`, token: "success" as const }] : []),
     ...(c.failed > 0 ? [{ text: ` · ✗${c.failed}`, token: "error" as const }] : []),

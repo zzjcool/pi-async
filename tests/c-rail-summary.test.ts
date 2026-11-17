@@ -23,6 +23,23 @@ test("formatSummary includes pending and uses the frozen strings", () => {
   assert.equal(formatSummary({ running: 0, pending: 0, completed: 0, failed: 3 }, NOW), "▶ 0 running · — · ✗3");
 });
 
+test("the summary leaves the duration to the single live task's own rail row (0.4.6)", () => {
+  // One live task → the rail renders exactly one task row, whose elapsed is the same duration, so
+  // the summary drops its copy: `▶ 1 running` is the whole story.
+  assert.equal(formatSummary({ running: 1, pending: 0, completed: 0, failed: 0, longestRunningStartedAt: NOW - 65_000 }, NOW), "▶ 1 running");
+  assert.equal(formatSummary({ running: 0, pending: 1, completed: 0, failed: 0 }, NOW), "▶ 0 running · 1 pending");
+  // Two or more live tasks: no single row carries the aggregate, so the summary keeps the duration.
+  assert.equal(formatSummary({ running: 2, pending: 0, completed: 0, failed: 0, longestRunningStartedAt: NOW - 65_000 }, NOW), "▶ 2 running · 1m 5s");
+  assert.equal(formatSummary({ running: 1, pending: 1, completed: 0, failed: 0, longestRunningStartedAt: NOW - 65_000 }, NOW), "▶ 1 running · 1 pending · 1m 5s");
+  // No live task: the em dash duplicates nothing, so it stays.
+  assert.equal(formatSummary({ running: 0, pending: 0, completed: 1, failed: 0 }, NOW), "▶ 0 running · — · ✓1");
+  // And the segment list really loses the dim elapsed token, not just its text.
+  assert.deepEqual(summarySegments({ running: 1, pending: 0, completed: 0, failed: 0, longestRunningStartedAt: NOW - 65_000 }, NOW), [
+    { text: "▶", token: "accent" },
+    { text: " 1 running", token: "accent" },
+  ]);
+});
+
 test("summarySegments returns the frozen token sequence", () => {
   assert.deepEqual(summarySegments({ running: 2, pending: 1, completed: 3, failed: 1, longestRunningStartedAt: NOW - 65_000 }, NOW), [
     { text: "▶", token: "accent" },
