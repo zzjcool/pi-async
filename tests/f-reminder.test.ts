@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { init } from "../extensions/index.ts";
 import { buildReminderXml, REMINDER_GUIDANCE, reminderGuidance, sendReminder } from "../src/core/notify.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
@@ -183,6 +183,15 @@ test("§18.3 delivery: async-task-reminder over followUp with elapsed-ms/remind-
 });
 
 test("§18.4 backoff: 1x → 2x → 4x, then stop at three reminders without killing or timing out", async () => {
+  // Deterministic clock AND timers. The 0.4.4 CI flake (`ci (node 22)`: "second reminder must be
+  // 2x") was not a race in the backoff: `fireReminder` sets `task.remindAt = Date.now() + delay`
+  // (registry.ts:573), then `persist()` writes the snapshot synchronously (:575), and only then
+  // dispatches the event (:576). With a real clock the listener's `at` therefore sits AFTER the
+  // fs write, so `remindAt - at` silently measured persist latency: a 40 ms write turns the 2x
+  // interval into 20 ms, which is what a slow runner did to the 25 ms SLACK_MS. Freezing `Date`
+  // makes both reads share one `now`, so the interval is asserted exactly (§18.4 semantics are
+  // unchanged — the production code still uses the real clock).
+  mock.timers.enable({ apis: ["setTimeout", "Date"] });
   const f = fixture();
   const base = 30;
   try {
@@ -190,23 +199,28 @@ test("§18.4 backoff: 1x → 2x → 4x, then stop at three reminders without kil
     const task = f.registry.submit({ command: "sleep 20", name: "backoff", remindAfterMs: base });
     assertArmedAfterStart(task.remindAt, task.startedAt ?? task.createdAt, base, "first reminder at 1x");
 
-    await waitFor(() => events.length >= 3, "three reminders");
-    // Each event reports the schedule it just armed: 2x after the first, 4x after the second.
+    mock.timers.tick(base);
+    assert.equal(events.length, 1, "the 1x reminder fires at the first deadline");
     assert.equal(events[0]!.count, 1);
-    assert.ok(Math.abs(events[0]!.remindAt! - events[0]!.at - 2 * base) <= SLACK_MS, `second reminder must be 2x, got ${events[0]!.remindAt! - events[0]!.at}ms`);
+    // Each event reports the schedule it just armed: 2x after the first, 4x after the second.
+    assert.equal(events[0]!.remindAt! - events[0]!.at, 2 * base, "second reminder must be exactly 2x");
+    mock.timers.tick(2 * base);
     assert.equal(events[1]!.count, 2);
-    assert.ok(Math.abs(events[1]!.remindAt! - events[1]!.at - 4 * base) <= SLACK_MS, `third reminder must be 4x, got ${events[1]!.remindAt! - events[1]!.at}ms`);
+    assert.equal(events[1]!.remindAt! - events[1]!.at, 4 * base, "third reminder must be exactly 4x");
+    mock.timers.tick(4 * base);
     assert.equal(events[2]!.count, 3);
     assert.equal(events[2]!.remindAt, undefined, "the third reminder arms nothing");
 
     // 4x base would have fired again by now; a fourth reminder must never arrive.
-    await sleep(4 * base + 150);
+    mock.timers.tick(4 * base + 150);
     assert.equal(events.length, 3, "the budget is three reminders, then silence");
     const live = f.registry.get(task.taskId)!;
     assert.equal(live.status, "running", "an exhausted budget never settles the task");
     assert.equal(live.remindAt, undefined);
     assert.equal(f.registry.isProcessAlive(task.taskId), true);
   } finally {
+    // Restore real timers before shutdown (it awaits real process-exit events).
+    mock.timers.reset();
     await f.cleanup();
   }
 });
