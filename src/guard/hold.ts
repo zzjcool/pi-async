@@ -1,8 +1,11 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import { isTerminal, type TaskSnapshot } from "../core/task.ts";
-import { formatElapsedMs } from "../core/duration.ts";
+import { formatDuration, formatElapsedMs } from "../core/duration.ts";
 import { envNumber } from "../core/env.ts";
+// SAFETY: `tui/width.ts` is a pure text utility (no TUI/host imports), so the guard layer may share
+// it instead of duplicating the CJK cell-width rules — the deps still point one way (tui → core).
+import { displayWidth, truncateToWidth } from "../tui/width.ts";
 import type { HoldNotificationRelay } from "./hold-notify.ts";
 
 /** Default upper bound for one hold (D-5 / D-9): ten minutes. */
@@ -29,6 +32,77 @@ const FOOTER_KEY = "pi-async-hold";
 const WIDGET_KEY = "pi-async-hold";
 const PROGRESS_FRAME_MS = 250;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/**
+ * Columns assumed when the host exposes no `process.stdout.columns` (a piped stdout, a test): the
+ * same 120-cell default the panel falls back to (`src/tui/panel.ts:424`).
+ */
+const DEFAULT_COLUMNS = 120;
+
+/** Characters of `taskId` used when a task has no name (an unnamed row is still identifiable). */
+const FALLBACK_ID_CHARS = 8;
+
+/**
+ * One task inside the progress row: `name (status, elapsed)` — the exact shape the model-facing
+ * `<async-state>` line uses (`src/context/nudges.ts:75`), so the user reads the same thing the
+ * model reads. An unnamed (or blank-named) task falls back to the first 8 characters of its id:
+ * `""` would otherwise render as a bare ` (running, 4s)` with nothing to identify it.
+ */
+function taskLabel(task: TaskSnapshot, now: number): string {
+  const name = typeof task.name === "string" ? task.name.trim() : "";
+  const shown = name.length > 0 ? name : task.taskId.slice(0, FALLBACK_ID_CHARS);
+  return `${shown} (${task.status}, ${formatDuration(task, now)})`;
+}
+
+/**
+ * Usable terminal width for a `setWidget(content: string[])` row.
+ *
+ * That form gets no width callback (only the factory form does), so the row sizes itself from
+ * `process.stdout.columns` — the same convention `src/tui/panel.ts:424` uses. One column is left
+ * free on purpose: a line that exactly fills the terminal is what makes some hosts wrap it, and a
+ * wrapping row is the jitter this budget exists to prevent.
+ */
+function terminalColumns(): number {
+  const columns = process.stdout?.columns;
+  const usable = typeof columns === "number" && columns > 0 ? columns : DEFAULT_COLUMNS;
+  return Math.max(20, usable - 1);
+}
+
+/**
+ * `a (running, 1m 4s) · b (running, 32s)`, cut to a cell budget with a `+N more` marker for the
+ * tasks that do not fit. Widths are measured in terminal cells (a CJK name is two cells per
+ * character), never in `String#length`.
+ *
+ * Returns `""` when the budget is exhausted, so the caller can fall back to the count-only row —
+ * the count in the head always tells the truth even when not one name fits.
+ */
+function fitTaskList(tasks: TaskSnapshot[], budget: number): string {
+  if (budget <= 0 || tasks.length === 0) return "";
+  // Epoch clock, like every other task-duration surface: the hold's own budget runs on
+  // `performance.now()`, but a task's `startedAt` is `Date.now()` — mixing the two is meaningless.
+  const now = Date.now();
+  const items = tasks.map((task) => taskLabel(task, now));
+  let shown = 0;
+  let text = "";
+  while (shown < items.length) {
+    const candidate = shown === 0 ? items[0]! : `${text} · ${items[shown]!}`;
+    // Reserve the marker for *this* stopping point: its width depends on how many stay hidden.
+    const hidden = items.length - shown - 1;
+    const marker = hidden > 0 ? ` +${hidden} more` : "";
+    if (displayWidth(candidate) + displayWidth(marker) > budget) break;
+    text = candidate;
+    shown++;
+  }
+  const hidden = items.length - shown;
+  if (hidden === 0) return text;
+  if (shown === 0) {
+    // Not even one label fits with its marker: ellipsize the first instead of hiding the only
+    // identifiable task behind `+N more`. The caller clamps the final line as a last resort.
+    const marker = items.length > 1 ? ` +${items.length - 1} more` : "";
+    return `${truncateToWidth(items[0]!, Math.max(1, budget - displayWidth(marker)))}${marker}`;
+  }
+  return `${text} +${hidden} more`;
+}
 
 /**
  * Why the hold may leave early (0.4.3, D-5 修订 3): the user always wins over the wait.
@@ -220,19 +294,34 @@ export function registerHold(
   };
 
   /**
-   * §7.1 修订 4: the visible "still working" row. A frame of `SPINNER_FRAMES` changes every
-   * `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the elapsed seconds tick with it.
+   * §7.1 修订 4 / 修订 5: the visible "still working" row. A frame of `SPINNER_FRAMES` changes
+   * every `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the elapsed seconds tick with
+   * it.
+   *
+   * 修订 5 adds the part the user missed: *which* tasks are being waited for. A count alone cannot
+   * be acted on — the user cannot tell "my watch is still running" from "some unrelated probe is
+   * hanging" — so the row lists every task as `name (status, elapsed)`, truncated to the terminal
+   * and summarised as `+N more`. It stays **one** line: a wrapping row would jitter the editor.
+   *
    * Purely cosmetic: every failure is swallowed like the footer (D-8).
    */
-  const setProgress = (ctx: HoldContext | undefined, count: number, elapsedMs: number, tick: number): void => {
+  const setProgress = (ctx: HoldContext | undefined, tasks: TaskSnapshot[], elapsedMs: number, tick: number): void => {
     try {
       const ui = ctx?.ui;
       const setWidget = ui?.setWidget;
       if (typeof setWidget !== "function") return;
       const frame = SPINNER_FRAMES[tick % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
-      const line = `${frame} waiting for ${count} async task${count === 1 ? "" : "s"} ${formatElapsedMs(elapsedMs)} — Esc stops waiting`;
+      const count = tasks.length;
+      const head = `${frame} ${count} async task${count === 1 ? "" : "s"} ${formatElapsedMs(elapsedMs)}`;
+      const tail = " — Esc stops waiting";
+      const width = terminalColumns();
+      const body = fitTaskList(tasks, width - displayWidth(`${head} — `) - displayWidth(tail));
+      const line = body.length > 0 ? `${head} — ${body}${tail}` : `${head}${tail}`;
+      // Belt and braces: the budget above already fits, and an ellipsis here is still better than a
+      // row the host wraps (the pathological case is a terminal narrower than the fixed wording).
+      const clamped = displayWidth(line) > width ? truncateToWidth(line, width) : line;
       // SAFETY: `setWidget` is optional and may reject a placement; the call is inside the guard.
-      setWidget.call(ui, WIDGET_KEY, [line], { placement: "aboveEditor" });
+      setWidget.call(ui, WIDGET_KEY, [clamped], { placement: "aboveEditor" });
     } catch {
       // Cosmetic only: an old host without setWidget must not end the hold.
     }
@@ -290,16 +379,20 @@ export function registerHold(
    *
    * Every non-1 exit releases the intercepted notifications, so the completion is never lost.
    *
-   * `ids` is the snapshot taken when the boundary opened — a task started while we wait is not ours
-   * to wait for. Nothing here changes task state or consumes output (D-7); only `registry.list` is
-   * read, and a throw from it (registry suspended/shut down under us) ends the hold.
+   * `snapshot` is the set of tasks observed when the boundary opened — a task started while we
+   * wait is not ours to wait for, and `ids` is derived from it. Nothing here changes task state or
+   * consumes output (D-7); only `registry.list` is read, and a throw from it (registry
+   * suspended/shut down under us) ends the hold.
    *
    * The budget runs on `performance.now()` (monotonic, 修订 1 / F4) so a wall-clock jump can never
    * stretch a hold past `holdMs`.
    */
-  const holdUntilSettled = async (ctx: HoldContext | undefined, ids: string[]): Promise<boolean> => {
+  const holdUntilSettled = async (ctx: HoldContext | undefined, snapshot: TaskSnapshot[]): Promise<boolean> => {
+    const ids = snapshot.map((task) => task.taskId);
     const startedAt = performance.now();
-    let waiting = ids.length;
+    // 修订 5: the row names these, so the snapshot has to survive outside the poll's `try` block.
+    // Names refresh once per poll (1 s by default); the elapsed per task ticks every frame.
+    let live = snapshot;
 
     let interrupted = false;
     let wake = (): void => undefined;
@@ -327,12 +420,12 @@ export function registerHold(
       }
     } catch { /* non-interactive host: no raw input */ }
 
-    setFooter(ctx, waiting, 0);
-    setProgress(ctx, waiting, 0, 0);
+    setFooter(ctx, live.length, 0);
+    setProgress(ctx, live, 0, 0);
     let tick = 0;
-    const refresh = setInterval(() => setFooter(ctx, waiting, performance.now() - startedAt), footerRefreshMs);
+    const refresh = setInterval(() => setFooter(ctx, live.length, performance.now() - startedAt), footerRefreshMs);
     refresh.unref?.();
-    const progress = setInterval(() => setProgress(ctx, waiting, performance.now() - startedAt, ++tick), PROGRESS_FRAME_MS);
+    const progress = setInterval(() => setProgress(ctx, live, performance.now() - startedAt, ++tick), PROGRESS_FRAME_MS);
     progress.unref?.();
     try {
       // A message queued before the hold opened is the same signal as one queued during it.
@@ -355,7 +448,7 @@ export function registerHold(
           return false;
         }
         if (stillLive.length === 0) return true; // D-6 normal path: the whole snapshot finished.
-        waiting = stillLive.length;
+        live = stillLive; // 修订 5: the ticker reads this array, so the names follow the poll.
       }
       return false; // timeout: the run settles exactly as it would have without the hold (D-6).
     } finally {
@@ -392,7 +485,7 @@ export function registerHold(
       // Arm ownership before the first poll: `onFinalize` for these ids runs in the same tick the
       // process exits, always before the poll that observes the terminal state can look.
       notify?.open(ids);
-      if (!(await holdUntilSettled(context, ids))) {
+      if (!(await holdUntilSettled(context, candidates))) {
         // Timeout, disposal or a throwing registry: settle as before, with no entries and no
         // `continue` (D-6) — and hand any intercepted completion back to its normal sender.
         notify?.release();

@@ -294,10 +294,14 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
      下一个 turn 投递它。与已废弃的 F2b 探针的区别：完成通知走 `agent.followUpQueue`，**不在**该计数里
      （`agent-session.js:1959-1965`），所以这个探针对通知永远为 `false`、只对用户文本为 `true`；
   5. `dispose` / registry 抛错 → 原样 `undefined`。
-- **进度可见性（修订 4）**：`agent_end` 在 `before_settle` **之前**就把宿主的 working 行清掉了
+- **进度可见性（修订 4 / 修订 5）**：`agent_end` 在 `before_settle` **之前**就把宿主的 working 行清掉了
   （`interactive-mode.js:3060-3064`），hold 期间屏幕看起来像死机。hold 因此自带一行 widget
-  （`setWidget("pi-async-hold", ["<frame> waiting for N async task(s) <elapsed> — Esc stops waiting"],
+  （`setWidget("pi-async-hold", ["<frame> N async task(s) <elapsed> — <name> (<status>, <elapsed>) · … — Esc stops waiting"],
   { placement: "aboveEditor" })`），每 250ms 换一帧（10 帧 braille），`finally` 里无条件清除。
+  **修订 5（0.4.5）**：只报数量时用户无法分辨「在等的是我的 watch 还是某个无关探针」，所以明细必须带
+  任务名——每项 `name (status, elapsed)`，与模型侧 `<async-state>` 同形（`src/context/nudges.ts:75`）；
+  无名/空白名用 `taskId` 前 8 位；按终端**格宽**截断（CJK 算 2 格，`src/tui/width.ts`），放不下的记
+  `+N more`，**永远单行**（换行会抖动 editor）。footer 仍是 `waiting for N task(s) <elapsed>`，细节只在 widget。
   不借用 `setWorkingVisible`/`setWorkingMessage`：`workingVisible` 是会话级持久状态，hold 结束后没有
   任何事件会把它收回，会留下永久 spinner。
 - 返回：全部终态 → 追加一条 `custom_message`（`customType: "async-task-settle-results"`、`display: false`、

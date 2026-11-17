@@ -2,6 +2,21 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.5 — 2026-11-17（等待条重新显示在等哪些任务）
+
+hold 期间屏幕上唯一的界面行只有 `N async tasks <elapsed>`，用户无法分辨在跑的是自己的 watch 还是某个
+无关探针，只能打开 rail/panel 或等 hold 结束。现在它直接列出快照内的每一个任务。
+
+### Added
+
+- **等待条列出正在等待的任务**（CONTRACT §7.1 修订 5）：每项 `name (status, elapsed)`，与模型侧
+  `<async-state>` 同形（`src/context/nudges.ts:75`）；无名/空白名用 `taskId` 前 8 位；按终端**格宽**
+  （CJK=2 格）截断并以 `+N more` 收尾，**始终单行**（不换行抖动 editor）；每任务耗时随 250ms 帧刷新，
+  集合随 poll（默认 1s）刷新。footer 仍是 `waiting for N task(s) <elapsed>`，明细只在 widget。
+  纯 cosmetic：渲染失败一律吞掉，不会结束 hold（D-8）。
+- 这是**补上从未实现的能力**，不是修复退化：hold 自 0.4.0 起的三个版本（`b2b6b47` / `71b690b` / `43e5c29`）
+  等待条都只报数量，任务名此前只存在于 rail、`/async` 面板与 hold 结束后的 results entry。
+
 ## 0.4.4 — 2026-11-17（忙碌父会话的完成通知不再被压到 run 结束）
 
 主题是**投递通道选错**：`sendMessage` 用 `deliverAs:"followUp"`，而宿主只在模型**不再发起 tool call** 时
