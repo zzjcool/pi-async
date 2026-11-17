@@ -153,9 +153,11 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
   calling `ctx.abort()`, `/tree` navigation) still cannot preempt the handler; see Known limitations.
 - **It visibly moves.** pi clears its own working row at `agent_end`, i.e. before this boundary, so a
   hold would otherwise look like a frozen screen. While it waits, the plugin renders its own row above
-  the editor — a spinning `⠋⠙⠹…` frame every 250 ms plus the elapsed seconds and `Esc stops waiting` —
-  and removes it in a `finally`. The footer line `waiting for N tasks <elapsed>` (15 s cadence) is
-  still written when the host exposes `setStatus`, but it is no longer the only sign of life.
+  the editor — a spinning `⠋⠙⠹…` frame every 250 ms, the elapsed time, and **which tasks** it is waiting
+  for (`name (status, elapsed)` per task, `+N more` when the line runs out of room), plus
+  `Esc stops waiting` — and removes it in a `finally`. The footer line `waiting for N tasks <elapsed>`
+  (15 s cadence) is still written when the host exposes `setStatus`, but it is no longer the only sign
+  of life.
 - When every task in the snapshot finished, the boundary returns one
   `async-task-settle-results` draft (name, status, exit code — **never** the output tail, use
   `async_logs`) plus `continue: true`, so the outcome reaches the transcript even if the wake-up was

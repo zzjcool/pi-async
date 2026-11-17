@@ -9,6 +9,7 @@ import { init } from "../extensions/index.ts";
 import { registerHold } from "../src/guard/hold.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
+import { displayWidth } from "../src/tui/width.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -91,6 +92,13 @@ function sequenceRegistry(sequence: TaskSnapshot[][]) {
 const running = (taskId: string, metadata: Record<string, unknown> = {}) =>
   makeSnapshot({ taskId, status: "running", metadata });
 const completed = (taskId: string) => makeSnapshot({ taskId, status: "completed" });
+
+/**
+ * A running task with a real name and a pinned start time, so the progress row's label
+ * (`name (status, elapsed)`) is fully predictable in an assertion.
+ */
+const named = (taskId: string, name: string, startedAt: number) =>
+  makeSnapshot({ taskId, name, status: "running", startedAt, metadata: {} });
 
 type EnvName = "PI_ASYNC_HOLD" | "PI_ASYNC_HOLD_MS" | "PI_ASYNC_HOLD_POLL_MS" | "PI_LEGION_NODE_ID";
 
@@ -778,7 +786,9 @@ test("the hold renders a live progress row and clears it when it ends (§7.1 修
   await withEnv(CLEAN, async () => {
     // Six running polls of 120 ms: long enough for the 250 ms frame ticker to advance at least twice.
     const { pi, fireOne } = makePi();
-    const registry = sequenceRegistry([[running("A")], [running("A")], [running("A")], [running("A")], [running("A")], [running("A")], []]);
+    const startedAt = Date.now();
+    const live = [named("A", "example", startedAt)];
+    const registry = sequenceRegistry([live, live, live, live, live, live, []]);
     registerHold(pi as never, registry as never, { holdMs: 5000, pollMs: 120 });
     const interactive = makeInteractiveCtx();
 
@@ -787,11 +797,89 @@ test("the hold renders a live progress row and clears it when it ends (§7.1 修
     const rows = interactive.progress();
     assert.ok(rows.length >= 3, `the row keeps ticking while the hold waits (got ${rows.length} writes)`);
     assert.equal(rows[0]?.placement, "aboveEditor");
-    assert.match(String(rows[0]?.content?.[0]), /^⠋ waiting for 1 async task 0s — Esc stops waiting$/);
+    assert.equal(rows[0]?.content?.length, 1, "the row is a single line");
+    assert.match(String(rows[0]?.content?.[0]), /^⠋ 1 async task 0s — example \(running, 0s\) — Esc stops waiting$/);
     const frames = new Set(rows.map((row) => String(row.content?.[0] ?? "").charAt(0)));
     assert.ok(frames.size >= 2, `the spinner really animates (frames: ${[...frames].join("")})`);
-    assert.ok(rows.some((row) => /waiting for 1 async task \d+s/.test(String(row.content?.[0]))), "elapsed seconds are shown");
+    assert.ok(
+      rows.some((row) => /1 async task \d+s — example \(running, \d+s\) — Esc stops waiting$/.test(String(row.content?.[0]))),
+      "elapsed seconds are shown for the hold and for the task",
+    );
     assert.equal(rows.at(-1)?.content, undefined, "the row is removed when the hold ends");
+  });
+});
+
+/**
+ * 0.4.5 regression (PLAN-HOLD 修订 5): the row used to say only "1 async task 0s", so the user could
+ * not tell *which* task the turn was waiting for. Anyone who deletes the task list from the row (or
+ * drops the names back to a bare count) turns this test red — that is its whole purpose.
+ */
+test("the progress row names every task it is waiting for (PLAN-HOLD 修订 5)", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-run2", now - 64_000);
+    const probe = named("t6j00002-aaaa-bbbb-cccc-dddddddddddd", "watch-t6j-probe", now - 32_000);
+    const registry = sequenceRegistry([[watch, probe], [watch, probe], []]);
+    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    const row = String(interactive.progress()[0]?.content?.[0]);
+    assert.equal(interactive.progress()[0]?.content?.length, 1, "the detail still fits on one line");
+    assert.ok(row.includes("watch-t4q-run2"), `the first task is named (got: ${row})`);
+    assert.ok(row.includes("watch-t6j-probe"), `the second task is named (got: ${row})`);
+    // Each task carries its own status and its own elapsed time, ` · `-joined like the async-state line.
+    assert.ok(
+      row.includes("watch-t4q-run2 (running, 1m 4s) · watch-t6j-probe (running, 32s)"),
+      `each task shows its status and its own elapsed time (got: ${row})`,
+    );
+  });
+});
+
+test("a narrow terminal truncates the task list instead of wrapping the row", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const tasks = Array.from({ length: 6 }, (_, index) => named(`id-000000${index}`, `watch-task-number-${index}`, now));
+    const registry = sequenceRegistry([tasks, tasks, []]);
+    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    const previousColumns = process.stdout.columns;
+    Object.defineProperty(process.stdout, "columns", { value: 80, configurable: true });
+    try {
+      assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+    } finally {
+      Object.defineProperty(process.stdout, "columns", { value: previousColumns, configurable: true });
+    }
+
+    const row = String(interactive.progress()[0]?.content?.[0]);
+    // One column stays free so the host never wraps the row (that is the jitter being prevented).
+    assert.ok(displayWidth(row) <= 79, `the row fits an 80-column terminal (${displayWidth(row)} cells: ${row})`);
+    assert.match(row, / \+\d+ more — Esc stops waiting$/, `the overflow is summarised (got: ${row})`);
+    assert.ok(row.includes("watch-task-number-0"), `the first task is still named (got: ${row})`);
+    assert.ok(!row.includes("watch-task-number-5"), `the last task is behind +N more, not printed (got: ${row})`);
+  });
+});
+
+test("an unnamed task is identified by the first 8 characters of its id", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const blank = makeSnapshot({ taskId: "abcd1234-5678-90ab-cdef-0123456789ab", name: "", status: "running", startedAt: now, metadata: {} });
+    const spaces = makeSnapshot({ taskId: "beef5678-90ab-cdef-0123-456789abcdef", name: "   ", status: "running", startedAt: now, metadata: {} });
+    const registry = sequenceRegistry([[blank, spaces], [blank, spaces], []]);
+    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    const row = String(interactive.progress()[0]?.content?.[0]);
+    assert.ok(row.includes("abcd1234 (running, 0s)"), `an empty name falls back to the id prefix (got: ${row})`);
+    assert.ok(row.includes("beef5678 (running, 0s)"), `a whitespace-only name falls back too (got: ${row})`);
+    assert.ok(!row.includes("abcd1234-5678"), `the whole uuid is not printed (got: ${row})`);
   });
 });
 
