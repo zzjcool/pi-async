@@ -2,6 +2,26 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.4 — 2026-11-17（忙碌父会话的完成通知不再被压到 run 结束）
+
+主题是**投递通道选错**：`sendMessage` 用 `deliverAs:"followUp"`，而宿主只在模型**不再发起 tool call** 时
+才抽 followUp 队列（`pi-agent-core/dist/agent-loop.js:197`），steering 队列则**每个 turn 边界**都抽
+（同文件 `:191`）。所以父会话只要还在连续调工具，完成通知就必然被压到整个 run 结束——实测
+`finishedAt` 04:15:24.745 → 注入 04:18:23.383（**+178.6s**），12 秒后又出现第二条。
+
+### Fixed
+
+- **活动 run 改用 steer + `turn_end` 结算**（CONTRACT §7.2 修订 2）：任务终态时父会话在 streaming →
+  `deliverAs:"steer"`，并在**下一个 `turn_end`** 结算（宿主在 `turn_end` 之后立刻读 steering：
+  `agent-loop.js:188-199`），不再等 `agent_before_settle`。空闲会话仍是 `followUp` + `triggerTurn: true`
+  （直接开新一轮唤醒）。0.4.3 的「延后到边界再裁决」保留——只是把最早结算点从 settle 提前到 turn 边界。
+- **单次终态只入队一次**：`pendingNotifications` 以 taskId 为键、flush 前整体 `clear`，`turn_end` /
+  `agent_before_settle` / `agent_settled` 三个结算点幂等；`notified` / `notifyAttempts` 语义不变
+  （一次发送 = `notifyAttempts+1`，host 接受后 `notified=true`）。新增用例锁住：跨三个边界 +
+  `resendUnnotified` 重放后仍只有 1 条、`notifyAttempts === 1`。
+- **`triggerOnCompletion: false` 也走同一条仲裁**：不再在 finalize 当场入队，避免长 run 里同样迟到；
+  区别只是 idle 时不会 `triggerTurn` 起新一轮。
+
 ## 0.4.3 — 2026-11-17（一个终态只播报一次；hold 可被 Esc 打断）
 
 两个主题。一是**同一个终态被重复播报**：hold 期间完成的任务先收到 `async-task-settle-results`（当场、in-run），

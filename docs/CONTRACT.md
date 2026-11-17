@@ -344,6 +344,16 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   通知 02:59:23 / 02:59:35，均落在 assistant 停止后 +9–12ms）。
 - **持久化**：`consumedAt` 写进 `<taskId>.json`（重载后仍生效）；`notified` 保持「host 已接受」语义不变；
   `outputConsumed` 保持原有「输出已读 / #15 提醒抑制」语义，两者不合并。
+- **投递通道（修订 2，0.4.4）**：父 run 活动时用 `deliverAs: "steer"`，并在 **`turn_end`** 结算。理由：
+  宿主只在模型**不再发起 tool call** 时才抽 `followUp`（`pi-agent-core/dist/agent-loop.js:197`），但
+  **每个 turn 边界**都抽 steering（同文件 `:191`），而且 `turn_end` 之后立刻读 steering（`:188-199`）。
+  实测反例（0.4.3）：任务 `finishedAt` 04:15:24.745，通知 04:18:23.383 才注入（**+178.638s**），
+  因为父会话一直在连续调工具；改用 steer + `turn_end` 结算后，同场景延迟降为一个 turn。
+  idle 仍用 `followUp` + `triggerTurn: true`（直接开新一轮唤醒）。
+- **单次终态只入队一次**：`pendingNotifications` 以 taskId 为键，flush 前先整体 `clear`，
+  `turn_end` / `agent_before_settle` / `agent_settled` 三个 flush 点幂等；`notified` / `notifyAttempts`
+  语义不变（发送一次 = `notifyAttempts+1`，host 接受后 `notified=true`）。测试钉住：跨三个边界 +
+  `resendUnnotified` 重放后仍只有 1 条、`notifyAttempts === 1`。
 - `notifyOnCompletion: false` / `triggerOnCompletion: false` 语义不变。
 
 ## 8. TUI（冻结，仅主会话）
@@ -549,7 +559,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | D9 | delayed：reload 恢复计时；dataDir 变更（切 session）时 copy+rename 迁移 `.json/.output/.stdout/.stderr` 并重写 `metadata.outputFile`，任务不丢（§10 / REV-17） |
 | D10 | settle 守卫每 run 重武装、累计 ≤3 次，超限放行但保留未决清单提示 |
 | D-14 | settle hold（§7.1）：仅在交互 TUI 会话、且存在会唤醒会话的 **running** 任务时，在 `agent_before_settle` 内等它们全部终态再 settle（上限 `PI_ASYNC_HOLD_MS`，默认 600000ms，单调时钟；**出口**：全终态 / 超时 / **Esc** / **用户已入队消息** / dispose，见 §7.1 修订 4）；全部终态时自带 `async-task-settle-results` entry + `continue: true`（不内联 outputTail），超时原样放行；`pending`/delayed、军团 child、`print`/`json`/`rpc` 都不 hold；**修订 3（0.4.3）**：hold 等待期间快照内任务的完成通知被扣住，全终态时由 results entry 独占播报并落 `notified`，非全终态出口则原样交还；**修订 4（0.4.3）**：Esc 经 `ui.onTerminalInput` 毫秒级释放，用户入队消息下一 poll 释放，hold 期间自带 250ms 刷新的 widget 进度行（修订 1 / 2 / 3 / 4） |
-| D-15 | 终态播报唯一性（§7.2，0.4.3）：`consumedAt` latch；`async_wait`/`async_status`/`async_logs` 交付终态即上锁；run 活动期通知不立即入队，延后到 settle 边界再裁决；`claimNotification`/`resendUnnotified` 跳过已消费任务；只对终态行上锁（修订 1） |
+| D-15 | 终态播报唯一性（§7.2，0.4.3）：`consumedAt` latch；`async_wait`/`async_status`/`async_logs` 交付终态即上锁；run 活动期通知不立即入队，延后到 turn/ settle 边界再裁决；`claimNotification`/`resendUnnotified` 跳过已消费任务；只对终态行上锁；**修订 2（0.4.4）**：活动 run 用 `deliverAs:"steer"` + `turn_end` 结算（`followUp` 只在模型停手时才抽），idle 仍 `followUp` + `triggerTurn` |
 
 ## 14. 验收清单（verify 门禁）
 

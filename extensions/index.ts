@@ -341,7 +341,14 @@ export async function init(pi: PiCtx): Promise<void> {
       };
       // Honest notification (PLAN §2.4/§2.8): no fake retries here. A failed send keeps
       // notified=false / notifyAttempts>0 in the registry and is re-sent at the next session_start.
-      const send = () => sendCompletionNotification(pi, registry, payload, { triggerTurn: snapshot.metadata.triggerOnCompletion !== false })
+      // Delivery channel (0.4.4, CONTRACT §7.2 修订 2): a live run gets `steer`, which the host drains
+      // at the *next turn boundary* (`agent-loop.js:191`); `followUp` would wait until the model stops
+      // asking for tools (`:197`) — 178 s in session 01a1e7… when the parent kept calling tools.
+      // An idle session keeps `followUp` + `triggerTurn`, which starts the wake-up run immediately.
+      const send = () => sendCompletionNotification(pi, registry, payload, {
+        triggerTurn: snapshot.metadata.triggerOnCompletion !== false,
+        deliverAs: runActive ? "steer" : "followUp",
+      })
         .then((outcome) => {
           if (outcome === "failed") {
             console.error(`pi-async: completion notification failed for ${snapshot.taskId}; it will be re-sent on the next session_start`);
@@ -354,11 +361,11 @@ export async function init(pi: PiCtx): Promise<void> {
       // "late receipt" (session 01a1e5b5 ln393→ln404, 49.6 s). The relay hands it back on every
       // hold exit that does not produce an entry (timeout/dispose), so nothing is lost.
       if (holdNotify.claim(snapshot.taskId, send)) return;
-      // §7.2: while a run is live, queue the decision for the settle boundary instead of the host's
-      // followUp queue — by then a consumer (wait/status/logs) may have latched the terminal state.
-      // `triggerOnCompletion: false` keeps 0.4.2 behaviour: it cannot wake anything, so there is no
-      // second turn to suppress.
-      if (runActive && snapshot.metadata.triggerOnCompletion !== false) {
+      // §7.2: while a run is live, do not enqueue at finalize — hand the send to the next **turn
+      // boundary** (`turn_end` below), where a consumer (wait/status/logs) may already have latched
+      // the terminal state. Deferring every completion keeps one rule: the first boundary after the
+      // task finishes decides, and `triggerOnCompletion: false` only stops the *idle* wake-up turn.
+      if (runActive) {
         pendingNotifications.set(snapshot.taskId, send);
         return;
       }
@@ -419,6 +426,10 @@ export async function init(pi: PiCtx): Promise<void> {
     // the guard's advisory still runs afterwards on the same boundary. The relay is what lets the
     // hold own the completion of a task that finishes inside that wait (CONTRACT §7.1 修订 3).
     activeHold = registerHold(pi, registry, { notify: holdNotify });
+    // §7.2 (0.4.4): the turn boundary is the earliest honest delivery point — the host drains the
+    // steering queue right after `turn_end` (`agent-loop.js:188-199`), so a steer queued here reaches
+    // the very next request instead of waiting for the model to stop calling tools.
+    context.on("turn_end", () => { flushPendingNotifications(); return undefined; });
     // §7.2: registered AFTER the hold, so a task the results entry owns is already latched
     // `notified` and this flush skips it. Runs before the guard (which only reads active tasks).
     context.on("agent_before_settle", () => { flushPendingNotifications(); return undefined; });

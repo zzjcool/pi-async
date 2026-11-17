@@ -176,12 +176,17 @@ export async function sendReminder(
  * persist the attempt → send `sendMessage` (awaited only when the host returns a promise) →
  * latch `notified` on success or drop the claim on failure (`notified` stays false so
  * `resendUnnotified` can retry later).
+ *
+ * `deliverAs` (0.4.4, CONTRACT §7.2 修订 2): the host drains `followUp` only when the model stops
+ * asking for tool calls (`pi-agent-core/dist/agent-loop.js:197`), but drains `steer` at **every**
+ * turn boundary (`:191`). A completion decided while the parent run is live must therefore steer;
+ * `followUp` is kept for the idle case, where `triggerTurn` starts the wake-up run.
  */
 export async function sendCompletionNotification(
   pi: PiCtx,
   registry: TaskRegistry,
   p: NotifyPayload,
-  options: { triggerTurn?: boolean } = {},
+  options: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" } = {},
 ): Promise<NotifyOutcome> {
   const task = registry.get(p.taskId);
   // skipped: nothing to notify about (unknown/consumed task) or the caller opted out.
@@ -203,7 +208,7 @@ export async function sendCompletionNotification(
     // No retry loop and no rollback — the host offers no ack, so retrying only duplicates messages.
     const result = target.sendMessage(
       { customType: "async-task-notification", content: buildNotificationXml(p), details: buildNotificationDetails(p) },
-      { deliverAs: "followUp", ...(options.triggerTurn === false ? {} : { triggerTurn: true }) },
+      { deliverAs: options.deliverAs ?? "followUp", ...(options.triggerTurn === false ? {} : { triggerTurn: true }) },
     );
     if (isThenable(result)) await result;
   } catch {

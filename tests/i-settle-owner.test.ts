@@ -32,7 +32,7 @@ type Tool = {
   execute: (toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
 };
 
-type Announcement = { customType: string; content: string; deliveredIn: "boundary" | "later-turn" };
+type Announcement = { customType: string; content: string; deliveredIn: "boundary" | "turn-boundary" | "later-turn" };
 
 type BeforeSettleResult = { entries?: Array<{ customType?: string; content?: string }>; continue?: boolean } | undefined;
 
@@ -57,6 +57,8 @@ function makeHost(cwd: string) {
   const transcript: Announcement[] = [];
   /** `sendMessage(..., {deliverAs:"followUp"})` while streaming: queued, invisible to the model. */
   const followUps: Array<{ customType: string; content: string }> = [];
+  /** `deliverAs:"steer"` while streaming: queued too, but drained at the *next* turn boundary. */
+  const steerQueue: Array<{ customType: string; content: string }> = [];
   let runLive = false;
   const sessionManager = { getSessionDir: () => cwd, getSessionId: () => "i-settle-owner" };
 
@@ -77,8 +79,12 @@ function makeHost(cwd: string) {
       };
     },
     sendMessage: (message: { customType: string; content: string }, options?: { deliverAs?: string }) => {
-      // agent-session.js:1959-1962 — streaming + followUp is enqueue-only, nothing is written now.
-      if (options?.deliverAs === "followUp" && runLive) {
+      // agent-session.js:1959-1965 — streaming + steer/followUp is enqueue-only, nothing is written now.
+      if (runLive && options?.deliverAs === "steer") {
+        steerQueue.push({ customType: message.customType, content: String(message.content) });
+        return;
+      }
+      if (runLive && options?.deliverAs === "followUp") {
         followUps.push({ customType: message.customType, content: String(message.content) });
         return;
       }
@@ -114,6 +120,9 @@ function makeHost(cwd: string) {
     pi,
     transcript,
     followUps,
+    steerQueue,
+    /** Everything the host still holds, whichever queue it is in. */
+    queued: (): number => steerQueue.length + followUps.length,
     tools,
     ui,
     progressRows,
@@ -133,7 +142,13 @@ function makeHost(cwd: string) {
     /** The run ends: only now does pi turn queued followUps into transcript records. */
     endRun: (): void => {
       runLive = false;
+      for (const message of steerQueue.splice(0)) transcript.push({ ...message, deliveredIn: "turn-boundary" });
       for (const message of followUps.splice(0)) transcript.push({ ...message, deliveredIn: "later-turn" });
+    },
+    /** The `turn_end` boundary: pi drains the steering queue right after it (agent-loop.js:188-199). */
+    turnEnd: async (): Promise<void> => {
+      await fire("turn_end", {});
+      for (const message of steerQueue.splice(0)) transcript.push({ ...message, deliveredIn: "turn-boundary" });
     },
     /** A later genuinely-idle `session_start` (what `resendUnnotified` runs on). */
     idle: (): void => { runLive = false; },
@@ -301,7 +316,7 @@ test("a legion child keeps its own channel: no hold, the completion notification
       // CONTRACT §7: a legion child never holds — and the guard's reminder path is untouched here.
       assert.equal(result, undefined, "no hold in a legion child");
       await host.settle(result);
-      await waitFor(() => host.followUps.length === 1);
+      await waitFor(() => host.queued() === 1);
       host.endRun();
 
       const announcements = host.mentions("child-task");
@@ -348,7 +363,7 @@ test("Esc during a hold settles it at once — and the notification is still the
 
       // The task finishes after the hold: its notification is the one announcement (the relay was
       // released, so nothing was swallowed and nothing was folded twice).
-      await waitFor(() => host.followUps.length === 1, 6000);
+      await waitFor(() => host.queued() === 1, 6000);
       host.endRun();
 
       const announcements = host.mentions("esc-task");
@@ -415,6 +430,7 @@ test("a task already collected with async_wait is never announced again", async 
 
       assert.equal(host.mentions("consumed-task").length, 0, "the one announcement already happened through async_wait");
       assert.deepEqual(host.followUps, [], "nothing is left in the host's followUp queue to arrive late");
+      assert.deepEqual(host.steerQueue, [], "and nothing was steered for a task the model already collected");
       const snapshot = readSnapshot(cwd, task.taskId);
       assert.equal(typeof snapshot.consumedAt, "number", "the consumer latch is persisted");
       assert.equal(snapshot.notified, false, "no notification slot was consumed");
@@ -467,7 +483,8 @@ test("a task nobody collected is still announced once — at the settle boundary
       await new Promise((resolve) => setTimeout(resolve, 250));
 
       const [first] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
-      assert.equal(host.followUps.length, 1, "the boundary decides: exactly one notification is queued");
+      assert.equal(host.queued(), 1, "the boundary decides: exactly one notification is queued");
+      assert.equal(host.steerQueue.length, 1, "the settle boundary is inside a live run, so the host gets a steer");
       await host.settle(first);
 
       // A second boundary in the same run must not announce it again.
@@ -480,6 +497,100 @@ test("a task nobody collected is still announced once — at the settle boundary
       assert.equal(announcements[0]?.customType, "async-task-notification");
       assert.equal(readSnapshot(cwd, task.taskId).notified, true, "the notification slot is latched");
       assert.equal(readSnapshot(cwd, task.taskId).consumedAt, undefined, "no consumer claimed it");
+    } finally {
+      await host.fire("session_shutdown", { reason: "quit" });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * CONTRACT §7.2 修订 2 (0.4.4): the delivery channel is chosen by run state.
+ *
+ * pi drains `followUp` only when the model stops asking for tool calls
+ * (`pi-agent-core/dist/agent-loop.js:197`) but drains `steer` at every turn boundary (`:191`), so a
+ * completion decided mid-run must steer — `followUp` put the notification 178.6 s behind the task's
+ * `finishedAt` in the reported session, because the parent kept calling tools the whole time.
+ */
+
+test("a completion decided mid-run steers at the next turn boundary instead of waiting for run end", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-async-steer-boundary-"));
+  await withEnv(CLEAN, async () => {
+    const { host, toolCtx }: { host: Host; toolCtx: Record<string, unknown>; settleCtx: Record<string, unknown> } = await bootHost(cwd);
+    try {
+      await host.fire("agent_start");
+      payload(await host.tools.get("async_run")!.execute("run", {
+        command: "sleep 0.1; echo steer-marker",
+        name: "steer-task",
+        mode: "background",
+      }, undefined, undefined, toolCtx));
+      await new Promise((resolve) => setTimeout(resolve, 250)); // finalize happens mid-run
+
+      assert.equal(host.queued(), 0, "nothing is enqueued at finalize: the boundary decides");
+      await host.turnEnd(); // the very next turn boundary of the same run
+      const delivered = host.transcript.filter((entry) => entry.customType === "async-task-notification");
+      assert.equal(delivered.length, 1, "the completion is visible one turn boundary later");
+      assert.equal(delivered[0]?.deliveredIn, "turn-boundary", "steer, not followUp — no new turn is wasted");
+    } finally {
+      await host.fire("session_shutdown", { reason: "quit" });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("an idle session keeps followUp + triggerTurn, so the notification starts a wake-up run", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-async-idle-followup-"));
+  await withEnv(CLEAN, async () => {
+    const { host, toolCtx }: { host: Host; toolCtx: Record<string, unknown>; settleCtx: Record<string, unknown> } = await bootHost(cwd);
+    try {
+      host.idle(); // no run is live
+      const task = payload(await host.tools.get("async_run")!.execute("run", {
+        command: "sleep 0.1; echo idle-marker",
+        name: "idle-task",
+        mode: "background",
+      }, undefined, undefined, toolCtx));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      assert.equal(host.steerQueue.length, 0, "no steer while the session is idle (steering needs a live run)");
+      assert.equal(host.followUps.length, 0, "a wake-up is written immediately, not queued as a streaming followUp");
+      const delivered = host.transcript.filter((entry) => entry.customType === "async-task-notification");
+      assert.equal(delivered.length, 1, "the idle send starts the wake-up run");
+      const snapshot = readSnapshot(cwd, task.taskId);
+      assert.equal(snapshot.notified, true);
+      assert.equal(snapshot.notifyAttempts, 1);
+    } finally {
+      await host.fire("session_shutdown", { reason: "quit" });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("one terminal event never produces two notifications across turn_end, settle and replay", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-async-notify-once-"));
+  await withEnv(CLEAN, async () => {
+    const { host, toolCtx, settleCtx }: { host: Host; toolCtx: Record<string, unknown>; settleCtx: Record<string, unknown> } = await bootHost(cwd);
+    try {
+      await host.fire("agent_start");
+      const task = payload(await host.tools.get("async_run")!.execute("run", {
+        command: "sleep 0.1; echo once-marker",
+        name: "once-task",
+        mode: "background",
+      }, undefined, undefined, toolCtx));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      await host.turnEnd();                       // first boundary: the one legitimate send
+      await host.turnEnd();                       // the run keeps working: nothing left to decide
+      const [result] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
+      await host.settle(result);
+      await host.fire("session_start", { type: "session_start" }, settleCtx); // resendUnnotified replay
+      host.endRun();
+
+      const notifications = host.mentions("once-task");
+      assert.equal(notifications.length, 1, `exactly one notification (got ${notifications.length})`);
+      assert.equal(notifications[0]?.customType, "async-task-notification");
+      const snapshot = readSnapshot(cwd, task.taskId);
+      assert.equal(snapshot.notified, true, "the completion slot is closed");
+      assert.equal(snapshot.notifyAttempts, 1, "the host was called once, not once per boundary");
     } finally {
       await host.fire("session_shutdown", { reason: "quit" });
       rmSync(cwd, { recursive: true, force: true });
