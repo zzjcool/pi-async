@@ -302,6 +302,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   取一次，与 rail 的渲染共用同一窗口/滚动状态），hold 行只写
   `setWidget("pi-async-hold", ["<frame> waiting <hold-elapsed> — Esc stops waiting"], { placement: "aboveEditor" })`
   ——`<hold-elapsed>` 是**这一轮被 hold 多久**，与任何任务的耗时都不是同一个数字，rail 上也看不到。
+  > **修订 8（0.4.8）已删除这一行**：`pi-async-hold` 这个 widget key 不复存在，`pi-async-hold` 只剩 footer 的
+  > status key；等待行改为 rail 首行（见下文修订 8），因此本节描述的“输入框上方独立一行”是 0.4.4–0.4.7 的历史。
   任务名/状态/耗时由 rail 行承担：0.4.5 把它们搬到 hold 行后，同一终端里汇总行、rail 行、hold 行
   三行在说同一件事（用户截图报的冗余）。
   **其他一切情况**——宿主没有 `setWidget`、widget 已被宿主清掉、rail 的窗口没覆盖这些任务——都退回
@@ -325,6 +327,29 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   均为英文，中英混排会割裂。两点都是有意为之，不是待办。
   不借用 `setWorkingVisible`/`setWorkingMessage`：`workingVisible` 是会话级持久状态，hold 结束后没有
   任何事件会把它收回，会留下永久 spinner。
+  **修订 8（0.4.8）：等待行并进 rail，输入框上方不再单独一行。** 修订 6/7 把明细收进 rail 之后，
+  `⠙ waiting 2m 28s — Esc stops waiting` 与 rail 首行仍是两块界面在说同一件事，用户裁决
+  「外观版的话我觉得可以，这样输入框上方的 `⠙ waiting 2m 28s — Esc stops waiting` 这个我觉得就可以不要了」。
+  因此 hold 期间 **rail 首行就是等待行**：`⠙ async_wait · running <hold-elapsed> — Esc stops waiting`
+  （braille 首字符保留、250ms 换帧；文案英文；唯一来源是 `src/tui/surfaces.ts` 的
+  `waitingRow(frame, elapsed, detail?)`，rail 首行与 hold 兜底行都调它，别处不许再拼一遍 `async_wait`）。
+  它 **顶掉**首行汇总行而不是新增一行：`RAIL_MAX_LINES=4` 冻结，用户示意正是「等待行 + 3 行任务」，
+  所以 `RAIL_TASK_SLOTS` 仍是 3 —— 调小会让第三个任务失去名字行 ⇒ `railShowsTasks` 变假 ⇒ 兜底行回来，
+  同一件事又说两遍。hold 每帧 `setHoldSurface({frame, elapsed})` + `railRepaint()` 驱动 250ms 重绘
+  （rail 自己的 ticker 是 1Hz，不够用）；`clearWaiting` 在 `holdUntilSettled` 的 `finally` 里撤销声明，
+  因此结束后首行自动回到汇总行（覆盖全终态 / 超时 / Esc / 用户入队 / dispose / registry 抛错全部出口）。
+  兜底键改为 `pi-async-hold-fallback`，**只在 rail 画不出来时存在**（宿主没有 `setWidget`、widget 被清且
+  装不回来、rail 窗口没覆盖这些任务），内容
+  `⠙ async_wait · running <elapsed> — <name> (status, elapsed) · … — Esc stops waiting`；
+  §8 不变式（每个等待中的任务名必须在屏幕上出现一次）因此保住：rail 正常画 ⇒ 名字只在 `▶` 行；
+  否则先 `setHoldSurface(undefined)`，再 `ensureRailSurface()` 自愈并**立即复检**，仍不行才由 hold 自己带名。
+  两面互斥：任何时刻全屏最多一处 `async_wait` 文本（测试用 `split("async_wait").length - 1 === 1` 断言）。
+  宿主**完全没有** `setWidget` 时 footer 追加任务名
+  （`waiting for N task(s) <elapsed> — name (status, elapsed) · …`），这是 §8 的最后落点；有 `setWidget` 时
+  footer 保持原样（不重复任务名）。
+  **宿主 working 行仍不可借用（复核，0.4.8）**：`interactive-mode.js` 的 `setWorkingVisible()` 中
+  `if (this.session.isStreaming && …) this.showWorkingStatusIndicator();` —— hold 期间 `agent_end` 已过、
+  没有流式输出，借用无效，修订 4 的裁决继续保留。
 - 返回：全部终态 → 追加一条 `custom_message`（`customType: "async-task-settle-results"`、`display: false`、
   不含 outputTail、指路 `async_logs`）并 **`continue: true`**；其余出口 → 原样 `undefined`（不带 entries/continue）。
   `continue` 不会成环：再次进入边界时快照内任务已终态。
@@ -341,7 +366,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - 仍然：不 consume 输出、不改任务状态、不内联 outputTail；`notified` 仅在「results entry 已播报」
   这一种情况下由 hold 置位（修订 3 取代 0.4.2 的「不动 `notified`／不抑制通知」）。
 - footer：`waiting for N task(s) <elapsed>`（key `pi-async-hold`），15s 刷新，结束后清除；全部 best-effort
-  （0.4.3 起它只是辅助信号，主信号是上面的 250ms widget —— 实测 16s hold 只触发 3 次 footer 写）。
+  （0.4.3 起它只是辅助信号，主信号是上面的 250ms 等待行 —— 修订 8 起那行在 rail 首行；实测 16s hold 只触发
+  3 次 footer 写）。宿主**完全没有** `setWidget` 时 footer 追加任务名（修订 8，§8 的最后落点）。
 - 开关：`PI_ASYNC_HOLD=0` 不注册任何 handler；`PI_ASYNC_HOLD_MS <= 0` 同样关闭。
 
 ### 7.2 终态播报唯一性（0.4.3，D-15）
@@ -402,6 +428,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   鼠标事件仅在 fullscreen / alt-screen（开启鼠标上报）时可用；regular 模式用 `/async` + 键盘。
   `renderRailRows(snapshots, width, now?)` 为纯函数，内部最多渲染 3 个任务行；没有可见任务时
   整个 widget 返回 `[]`，不显示汇总行。
+  **hold 期间首行不是汇总行（修订 8，0.4.8）**：hold 在等时首行换成等待行
+  `⠙ async_wait · running <hold-elapsed> — Esc stops waiting`（顶掉汇总行，不是新增一行），
+  `▶ name · state · elapsed` 任务行、任务槽位数与总行数上限（4）都不变；hold 结束后首行自动回到汇总行。
 - **汇总行**：由 `summarySegments`/`formatSummary` 生成，段序为 `▶ N running · N pending · <elapsed> · ✓N · ✗N`；
   `pending` 仅在数量大于 0 时显示；`✓N` 与 `✗N` 对称，均仅在各自数量大于 0 时显示
   （全失败场景不再出现绿色的 `✓0`）；无 running 时 elapsed 为 `—`。

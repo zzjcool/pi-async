@@ -6,11 +6,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { init } from "../extensions/index.ts";
-import { registerHold } from "../src/guard/hold.ts";
+import { HOLD_FALLBACK_WIDGET_KEY, registerHold } from "../src/guard/hold.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { displayWidth } from "../src/tui/width.ts";
-import { mountRailDetail, resetRailSurfaceForTests, unmountRailDetail } from "../src/tui/surfaces.ts";
+import { holdSurface, mountRailDetail, resetRailSurfaceForTests, unmountRailDetail, type HoldSurface } from "../src/tui/surfaces.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -158,10 +158,19 @@ function assertResultsResult(result: unknown): { type?: string; customType?: str
   return draft!;
 }
 
-/** Collects `ui.setStatus` calls from a TUI-ish ctx. */
+/**
+ * Collects `ui.setStatus` calls from a TUI-ish ctx.
+ *
+ * It offers a no-op `setWidget` on purpose: that is the common host, where the footer counts and the
+ * waiting row lives on another surface. The host with **no** widget surface at all — where the footer
+ * has to name the tasks (修订 8) — has its own test below.
+ */
 function makeCtx(statuses: Array<[string, string | undefined]> = []) {
   return {
-    ctx: { mode: "tui", ui: { setStatus: (key: string, value: string | undefined) => statuses.push([key, value]) } },
+    ctx: {
+      mode: "tui",
+      ui: { setStatus: (key: string, value: string | undefined) => statuses.push([key, value]), setWidget: () => undefined },
+    },
     statuses,
   };
 }
@@ -679,7 +688,17 @@ test("a hold still resolves in a process with no other live handles (no unref'd 
  * These tests therefore never hand a `signal` to the hold — the hold has no signal channel at all.
  */
 
-/** A TUI ctx that exposes the raw-input subscription and records every progress widget write. */
+/** Spin until `predicate` holds, so a loaded machine cannot turn a frame count into a wall-clock race. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 3_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return true;
+}
+
+/** A TUI ctx that exposes the raw-input subscription and records every widget write the hold makes. */
 function makeInteractiveCtx(options: { queued?: () => boolean } = {}) {
   const widgets: Array<{ key: string; content?: string[]; placement?: unknown }> = [];
   let press: ((data: string) => undefined) | undefined;
@@ -717,7 +736,14 @@ function makeInteractiveCtx(options: { queued?: () => boolean } = {}) {
     hasListener: () => press !== undefined,
     subscribed: () => subscribed,
     unsubscribed: () => unsubscribed,
-    progress: () => widgets.filter((entry) => entry.key === "pi-async-hold"),
+    /** §7.1 修订 8: the hold's own line, written only while the rail cannot carry it. */
+    fallback: () => widgets.filter((entry) => entry.key === HOLD_FALLBACK_WIDGET_KEY),
+    /** 0.4.3–0.4.7's widget key: 0.4.8 deleted it, so nothing may ever write it again. */
+    legacy: () => widgets.filter((entry) => entry.key === "pi-async-hold"),
+    /** Every fallback line that actually painted something (`undefined` writes are clears). */
+    painted: () => widgets
+      .filter((entry) => entry.key === HOLD_FALLBACK_WIDGET_KEY && entry.content !== undefined)
+      .map((entry) => String(entry.content?.[0])),
   };
 }
 
@@ -784,99 +810,85 @@ test("a message already queued when the boundary opens means no hold at all", as
     assertBareResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
     assert.ok(performance.now() - started < 100, "no poll at all: settle immediately");
     assert.equal(registry.calls(), 1, "the opening snapshot is the only read");
-  });
-});
-
-test("the hold renders a live progress row and clears it when it ends (§7.1 修订 4)", async () => {
-  await withEnv(CLEAN, async () => {
-    // Six running polls of 120 ms: long enough for the 250 ms frame ticker to advance at least twice.
-    const { pi, fireOne } = makePi();
-    const startedAt = Date.now();
-    const live = [named("A", "example", startedAt)];
-    const registry = sequenceRegistry([live, live, live, live, live, live, []]);
-    registerHold(pi as never, registry as never, { holdMs: 5000, pollMs: 120 });
-    const interactive = makeInteractiveCtx();
-
-    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
-
-    const rows = interactive.progress();
-    assert.ok(rows.length >= 3, `the row keeps ticking while the hold waits (got ${rows.length} writes)`);
-    assert.equal(rows[0]?.placement, "aboveEditor");
-    assert.equal(rows[0]?.content?.length, 1, "the row is a single line");
-    assert.match(String(rows[0]?.content?.[0]), /^⠋ 1 async task 0s — example \(running, 0s\) — Esc stops waiting$/);
-    const frames = new Set(rows.map((row) => String(row.content?.[0] ?? "").charAt(0)));
-    assert.ok(frames.size >= 2, `the spinner really animates (frames: ${[...frames].join("")})`);
-    assert.ok(
-      rows.some((row) => /1 async task \d+s — example \(running, \d+s\) — Esc stops waiting$/.test(String(row.content?.[0]))),
-      "elapsed seconds are shown for the hold and for the task",
-    );
-    assert.equal(rows.at(-1)?.content, undefined, "the row is removed when the hold ends");
+    assert.equal(holdSurface(), undefined, "a hold that never opens publishes nothing");
   });
 });
 
 /**
- * 0.4.5 regression (PLAN-HOLD 修订 5) — now the **fallback** branch (§7.1 修订 6): a host without the
- * rail widget has nowhere else to show the tasks, so the hold row names them. The RAIL_AVAILABLE
- * case below asserts the opposite; deleting the fallback turns this test red.
+ * §7.1 修订 8, the whole point of 0.4.8: the wait is **one** row and it lives in the rail's first line.
+ * Nothing is painted above the editor while the rail carries it, and the row's two facts are the ones
+ * only the hold knows — its animation frame and how long *this turn* has been held.
  */
-test("without a rail the progress row names every task it is waiting for (fallback)", async () => {
+test("while the rail lists the waited tasks the hold paints no line of its own", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-yamlfix", Date.now() - 439_000);
+    const registry = makeRegistry(() => [watch]);
+    registerHold(pi as never, registry as never, { holdMs: 3_000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    // One snapshot per repaint request: the rail's own ticker is 1 Hz, the hold's frame is 250 ms.
+    const frames: Array<HoldSurface | undefined> = [];
+    const paintedFrames = () => frames.filter((snapshot): snapshot is HoldSurface => snapshot !== undefined);
+    const detail = { taskIds: () => [watch.taskId], repaint: () => frames.push(holdSurface()) };
+    mountRailDetail(detail);
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    // Wait for the frames themselves (a loaded machine may stretch a 250 ms tick): the point is that the
+    // hold's own elapsed advances frame by frame, not that a wall clock reached 1 s.
+    const ticked = await waitUntil(() => new Set(paintedFrames().map((snapshot) => snapshot.elapsed)).size >= 2);
+    assertBareResult(await pending);
+    unmountRailDetail(detail); // the rail stays mounted for the whole hold: it is the surface under test
+
+    const painted = paintedFrames();
+    assert.ok(painted.length >= 3, `the hold drives a repaint per frame (got ${painted.length})`);
+    assert.ok(new Set(painted.map((snapshot) => snapshot.frame)).size >= 2, "the braille frame really changes");
+    assert.ok(
+      ticked,
+      `the hold's own elapsed ticks (got ${JSON.stringify([...new Set(painted.map((snapshot) => snapshot.elapsed))])})`,
+    );
+    assert.equal(interactive.painted().length, 0, "the rail carries the row, so the hold paints nothing of its own");
+    assert.equal(interactive.legacy().length, 0, "the 0.4.7 `pi-async-hold` widget key is gone (the footer keeps it)");
+    assert.equal(holdSurface(), undefined, "the claim is withdrawn when the hold ends");
+  });
+});
+
+/**
+ * 0.4.5 regression (PLAN-HOLD 修订 5), now the **fallback** branch (§7.1 修订 8): a host without the
+ * rail widget has nowhere else to show the tasks, so the hold's own row names them. The rail-covering
+ * case above asserts the opposite; deleting the fallback turns this test red.
+ */
+test("without a rail the hold names every task it is waiting for (fallback)", async () => {
   await withEnv(CLEAN, async () => {
     const { pi, fireOne } = makePi();
     const now = Date.now();
     const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-run2", now - 64_000);
     const probe = named("t6j00002-aaaa-bbbb-cccc-dddddddddddd", "watch-t6j-probe", now - 32_000);
-    const registry = sequenceRegistry([[watch, probe], [watch, probe], []]);
-    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
+    const registry = makeRegistry(() => [watch, probe]);
+    registerHold(pi as never, registry as never, { holdMs: 600, pollMs: 40 });
     const interactive = makeInteractiveCtx();
 
-    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+    assertBareResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
 
-    const row = String(interactive.progress()[0]?.content?.[0]);
-    assert.equal(interactive.progress()[0]?.content?.length, 1, "the detail still fits on one line");
-    assert.ok(row.includes("watch-t4q-run2"), `the first task is named (got: ${row})`);
-    assert.ok(row.includes("watch-t6j-probe"), `the second task is named (got: ${row})`);
-    // Each task carries its own status and its own elapsed time, ` · `-joined like the async-state line.
-    assert.ok(
-      row.includes("watch-t4q-run2 (running, 1m 4s) · watch-t6j-probe (running, 32s)"),
-      `each task shows its status and its own elapsed time (got: ${row})`,
+    const first = interactive.fallback()[0];
+    assert.equal(first?.placement, "aboveEditor", "the fallback line sits where the rail would be");
+    assert.equal(first?.content?.length, 1, "the detail still fits on one line");
+    // Row 0 is the opening frame (`⠋`), row 1 the next one: the whole line is one `waitingRow` call.
+    assert.match(
+      String(interactive.fallback()[0]?.content?.[0]),
+      /^⠋ async_wait · running \d+s — watch-t4q-run2 \(running, 1m 4s\) · watch-t6j-probe \(running, 32s\) — Esc stops waiting$/,
     );
+    assert.match(
+      String(interactive.fallback()[1]?.content?.[0]),
+      /^⠙ async_wait · running \d+s — watch-t4q-run2 \(running, 1m 4s\) · watch-t6j-probe \(running, 32s\) — Esc stops waiting$/,
+    );
+    assert.equal(interactive.legacy().length, 0, "the old widget key is never written");
   });
 });
 
 /**
- * §7.1 修订 6 / 修订 7: the rail is the one place that carries `name · state · elapsed` per task,
- * so the hold row must not repeat it — three lines of the same fact in one terminal was the bug.
- * What only the hold knows is how long *this turn* has been held, and that is all it says.
- *
- * 修订 7 makes the gate "the rail lists exactly these tasks" rather than "a rail was registered".
- */
-test("with a rail that lists the tasks on screen the hold row leaves the detail to the rail", async () => {
-  await withEnv(CLEAN, async () => {
-    const { pi, fireOne } = makePi();
-    const now = Date.now();
-    const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-yamlfix", now - 439_000);
-    const registry = sequenceRegistry([[watch], [watch], []]);
-    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
-    const interactive = makeInteractiveCtx();
-
-    // A mounted rail whose window really covers the task the hold waits for.
-    const detail = { taskIds: () => [watch.taskId] };
-    mountRailDetail(detail);
-    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
-    unmountRailDetail(detail);
-
-    const row = String(interactive.progress()[0]?.content?.[0]);
-    assert.equal(row, "⠋ waiting 0s — Esc stops waiting", `the row carries only the hold's own elapsed (got: ${row})`);
-    assert.ok(!row.includes("watch-t4q-yamlfix"), `the task name is the rail's job (got: ${row})`);
-    assert.ok(!row.includes("7m"), `the task's own elapsed must not leak in — this elapsed is the hold's (got: ${row})`);
-    assert.equal(interactive.progress()[0]?.content?.length, 1, "still a single line");
-  });
-});
-
-/**
- * §7.1 修订 7, the bug 0.4.6 shipped: registration is not visibility. A rail widget can be mounted
- * and still paint nothing (empty / retired registry), or be gone while the old "registered" flag
- * still said otherwise. In both cases the hold must name the tasks itself.
+ * §7.1 修订 7 / 修订 8: the rail is the one place that carries `name · state · elapsed` per task, so
+ * the hold's own row must not repeat it — but only while the rail **demonstrably** lists the tasks.
+ * 修订 7 made that gate "the rail lists exactly these tasks" rather than "a rail was registered".
  */
 test("a rail that does not list the waited task never silences the hold row", async () => {
   await withEnv(CLEAN, async () => {
@@ -888,37 +900,92 @@ test("a rail that does not list the waited task never silences the hold row", as
     const interactive = makeInteractiveCtx();
 
     // Mounted, but it paints no task rows (what a stale registry / a cleared widget looks like).
-    mountRailDetail({ taskIds: () => [] });
+    const detail = { taskIds: () => [], repaint: () => undefined };
+    mountRailDetail(detail);
     assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+    unmountRailDetail(detail);
 
-    const row = String(interactive.progress()[0]?.content?.[0]);
-    assert.ok(row.includes("watch-t4q-yamlfix"), `the hold names the task when the rail shows none (got: ${row})`);
+    const rows = interactive.painted();
+    assert.ok(rows.length > 0, "the hold painted its own line");
+    assert.ok(rows[0]?.includes("watch-t4q-yamlfix"), `the hold names the task when the rail shows none (got: ${rows[0]})`);
+    assert.equal(holdSurface(), undefined, "and it never claimed the rail was carrying the row");
   });
 });
 
 /**
- * §7.1 修订 7: a rail the host disposed (session invalidate / reload clears every extension widget)
- * must restore the detail on the very next frame — no permanent "silent" window.
+ * §7.1 修订 7 / 修订 8: a rail the host disposed (session invalidate / reload clears every extension
+ * widget) must restore the detail on the very next frame — no permanent "silent" window.
  */
 test("a disposed rail restores the task names on the next hold frame", async () => {
   await withEnv(CLEAN, async () => {
     const { pi, fireOne } = makePi();
     const now = Date.now();
     const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-yamlfix", now - 64_000);
-    const registry = sequenceRegistry([[watch], [watch], [watch], [watch], [watch], [watch], [watch], [watch], []]);
-    registerHold(pi as never, registry as never, { holdMs: 5000, pollMs: 40 });
+    const registry = makeRegistry(() => [watch]);
+    registerHold(pi as never, registry as never, { holdMs: 2_000, pollMs: 40 });
     const interactive = makeInteractiveCtx();
 
-    const detail = { taskIds: () => [watch.taskId] };
+    const detail = { taskIds: () => [watch.taskId], repaint: () => undefined };
     mountRailDetail(detail);
     const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
-    await new Promise((resolve) => setTimeout(resolve, 120)); // let the rail-quiet frames paint
+    await new Promise((resolve) => setTimeout(resolve, 600)); // let the rail-carrying frames paint
+    assert.equal(interactive.painted().length, 0, "the rail carried the row, so there was no fallback line");
     unmountRailDetail(detail); // what the host's clearExtensionWidgets() → dispose() does
-    assertResultsResult(await pending);
+    await new Promise((resolve) => setTimeout(resolve, 400)); // a couple of 250 ms frames
+    const rows = interactive.painted();
+    assertBareResult(await pending);
 
-    const rows = interactive.progress().filter((entry) => entry.content !== undefined).map((entry) => String(entry.content?.[0]));
-    assert.ok(rows[0]?.includes("watch-t4q-yamlfix") === false, `early frames leave the detail to the rail (got: ${rows[0]})`);
-    assert.ok(rows.at(-1)?.includes("watch-t4q-yamlfix"), `after the rail is gone the hold names the task (got: ${rows.at(-1)})`);
+    assert.ok(rows.length > 0, "the hold started painting its own line");
+    assert.ok(String(rows[0]).includes("watch-t4q-yamlfix"), `after the rail is gone the hold names the task (got: ${rows[0]})`);
+  });
+});
+
+/** §7.1 修订 8: the rail's first row is the hold's, so every exit has to hand it back. */
+test("the waiting row disappears when the hold exits on an all-terminal snapshot", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = sequenceRegistry([[running("A")], [running("A")], [completed("A")]]);
+    registerHold(pi as never, registry as never, { holdMs: 5_000, pollMs: 10 });
+    const interactive = makeInteractiveCtx();
+
+    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    assert.ok(interactive.painted().length > 0, "the waiting row was on screen while it waited");
+    assert.equal(holdSurface(), undefined, "the rail's first row goes back to the summary");
+    assert.equal(interactive.fallback().at(-1)?.content, undefined, "and the fallback line is cleared");
+  });
+});
+
+test("the waiting row disappears when the hold exits on the budget", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = makeRegistry(() => [running("A")]);
+    registerHold(pi as never, registry as never, { holdMs: 80, pollMs: 10 });
+    const interactive = makeInteractiveCtx();
+
+    assertBareResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    assert.ok(interactive.painted().length > 0, "the waiting row was on screen while it waited");
+    assert.equal(holdSurface(), undefined, "the rail's first row goes back to the summary");
+    assert.equal(interactive.fallback().at(-1)?.content, undefined, "and the fallback line is cleared");
+  });
+});
+
+test("the waiting row disappears when the user presses Esc", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = makeRegistry(() => [running("A")]);
+    registerHold(pi as never, registry as never, { holdMs: 60_000, pollMs: 5_000 });
+    const interactive = makeInteractiveCtx();
+
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.ok(interactive.painted().length > 0, "the waiting row was on screen while it waited");
+    interactive.press("\x1b");
+    assertBareResult(await pending);
+
+    assert.equal(holdSurface(), undefined, "the rail's first row goes back to the summary");
+    assert.equal(interactive.fallback().at(-1)?.content, undefined, "and the fallback line is cleared");
   });
 });
 
@@ -939,7 +1006,9 @@ test("a narrow terminal truncates the task list instead of wrapping the row", as
       Object.defineProperty(process.stdout, "columns", { value: previousColumns, configurable: true });
     }
 
-    const row = String(interactive.progress()[0]?.content?.[0]);
+    const rows = interactive.painted();
+    assert.ok(rows.length > 0, "the hold painted its own line");
+    const row = rows[0]!;
     // One column stays free so the host never wraps the row (that is the jitter being prevented).
     assert.ok(displayWidth(row) <= 79, `the row fits an 80-column terminal (${displayWidth(row)} cells: ${row})`);
     assert.match(row, / \+\d+ more — Esc stops waiting$/, `the overflow is summarised (got: ${row})`);
@@ -960,10 +1029,38 @@ test("an unnamed task is identified by the first 8 characters of its id", async 
 
     assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
 
-    const row = String(interactive.progress()[0]?.content?.[0]);
+    const row = interactive.painted()[0]!;
     assert.ok(row.includes("abcd1234 (running, 0s)"), `an empty name falls back to the id prefix (got: ${row})`);
     assert.ok(row.includes("beef5678 (running, 0s)"), `a whitespace-only name falls back too (got: ${row})`);
     assert.ok(!row.includes("abcd1234-5678"), `the whole uuid is not printed (got: ${row})`);
+  });
+});
+
+/**
+ * §8's last resort (修订 8): with no `setWidget` on the host there is no waiting row anywhere, so the
+ * footer — the one surface left — has to carry the task names instead of only counting them.
+ */
+test("a host with no widget surface gets the task names in the footer instead", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const first = named("id-a", "watch-footer-a", now);
+    const second = named("id-b", "watch-footer-b", now);
+    const registry = makeRegistry(() => [first, second]);
+    // A host with `setStatus` only: no widget surface at all, so no waiting row can be painted.
+    const statuses: Array<[string, string | undefined]> = [];
+    const ctx = { mode: "tui", ui: { setStatus: (key: string, value: string | undefined) => statuses.push([key, value]) } };
+    registerHold(pi as never, registry as never, { holdMs: 80, pollMs: 10 });
+
+    assertBareResult(await fireOne("agent_before_settle", { entries: [] }, ctx));
+
+    const texts = holdTexts(statuses);
+    assert.equal(
+      texts[0],
+      "waiting for 2 tasks 0s — watch-footer-a (running, 0s) · watch-footer-b (running, 0s)",
+      "the footer names what nothing else can name",
+    );
+    assert.equal(texts.at(-1), undefined, "and it is still cleared when the hold ends");
   });
 });
 

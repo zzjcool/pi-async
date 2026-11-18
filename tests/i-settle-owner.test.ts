@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
+import { HOLD_FALLBACK_WIDGET_KEY } from "../src/guard/hold.ts";
 
 /**
  * 0.4.2 regression (report 2026-11-17): one terminal event, two announcements.
@@ -94,12 +95,12 @@ function makeHost(cwd: string) {
 
   /** Raw terminal-input subscription, exactly like `ui.onTerminalInput` (tui.js:719-735). */
   let press: ((data: string) => undefined) | undefined;
-  /** Every progress row the hold writes (`setWidget("pi-async-hold", …)`). */
+  /** Every row the hold paints itself (`setWidget(HOLD_FALLBACK_WIDGET_KEY, …)`, §7.1 修订 8). */
   const progressRows: Array<string[] | undefined> = [];
   const ui = {
     setStatus: () => undefined,
     setWidget: (key: string, content: string[] | undefined) => {
-      if (key === "pi-async-hold") progressRows.push(content);
+      if (key === HOLD_FALLBACK_WIDGET_KEY) progressRows.push(content);
     },
     onTerminalInput: (handler: (data: string) => undefined) => {
       press = handler;
