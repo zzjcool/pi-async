@@ -233,7 +233,7 @@ PI_ASYNC_MAX_SYNC_TIMEOUT_MS` 与词边界 `sync`，文件集：task/registry/to
 
 ---
 
-## 5.7 对抗式 review 结论与处理
+### 5.7 对抗式 review 结论与处理
 
 三路 fresh-context review（正确性 / 测试有效性 / 文档契约），全部只读：
 
