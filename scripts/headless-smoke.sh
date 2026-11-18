@@ -157,12 +157,18 @@ case "$CASE" in
     grep -q "CONCLUSION-AFTER-TASK" "$WORK/stdout.txt" || fail "stdout does not carry the post-task conclusion"
     [ "$CODE" -eq 0 ] || fail "exit code $CODE"
     [ "$WALL" -ge 3000 ] || fail "process exited before the 3s task finished (${WALL}ms)"
-    [ "$REQUESTS" -ge 3 ] || fail "the model was not re-invoked after the task finished (${REQUESTS} requests)"
+    # The continuation request is the one that carries OUR results entry. A bare "requests >= 3"
+    # is vacuous: even with the guarantee disabled the shutdown notification buys a third request.
+    grep -q "Waited for 1 async task(s)" "$WORK/requests.log" || fail "no provider request carried the print-results entry (the model was not re-invoked by the wait)"
+    ! grep -q "Extension error" "$WORK/stderr.txt" || fail "the normal path must not emit extension errors"
     ;;
   cap)
     [ "$CODE" -ne 0 ] || fail "over-budget run exited 0"
     grep -q "still running" "$WORK/stderr.txt" || fail "stderr does not report still-running tasks"
     grep -q "after 1 continuation(s)" "$WORK/stderr.txt" || fail "the continuation cap, not the clock, must end this run"
+    # Cap, not clock: the budget is 30 s and the first task takes 1 s, so a run that waited on the
+    # clock would be an order of magnitude longer. `and Ns` is printed from the same monotonic clock.
+    [ "$WALL" -lt 10000 ] || fail "the run took ${WALL}ms — it waited on the clock, not the cap"
     [ -n "$TASK_ID" ] || fail "stderr does not name the still-running taskId"
     grep -q "$TASK_ID" "$WORK/stderr.txt" || fail "stderr does not contain the taskId $TASK_ID"
     ;;

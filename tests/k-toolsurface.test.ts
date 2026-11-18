@@ -18,6 +18,8 @@ import { withExposedWait } from "./helpers/index.ts";
 
 type Tool = {
   name: string;
+  description?: string;
+  promptSnippet?: string;
   parameters: { properties: Record<string, unknown>; enum?: unknown };
   execute: (id: string, params: Record<string, unknown>, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<unknown>;
 };
@@ -70,6 +72,26 @@ test("the default tool surface is five tools; PI_ASYNC_EXPOSE_WAIT=1 adds async_
   } finally { await f.cleanup(); }
 });
 
+/**
+ * D4's copy rule, applied to the surface itself: nothing the default registration shows the model —
+ * a description, a prompt snippet, or a schema field description — may name a tool this session does
+ * not have. (`promptGuidelines` is excluded on purpose: the base four are frozen CONTRACT §17 text and
+ * the fifth exists precisely to say `async_wait` is unavailable.) This is the assertion that catches a
+ * tool description advertising the retired default.
+ */
+test("nothing on the default tool surface advertises async_wait", async () => {
+  const f = fixture();
+  try {
+    assert.equal(waitToolExposed(), false);
+    const h = host();
+    registerTools(h.pi as never, f.registry);
+    for (const tool of h.tools.values()) {
+      const visible = JSON.stringify({ description: tool.description, promptSnippet: tool.promptSnippet, parameters: tool.parameters });
+      assert.doesNotMatch(visible, /async_wait/, `${tool.name} must not point at a tool this session does not expose`);
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("a stale async_wait registration resolves with a readable degraded payload instead of throwing", async () => {
   const f = fixture();
   try {
@@ -98,23 +120,35 @@ test("a stale async_wait registration resolves with a readable degraded payload 
     const text = result.content.map((block) => block.text).join("\n");
     assert.match(text, /not available in this configuration/);
     assert.match(text, /PI_ASYNC_EXPOSE_WAIT=1/);
-    assert.equal(typeof result.content, "object", "the payload still satisfies the ToolResultMessage contract");
+    // The ToolResultMessage shape itself (content blocks + isError) is pinned in
+    // `tests/a-tool-result-contract.test.ts`; asserting `typeof array === "object"` here would be
+    // true for anything and prove nothing.
   } finally { await f.cleanup(); }
 });
 
 /**
- * D3 residue audit over the four files that carried the mode. `\bsync\b` (not /sync/) on purpose:
- * "async" contains the letters, so an unbounded pattern would flag every `async_run` mention.
+ * D3 residue audit. `\bsync\b` (not /sync/) on purpose: "async" contains the letters, so an
+ * unbounded pattern would flag every `async_run` mention.
+ *
+ * Two tiers, because the files are not alike:
+ *  - the four files that carried the mode enum/API lose the **API names** as well;
+ *  - `context/nudges.ts` only ever carried the user-visible `mode=sync with timeoutMs` copy, so it is
+ *    audited for the mode word alone (the behaviour is pinned in `e-nudges`). `settle-guard.ts` is not
+ *    in either list: its 2026-10-21 crash note legitimately names `Timeout._onTimeout`, which would
+ *    trip the API-name pattern for an unrelated reason.
  */
-test("no residual mode=sync plumbing in task.ts / registry.ts / tools/index.ts / rail.ts", () => {
-  const files = ["../src/core/task.ts", "../src/core/registry.ts", "../src/tools/index.ts", "../src/tui/rail.ts"];
-  for (const file of files) {
+test("no residual mode=sync plumbing in task.ts / registry.ts / tools/index.ts / rail.ts / nudges.ts", () => {
+  const apiFiles = ["../src/core/task.ts", "../src/core/registry.ts", "../src/tools/index.ts", "../src/tui/rail.ts"];
+  for (const file of apiFiles) {
     const source = readFileSync(new URL(file, import.meta.url), "utf8");
     assert.doesNotMatch(source, /runSync|SyncResult|onTimeout|PI_ASYNC_MAX_SYNC_TIMEOUT_MS/, `${file} must not carry the retired sync API`);
     assert.doesNotMatch(source, /\bsync\b/, `${file} must not carry the retired sync mode (word-bounded)`);
     // Word-bounded on both sides: `mode` is followed by `async_run` on plenty of healthy lines.
     assert.doesNotMatch(source, /\bmode\b.*\bsync\b/, `${file} must not reference a sync mode`);
   }
+  const copy = readFileSync(new URL("../src/context/nudges.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(copy, /\bsync\b/, "nudges.ts must not sell a sync mode (word-bounded)");
+  assert.doesNotMatch(copy, /\bmode\b.*\bsync\b/, "nudges.ts must not reference a sync mode");
 });
 
 test("async_run declares only background/delayed and no longer exposes the sync-only knobs", async () => {

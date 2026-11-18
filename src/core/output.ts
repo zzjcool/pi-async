@@ -36,6 +36,11 @@ export function stripLogControls(text: string): string {
  * Truncate a UTF-8 buffer to at most `maxBytes`, cutting on a leading-byte boundary
  * so multi-byte characters are never split into U+FFFD (#17).
  * When `tail` is true, keep the end of the buffer (advance past continuation bytes).
+ *
+ * Public helper, not an internal one: 0.5.0 (REV-29) removed its only in-tree production caller
+ * (`TaskRegistry.syncResult`), so it now serves embedders and `tests/w2-safety.test.ts` directly.
+ * `TaskRegistry` keeps its own windowed mirror (`truncateUtf8Window`) because it must never load the
+ * whole file to truncate; this byte-level version is for callers that already hold the buffer.
  */
 export function truncateUtf8Bytes(bytes: Buffer, maxBytes: number, tail = true): string {
   if (maxBytes <= 0) return "";

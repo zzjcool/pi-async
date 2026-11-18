@@ -154,7 +154,7 @@ const schema = (properties: Record<string, unknown>, required: string[] = [], al
 const stringField = { type: "string" };
 const timeoutField = { type: "number", minimum: 0 };
 /** `async_run` fields that carry their own description instead of the bare `stringField` (D-C2). */const commandField = { type: "string", description: "Shell command to execute (/bin/sh -c) in the session cwd." };
-const nameField = { type: "string", description: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars)." };
+const nameField = { type: "string", description: "Short handle for later async_logs/async_kill calls (max 48 chars)." };
 const conditionSchema = {
   oneOf: [
     { type: "object", properties: { type: { const: "exit_code" }, equals: { type: "number", description: "Exit code that matches; evaluated only once the process has exited." } }, required: ["type", "equals"], additionalProperties: false },

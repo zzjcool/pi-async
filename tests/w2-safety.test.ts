@@ -52,6 +52,30 @@ test("truncateUtf8Bytes does not inject U+FFFD on CJK tails (#17)", () => {
   assert.ok(out.endsWith("中"));
 });
 
+// --- D3 carried-over bound: the tail the removed syncResult used to keep ≤8 KiB is still bounded on
+// the live path that carries it now (`registry.wait` → `async_wait`). Without this, the only remaining
+// pin on `waitResult`'s 8192 window was the sync test that D3 deleted.
+test("wait results keep a UTF-8-clean, ≤8 KiB outputTail (#17, carried over from the removed syncResult)", async () => {
+  const dir = tmpDir("pi-async-w2-waittail-");
+  const registry = new TaskRegistry({ dataDir: dir });
+  try {
+    // 400 lines × 60 CJK characters: far past 8 KiB, and every cut lands mid-sequence if unbounded.
+    const task = registry.submit({
+      command: `node -e 'for (let i = 0; i < 400; i++) process.stdout.write("中".repeat(60) + "\\n")'`,
+      cwd: dir,
+    });
+    const outcome = await registry.wait([task.taskId], 30_000);
+    assert.ok("results" in outcome, "the task must finish inside the wait window");
+    const row = outcome.results[0]!;
+    assert.equal(row.status, "completed");
+    assert.ok(Buffer.byteLength(row.outputTail, "utf8") <= 8192, "outputTail respects the 8 KiB read window");
+    assert.equal([...row.outputTail].filter((character) => character === "\uFFFD").length, 0, "no split UTF-8 sequences");
+  } finally {
+    await registry.shutdown();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // --- #19 escapeXml ---
 test("notification XML strips illegal C0 characters (#19)", () => {
   const xml = buildNotificationXml({

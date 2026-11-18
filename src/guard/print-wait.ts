@@ -18,7 +18,7 @@ import type { HoldNotificationRelay } from "./hold-notify.ts";
  *
  * - `pi -p` binds extensions with `mode: "print"` (`bindExtensions({mode:"print"})`), so every
  *   event ctx carries `mode === "print"`.
- * - `agent_before_settle` handlers are `await`ed with **no timeout** (`runner.js:779`), exactly like
+ * - `agent_before_settle` handlers are `await`ed with **no timeout** (`runner.js:782`), exactly like
  *   the TUI boundary the settle hold uses — so this is the one place where a headless process may
  *   legitimately spend wall time.
  * - Returning `{entries:[...], continue: true}` makes the session send one more provider request
@@ -94,7 +94,10 @@ type HostHooks = {
   off?: (event: string, handler: (...args: unknown[]) => unknown) => void;
 };
 
-/** Display name of a task: its own name, or the first 8 characters of the id when it has none. */
+/**
+ * Display name of a task: its own (trimmed) name, or the taskId when it has none — the id is a
+ * 36-character uuid, so `MAX_NOTICE_NAME` only matters for a synthetic/mock id.
+ */
 function nameOf(task: TaskSnapshot): string {
   const name = typeof task.name === "string" ? task.name.trim() : "";
   if (name.length > 0) return name;
@@ -107,12 +110,14 @@ function nameOf(task: TaskSnapshot): string {
  *
  * Output tails are up to 8 KiB each and this line is part of a provider request, so the reader is
  * pointed at `async_logs` instead of being handed the bytes (same D-6 rule the hold's results entry
- * follows). The list is bounded with a `+N more` marker rather than growing a prompt without limit.
+ * follows). The list is bounded with a `+N more` marker rather than growing a prompt without limit;
+ * `missing` covers the other bound — rows the registry can no longer produce (pruned history), so
+ * the entry never claims fewer tasks than it waited for.
  */
-function summaryItems(done: TaskSnapshot[]): string {
+function summaryItems(done: TaskSnapshot[], missing: number): string {
   const listed = done.slice(0, MAX_LISTED_TASKS).map((task) =>
     `${nameOf(task)} (${task.status}${task.exitCode === undefined ? "" : `, exit ${task.exitCode}`})`);
-  const hidden = done.length - listed.length;
+  const hidden = done.length - listed.length + Math.max(0, missing);
   if (hidden > 0) listed.push(`+${hidden} more`);
   return listed.join(" · ");
 }
@@ -144,9 +149,10 @@ function sleep(ms: number): Promise<void> {
  *    one stderr line naming every taskId, `process.exitCode = 1`, `undefined`;
  * 6. every task in the snapshot finished → results draft + `continue: true` (notifications
  *    committed, ids latched with `markNotified`);
- * 7. dispose during the wait, or a throwing registry → notifications released, `undefined`, and
+ * 7. the budget runs out **inside** the loop (a task outlived `waitMs`) → the same throttle exit as 5;
+ * 8. dispose during the wait, or a throwing registry → notifications released, `undefined`, and
  *    **no** exit code (a teardown or a broken registry is not a task failure);
- * 8. disposed/dispatched after `dispose()` → `undefined`.
+ * 9. a boundary that arrives after `dispose()` → `undefined`.
  *
  * Nothing here throws and nothing calls `process.exit()`: a courtesy wait must never turn a working
  * run into a crash.
@@ -197,7 +203,7 @@ export function registerPrintWait(pi: PiCtx, registry: TaskRegistry, opts?: Prin
    *
    * `includeHistory: false` already drops terminal rows in the real registry; the status filter is
    * kept explicit because this module's contract is "only `running` blocks the exit" — a mock or an
-   * older registry that ignores the option must not make a pending/promoted row look live.
+   * older registry that ignores the option must not make a pending row look live.
    */
   const runningAmong = (ids: string[]): TaskSnapshot[] =>
     registry.list({ includeHistory: false })
@@ -295,12 +301,13 @@ export function registerPrintWait(pi: PiCtx, registry: TaskRegistry, opts?: Prin
         // Normal path: every task in the snapshot is terminal, so hand the outcome back and let the
         // host run one more provider request — that request is what produces the printed answer.
         const done = terminalSnapshots(ids);
-        const items = summaryItems(done);
+        // Rows the registry can no longer produce are counted, never silently dropped.
+        const items = summaryItems(done, ids.length - done.length);
         const draft: CustomMessageDraft = {
           type: "custom_message",
           customType: "async-task-print-results",
           display: false,
-          content: items.length > 0
+          content: done.length > 0
             ? `Waited for ${ids.length} async task(s); all finished: ${items}. Read the output with async_logs before answering.`
             // 修订 2 shape: never invent a status for a row the registry can no longer produce.
             : `Waited for ${ids.length} async task(s); they finished (records pruned). Read the output with async_logs before answering.`,

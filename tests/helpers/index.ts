@@ -1,6 +1,26 @@
 import type { TaskSnapshot, TaskStatus, TaskMode } from "../../src/core/task.ts";
 
 /**
+ * Hermetic defaults for the product switches (0.5.0).
+ *
+ * `async_wait` exposure and the headless backstop are read from the process env, so a developer
+ * shell that exports `PI_ASYNC_EXPOSE_WAIT=1` (or `PI_ASYNC_PRINT_WAIT=0`) would silently change
+ * what the "default face" tests observe — `PI_ASYNC_EXPOSE_WAIT=1 npm test` used to fail 9 cases.
+ * Every test file that asserts default behaviour imports this module, and a module body runs before
+ * any test in that file, so clearing the switches here is enough; tests that need a switch set use
+ * `withExposedWait` / `withExposedWaitAsync` or their own `withEnv`.
+ */
+for (const name of [
+  "PI_ASYNC_EXPOSE_WAIT",
+  "PI_ASYNC_PRINT_WAIT",
+  "PI_ASYNC_PRINT_WAIT_MS",
+  "PI_ASYNC_PRINT_POLL_MS",
+  "PI_ASYNC_PRINT_MAX_CONTINUATIONS",
+]) {
+  delete process.env[name];
+}
+
+/**
  * Run `fn` with `PI_ASYNC_EXPOSE_WAIT=1` so `registerTools` also registers `async_wait` (D4, 0.5.0:
  * the wait tool is opt-in). Restores the previous value afterwards. Synchronous on purpose — see
  * `withExposedWaitAsync` for test bodies that await.

@@ -576,9 +576,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_HOLD_MS` | `600_000`（10 分钟） | 单次 hold 上限（单调时钟计时）；**≤ 0 关闭**（负数不会回退到默认值） |
 | `PI_ASYNC_HOLD_POLL_MS` | `1_000` | hold 期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
 | `PI_ASYNC_PRINT_WAIT` | 开启（未设） | `0` → headless（`pi -p`）保底关闭，一个 handler 都不注册，回到 0.4.x「进程可以带着未完成任务退出」（REV-30） |
-| `PI_ASYNC_PRINT_WAIT_MS` | `600_000`（10 分钟） | print 会话等待的整体预算（单调时钟，跨回合累计，不重置）；用尽 → 打印仍在跑的任务并 `exitCode=1` |
+| `PI_ASYNC_PRINT_WAIT_MS` | `600_000`（10 分钟） | print 会话等待的整体预算（单调时钟，从第一次真正等待开始，跨回合累计，不重置；**回合之间的 provider 时间也计入**）；用尽 → 打印仍在跑的任务并 `exitCode=1` |
 | `PI_ASYNC_PRINT_POLL_MS` | `500` | print 会话等待期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
-| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | print 保底允许消耗的强制续跑次数（整个进程累计，宿主不提供上限，见 REV-30） |
+| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | print 保底允许消耗的强制续跑次数（整个进程累计，宿主不提供上限，见 REV-30）；**`0` = 从第一个边界起就限流**（有 running 任务即打印并退 1） |
 | `PI_ASYNC_FOOTER` | 关闭（未设） | `1` 且宿主 `ui.setStatus` 存在时额外渲染一行 footer 汇总；rail 首行仍是默认状态面 |
 | `PI_ASYNC_RETENTION_MS` | `604_800_000`（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
@@ -819,6 +819,12 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     - 全部不会通知：`— none of these will notify you; collect them with async_logs before you need the result.`
       （暴露时为 `collect them with async_wait …`）
     理由是 0.3.0 的核心不变量：不得用全局断言陈述 per-task 事实。
+  - **REV-29 前的原始文案（回滚时逐字还原用）**：全唤醒
+    `— end the turn and the completion notification wakes you, or call async_wait if you need one now.`；
+    混合 `— end the turn and let notifications wake you where enabled, or call async_wait for the rest.`；
+    全不唤醒 `— none of these will notify you; collect them with async_wait before you need the result.`；
+    bash nudge 尾巴 `, or mode=sync with timeoutMs when you need the result soon)`。
+    REV-29 只改「默认（未暴露 `async_wait`）」这一路的措辞，暴露态仍用上面四句原样。
   - `async_run` receipt（REV-21，修正版 D-C5）：通用规则只在系统提示/`<async-state>` 里讲一次；
     receipt 只承载**例外**。`notifyOnCompletion: false` → `willNotify: false` + `outputHint`
     `Notifications are off for this task; collect it with async_wait or async_logs.`；
@@ -1198,9 +1204,15 @@ Async task admission is closed (registry suspended: a reload or resume retired t
   - `execute` 保留：mode 白名单（`Unsupported async_run mode: sync`）、`delayMs` 在 delayed 必填、
     非 delayed 传 `delayMs` 报错。`async_run.description` 与 `mode` 字段描述见 §17。
   - TUI 配色：`src/tui/rail.ts` 的 `typeColor()` 改为 `mode === "delayed" ? 2 : 0`，**TYPE_TOKENS 槽位
-    与既有 rail 颜色测试完全不变**。
-  - `src/` 内不得再出现 `runSync` / `SyncResult` / `onTimeout` / `PI_ASYNC_MAX_SYNC_TIMEOUT_MS`，
-    也不得出现词边界 `sync`（`async` 含该子串，审计必须用 `\bsync\b`）。
+    与既有 rail 颜色测试完全不变**。升级时从磁盘恢复的 0.4.x 快照若仍是 `mode: "sync"`（`reloadFromDisk`
+    只校验 `status`），它按 background 取色（slot 0）——纯外观、不崩、不越界；此后不会再产生这类快照。
+  - 承载该 API 的四个文件（`src/core/task.ts` / `src/core/registry.ts` / `src/tools/index.ts` /
+    `src/tui/rail.ts`）不得再出现 `runSync` / `SyncResult` / `onTimeout` / `PI_ASYNC_MAX_SYNC_TIMEOUT_MS`，
+    也不得出现词边界 `sync`（`async` 含该子串，审计必须用 `\bsync\b`）；`src/context/nudges.ts` 另按
+    词边界 `sync` 审计（它只承载过用户文案）。`src/guard/settle-guard.ts` 的 2026-10-21 事故注释里
+    合法保留 `Timeout._onTimeout`（与 sync 无关，故不进 API 名审计）；
+    `src/guard/hold.ts` 的英文注释 `Keep in sync with` 与 `src/core/notify.ts` 的 `Sync throw` 同样与
+    sync 模式无关，属可接受残留。
 - **回退开关**：无（无兼容层）。
 
 ### 22.2 `async_wait` 默认不注册（D4）
@@ -1267,14 +1279,16 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 - **只在 `ctx.mode === "print"` 生效**（`src/guard/print-wait.ts`）。`tui`/`rpc`/`json`/缺失 ctx 一律
   立即返回：print 是这个模块唯一服务的模式，缺失 ctx 不得被当成 print（否则每个模式都会白等十分钟）。
-- **等待位置**：`agent_before_settle`。宿主对该 handler 的 `await` 没有超时（`runner.js:779`），
+- **等待位置**：`agent_before_settle`。宿主对该 handler 的 `await` 没有超时（`runner.js:782`），
   所以这是 headless 进程唯一合法的「花墙钟时间」的地方。
 - **等待对象**：`status === "running"` 的任务。`pending`（delayed）不算：`dueAt` 可能在一小时外，
   把它算进来只会每次打印运行都烧掉整个预算；它的快照留在磁盘上给下一个会话。
   **不**按 `notifyOnCompletion` 过滤——print 模式没有别的播报通道，静默任务同样不能带着输出一起走。
 - **正常出口**：全部终态 → 提交一条 `custom_message`（`customType: "async-task-print-results"`，
-  `display: false`，内容只含 name/status/exitCode + `Read the output with async_logs before answering.`，
-  最多 8 行 + `+N more`，**绝不内联 outputTail**）并返回 `continue: true`。
+  `display: false`，内容形如 `Waited for N async task(s); all finished: a (completed, exit 0) · b (failed, exit 7).
+  Read the output with async_logs before answering.`，明细**一行、最多 8 项**（以 ` · ` 分隔，超出补 `+N more`），
+  只含 name/status/exitCode，**绝不内联 outputTail**；history 已被 prune 时明细只列仍能读到的行，缺的行数并入
+  `+N more`，一行都读不到时退化为 `… they finished (records pruned). …`）并返回 `continue: true`。
   host 因此再发一次 provider 请求（`agent-session.js:1521-1525`，不受模式限制），
   模型的回答成为最后一条 assistant 消息，也就是 `print-mode.js:117-138` 打印的东西。
 - **终态归属**：复用 0.4.3 的 `HoldNotificationRelay`（`open`/`claim`/`commit`/`release`，与 hold 同一个

@@ -27,7 +27,8 @@
 - 旧会话/旧注册若仍调到 `async_wait`，**不再抛错**：返回 `{ taskId: null, available: false, error,
   enableWith: "PI_ASYNC_EXPOSE_WAIT=1", alternatives: ["async_status","async_logs"] }`（`isError: true`，
   正常 resolve），说明原因与开启方式。
-- 文案不再劝模型调用未暴露的工具：`async_run` 的第 5 条 guideline、receipt 的两条例外 hint、
+- 默认工具面上任何模型可见文本都不再有 `async_wait`：`async_run.name` 的字段描述（`Short handle for
+  later async_logs/async_kill calls`）、第 5 条 guideline、receipt 的两条例外 hint、
   `<async-state>` 的三条 tail、settle guard 的 advisory / reminder / unresolved / aborted 文案，
   默认一律指向 `async_status` + `async_logs`；只有 `PI_ASYNC_EXPOSE_WAIT=1` 时才保留 `async_wait` 措辞。
   默认路径生成的文本里不会出现 `async_wait`。
@@ -49,7 +50,9 @@
   提交一条 `async-task-print-results`（只含 name/status/exit，不含 output tail）并返回 `continue: true`，
   宿主因此再发一次 provider 请求——**模型的结论成为最终输出**，而不是 0.4.x 的「565 ms 退出 + 空 stdout + 任务被杀」。
   等待复用完成通知归属中继：等待期间落地的通知由 results entry 独占播报并落 `notified`。
-- 两道界：`PI_ASYNC_PRINT_MAX_CONTINUATIONS`（默认 5）与 `PI_ASYNC_PRINT_WAIT_MS`（默认 10 分钟）。
+- 两道界：`PI_ASYNC_PRINT_MAX_CONTINUATIONS`（默认 5，`0` = 首个边界即限流）与 `PI_ASYNC_PRINT_WAIT_MS`
+  （默认 10 分钟，从第一次真正等待起按墙钟累计，回合之间的 provider 时间计在内——这是刻意的整进程上限，
+  代价是长运行后半段新起的任务会被立即限流而不是等待）。
   超限 **stderr** 打印 `still running N async task(s) after C continuation(s) and Ts: <taskId> …` 并以
   `exitCode = 1` 退出（不静默）；`PI_ASYNC_PRINT_WAIT=0` 关闭整条保底（0.4.x 行为，用于对照/紧急回退）。
 - 只等 `running`；`delayed`/`pending` 是「已排期的工作」，不阻塞退出（否则每次打印运行都会烧掉整个预算）。

@@ -37,9 +37,10 @@ The extension registers five tools by default (plus one opt-in tool):
 | `async_kill` | Terminate a task and its process group. |
 | `async_wait` *(opt-in)* | Wait for task completion or return a `notReady` result on timeout. Registered only when the host sets `PI_ASYNC_EXPOSE_WAIT=1`. |
 
-`async_logs`, `async_status`, `async_extend`, `async_kill` (and `async_wait` where it is exposed) accept a
-task **name** as well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown
-ids/names are an error instead of a silent success.
+`async_logs`, `async_extend`, `async_kill` (and `async_wait` where it is exposed) accept a task **name** as
+well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown ids/names are an
+error instead of a silent success. `async_status` is the read-only exception: its `name` argument is a
+case-insensitive substring filter over the list (see [Notifications](#notifications)).
 
 `async_wait` is not registered by default: a completion notification wakes the session, so the blocking
 collect step is opt-in. If a stale registration is still called while the switch is off, it answers
@@ -110,6 +111,10 @@ The rail's first row summarizes running, pending, elapsed, completed, and failed
 | `PI_ASYNC_HOLD` | `on` | Set `0` to disable the settle hold entirely (no `agent_before_settle` handler is registered). |
 | `PI_ASYNC_HOLD_MS` | `600000` (10 min) | Upper bound for one settle hold; `≤ 0` disables the feature (a negative value is not replaced by the default, and non-integer values fall back to the default). |
 | `PI_ASYNC_HOLD_POLL_MS` | `1000` | How often the task list is re-read while the run is being held. |
+| `PI_ASYNC_PRINT_WAIT` | `on` | Set `0` to disable the headless (`pi -p`) backstop entirely (the process may exit while tasks still run — the 0.4.x behaviour). |
+| `PI_ASYNC_PRINT_WAIT_MS` | `600000` (10 min) | Overall budget for the headless wait: wall clock from the first real wait, accumulated across turns and continuation requests (time spent in provider requests counts). |
+| `PI_ASYNC_PRINT_POLL_MS` | `500` | How often the task list is re-read while a print run waits; a value below 50 falls back to the default (it is not clamped). |
+| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | Forced provider requests the headless backstop may spend before it reports the still-running tasks and exits non-zero. `0` means "never wait-and-continue": first boundary with a running task already throttles. |
 | `PI_ASYNC_FOOTER` | `off` | Set `1` to also render a one-line task summary through the host's `setStatus` footer (only when the host exposes `setStatus`). The rail's first row is the default status surface. |
 | `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
@@ -187,9 +192,10 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
   notifications instead, so nothing is ever swallowed.
 - The draft names each finished task by `name` (falling back to the task id), which is exactly what
   `async_logs` accepts, and still points at `async_logs` rather than inlining a tail.
-- Only an interactive TUI session holds. `print` / `json` would delay the process exit, `rpc` aborts
-  under a client-side timeout, and legion child sessions keep their own bounded reminder channel —
-  none of them are affected.
+- Only an interactive TUI session holds. A `print` session is served by a different mechanism — the
+  headless backstop below deliberately keeps the process alive until running tasks finish — and `rpc`
+  aborts under a client-side timeout, so neither of them may also hold. Legion child sessions keep
+  their own bounded reminder channel. None of the three is affected by the hold.
 - While it waits the footer shows `waiting for N tasks <elapsed>`, refreshed every 15 s, whenever the
   host exposes `setStatus`.
 | Environment variable | Default | Description |
@@ -197,10 +203,6 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
 | `PI_ASYNC_HOLD` | `on` | Set `0` to disable the hold entirely (no handler is registered at all). |
 | `PI_ASYNC_HOLD_MS` | `600000` (10 min) | Upper bound for one hold; **≤ 0** disables the feature (a negative value is not replaced by the default; non-integer values fall back to the default). |
 | `PI_ASYNC_HOLD_POLL_MS` | `1000` | How often the task list is re-read while holding. |
-| `PI_ASYNC_PRINT_WAIT` | `on` | Set `0` to disable the headless (`pi -p`) backstop entirely (the process may exit while tasks still run, 0.4.x behaviour). |
-| `PI_ASYNC_PRINT_WAIT_MS` | `600000` (10 min) | Overall budget for the headless wait, accumulated across turns and continuation requests. |
-| `PI_ASYNC_PRINT_POLL_MS` | `500` | How often the task list is re-read while a print run is waiting (minimum 50). |
-| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | Forced provider requests the headless backstop may spend before it reports the still-running tasks and exits non-zero. |
 
 Start long-lived services (a dev server, a watcher you keep across turns) with
 `notifyOnCompletion: false`: such a task is still running at every turn end, so with the default it
@@ -228,7 +230,9 @@ process alive while a background task still runs, so pi-async does it structural
 - The wait reuses the completion-notification ownership relay, so a task finishing inside it is
   announced exactly once (the results entry) and `notified` is latched; nothing is lost or doubled.
 - It is bounded twice: `PI_ASYNC_PRINT_MAX_CONTINUATIONS` forced turns (default 5) and one overall
-  `PI_ASYNC_PRINT_WAIT_MS` budget (default 10 min). Over budget the run is allowed to end, but not
+  `PI_ASYNC_PRINT_WAIT_MS` wall-clock budget (default 10 min, accumulated from the first real wait —
+  provider time between turns counts, so a long run may report a *newly* started task immediately
+  instead of waiting for it; that is the intentional whole-process bound). Over budget the run is allowed to end, but not
   silently: stderr gets `pi-async: still running N async task(s) after C continuation(s) and Ts: <id>
   (<name>), …` naming every taskId, and the process exits with code 1.
 - Only `running` tasks block the exit. A `mode: delayed` task sits in `pending` by definition (its

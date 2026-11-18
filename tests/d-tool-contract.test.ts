@@ -165,7 +165,7 @@ test("async_run field descriptions follow D-C2 verbatim (command and watch pinne
   try {
     const expected: Record<string, string> = {
       command: "Shell command to execute (/bin/sh -c) in the session cwd.",
-      name: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars).",
+      name: "Short handle for later async_logs/async_kill calls (max 48 chars).",
       mode: "background (default) returns a taskId now; delayed starts after delayMs.",
       delayMs: "delayed only: milliseconds to wait before starting.",
       taskTimeoutMs: "Kill the task after this many ms, in any mode.",

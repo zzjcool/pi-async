@@ -369,6 +369,46 @@ test("the budget spans turns: a second turn may continue once, then the cap stop
   });
 });
 
+test("the results entry counts rows the registry can no longer produce", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const registry = makeRegistry([running("T8a", "kept"), running("T8b", "pruned one"), running("T8c", "pruned two")]);
+    const dispose = registerPrintWait(pi as never, registry as never, { pollMs: 20, waitMs: 5_000 });
+    // Two of the three rows are gone from history by the time the entry is built (pruned retention).
+    const flip = setTimeout(() => registry.setRows([completed("T8a", "kept")]), 60);
+    try {
+      const content = String(resultsDraft(await fireOne("agent_before_settle", {}, { mode: "print" })).content);
+      assert.match(content, /Waited for 3 async task\(s\)/, "the count is the snapshot, not the surviving rows");
+      assert.match(content, /kept \(completed, exit 0\)/);
+      assert.match(content, /\+2 more/, "missing rows are counted instead of silently dropped");
+    } finally {
+      clearTimeout(flip);
+      dispose();
+    }
+  });
+});
+
+test("the throttle exit names every still-running taskId, not just the first", async () => {
+  await withEnv({ ...CLEAN, PI_ASYNC_PRINT_MAX_CONTINUATIONS: "0" }, async () => {
+    const savedExitCode = process.exitCode;
+    const { pi, fireOne } = makePi();
+    const registry = makeRegistry([running("T9a", "first job"), running("T9b", "second job")]);
+    const dispose = registerPrintWait(pi as never, registry as never, { pollMs: 20, waitMs: 5_000 });
+    try {
+      const { result, lines, exitCode } = await captureStderr(async () => fireOne("agent_before_settle", {}, { mode: "print" }));
+      assert.equal(result, undefined);
+      assert.equal(exitCode, 1);
+      const notice = lines.find((line) => line.includes("still running"));
+      assert.ok(notice, JSON.stringify(lines));
+      assert.match(String(notice), /2 async task\(s\)/);
+      assert.ok(String(notice).includes("T9a") && String(notice).includes("T9b"), "every id is named");
+    } finally {
+      process.exitCode = savedExitCode;
+      dispose();
+    }
+  });
+});
+
 test("exactly three hooks, and dispose is idempotent and final", async () => {
   await withEnv(CLEAN, async () => {
     const { pi, handlers, fire, fireOne, unsubscribed } = makePi();

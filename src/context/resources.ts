@@ -7,7 +7,7 @@ import type { PiCtx } from "../core/notify.ts";
  * Skill discovery (PLAN-CONTEXT §D-C7).
  *
  * The tool snippets answer "when do I use this"; the procedural detail (check-writing
- * discipline, watch semantics, promote/abort, legion collection) is too long to keep in the
+ * discipline, watch semantics, legion collection) is too long to keep in the
  * system prompt. It ships as an Agent Skill instead: one line in the prompt, full text read
  * only when the task matches.
  */
