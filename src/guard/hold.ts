@@ -6,7 +6,7 @@ import { envNumber } from "../core/env.ts";
 // SAFETY: `tui/width.ts` is a pure text utility (no TUI/host imports), so the guard layer may share
 // it instead of duplicating the CJK cell-width rules — the deps still point one way (tui → core).
 import { displayWidth, truncateToWidth } from "../tui/width.ts";
-import { ensureRailSurface, railShowsTasks } from "../tui/surfaces.ts";
+import { ensureRailSurface, railRepaint, railShowsTasks, setHoldSurface, waitingRow } from "../tui/surfaces.ts";
 import type { HoldNotificationRelay } from "./hold-notify.ts";
 
 /** Default upper bound for one hold (D-5 / D-9): ten minutes. */
@@ -22,15 +22,14 @@ const DEFAULT_FOOTER_REFRESH_MS = 15_000;
 const FOOTER_KEY = "pi-async-hold";
 
 /**
- * Progress surface (0.4.3, §7.1 修订 4).
+ * Widget key for the hold's **fallback** line (§7.1 修订 8).
  *
- * pi clears its own working row on `agent_end` (`interactive-mode.js:3060-3064`), which fires
- * *before* `agent_before_settle` — so during a hold the screen looks idle and the user cannot tell
- * whether anything is happening. The native working row cannot be borrowed: `setWorkingVisible`
- * persists in the session and nothing clears it after a settle that re-shows it. An extension
- * widget is self-owned and cancelled in `finally`, so it is the safe surface.
+ * 0.4.3–0.4.7 painted the wait into an always-present widget above the editor; 0.4.8 puts that row
+ * into the rail's first line instead, so this key exists **only** while the rail cannot carry it (no
+ * `setWidget` host, a widget the host dropped and cannot take back, a rail window that does not cover
+ * the waited tasks). Exported for the tests that assert exactly that; not part of the user docs.
  */
-const WIDGET_KEY = "pi-async-hold";
+export const HOLD_FALLBACK_WIDGET_KEY = "pi-async-hold-fallback";
 const PROGRESS_FRAME_MS = 250;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -106,15 +105,16 @@ function fitTaskList(tasks: TaskSnapshot[], budget: number): string {
 }
 
 /**
- * The 0.4.5 detail row: count, every waiting task's `name (status, elapsed)`, the Esc hint — used
- * only when no rail is on screen (§7.1 修订 6). With a rail, repeating this here duplicated the
- * rail's own `▶ name · state · elapsed` rows and put three lines of the same fact in one terminal.
+ * The 0.4.5 detail tail: every waiting task's `name (status, elapsed)`. Since 修订 8 it is only used
+ * where the rail cannot carry the task rows — the fallback line and the name-less footer.
  */
-function detailedRow(frame: string, tasks: TaskSnapshot[], elapsed: string, width: number, tail: string): string {
-  const count = tasks.length;
-  const head = `${frame} ${count} async task${count === 1 ? "" : "s"} ${elapsed}`;
-  const body = fitTaskList(tasks, width - displayWidth(`${head} — `) - displayWidth(tail));
-  return body.length > 0 ? `${head} — ${body}${tail}` : `${head}${tail}`;
+function namedFooter(head: string, tasks: TaskSnapshot[]): string {
+  const separator = " — ";
+  const width = terminalColumns();
+  const detail = fitTaskList(tasks, width - displayWidth(head) - displayWidth(separator));
+  if (detail.length === 0) return head;
+  const line = `${head}${separator}${detail}`;
+  return displayWidth(line) > width ? truncateToWidth(line, width) : line;
 }
 
 /**
@@ -281,14 +281,19 @@ export function registerHold(
   let heldThisGeneration = false;
   const unsubscribers: Array<() => void> = [];
 
-  const setFooter = (ctx: HoldContext | undefined, count: number, elapsedMs: number): void => {
+  const setFooter = (ctx: HoldContext | undefined, tasks: TaskSnapshot[], elapsedMs: number): void => {
     try {
       // SAFETY: `ui`/`setStatus` exist only on handler ctxs (never at factory time), and a stale
       // ctx getter throws on read — so the read sits inside the guard together with the call.
       const ui = ctx?.ui;
       const setStatus = ui?.setStatus;
       if (typeof setStatus !== "function") return;
-      setStatus.call(ui, FOOTER_KEY, `waiting for ${count} task${count === 1 ? "" : "s"} ${formatElapsedMs(elapsedMs)}`);
+      const count = tasks.length;
+      const head = `waiting for ${count} task${count === 1 ? "" : "s"} ${formatElapsedMs(elapsedMs)}`;
+      // 修订 8, §8's last resort: a host with no widget surface can paint no waiting row anywhere,
+      // so the footer — the one surface left — names the tasks instead of only counting them.
+      const text = typeof ui?.setWidget === "function" ? head : namedFooter(head, tasks);
+      setStatus.call(ui, FOOTER_KEY, text);
     } catch {
       // D-8: the footer is decoration; a host that rejects setStatus must not end the hold.
     }
@@ -307,51 +312,87 @@ export function registerHold(
   };
 
   /**
-   * §7.1 修订 4 / 修订 5 / 修订 6 / 修订 7: the visible "still working" row. A frame of
-   * `SPINNER_FRAMES` changes every `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the
-   * elapsed seconds tick with it.
+   * True while the visible wait is on the rail (or was on the rail an instant ago). Prevents widget
+   * churn: a fallback line is cleared once and only when the rail takes over (§7.1 修订 8).
+   */
+  let fallbackShown = false;
+
+  /**
+   * §7.1 修订 8: the wait is **one** row and it lives in the rail's first line.
    *
-   * 修订 5 listed the waiting tasks here; 修订 6 took the names out whenever a rail was "registered".
-   * That read a one-time fact as a live one and produced a blackout: the host disposes every
-   * extension widget on session invalidate / reload, so the rail can be gone while registration still
-   * holds — and the row then said nothing at all. 修订 7 decides from what the rail **paints now**:
-   * the names are omitted only when the mounted rail lists every task this hold waits for.
-   * Otherwise the hold names them and asks the rail to re-install itself for the next frame, so the
-   * window with no list anywhere is a single frame instead of "forever".
+   * `setWaiting` publishes the hold's frame/elapsed through `setHoldSurface` and asks the mounted rail
+   * to repaint (its own ticker is 1 Hz — too slow for a 250 ms braille frame). It only paints a line of
+   * its own when the rail provably cannot: no `setWidget` at all, a widget the host dropped and cannot
+   * take back, or a rail window that does not cover every waited task. That fallback carries the task
+   * names (修订 5) because the rail is not naming them either — §8's "the names are somewhere" rule.
+   *
+   * Exactly one `async_wait` may be on screen at any time, so the two branches are mutually exclusive
+   * within a frame, and a stale claim is withdrawn before the fallback line is written.
    *
    * Purely cosmetic: every failure is swallowed like the footer (D-8).
    */
-  const setProgress = (ctx: HoldContext | undefined, tasks: TaskSnapshot[], elapsedMs: number, tick: number): void => {
+  const setWaiting = (ctx: HoldContext | undefined, tasks: TaskSnapshot[], elapsedMs: number, tick: number): void => {
     try {
+      const frame = SPINNER_FRAMES[tick % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0]!;
+      const elapsed = formatElapsedMs(elapsedMs);
+      const ids = tasks.map((task) => task.taskId);
+      let onRail = railShowsTasks(ids);
+      if (!onRail) {
+        // Withdraw our claim first: a rail that repaints before the self-heal below must not paint a
+        // stale waiting row next to the one this frame is about to write.
+        setHoldSurface(undefined);
+        // Self-heal the other surface, then re-check immediately — a rail that comes back in this same
+        // frame carries the row, so there is no fallback window at all (修订 7's healing, kept).
+        if (ensureRailSurface()) onRail = railShowsTasks(ids);
+      }
+      if (onRail) {
+        setHoldSurface({ frame, elapsed });
+        railRepaint();
+        if (fallbackShown) {
+          const ui = ctx?.ui;
+          const setWidget = ui?.setWidget;
+          if (typeof setWidget === "function") setWidget.call(ui, HOLD_FALLBACK_WIDGET_KEY, undefined);
+          fallbackShown = false;
+        }
+        return;
+      }
+      setHoldSurface(undefined);
       const ui = ctx?.ui;
       const setWidget = ui?.setWidget;
       if (typeof setWidget !== "function") return;
-      const frame = SPINNER_FRAMES[tick % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
-      const elapsed = formatElapsedMs(elapsedMs);
-      const tail = " — Esc stops waiting";
       const width = terminalColumns();
-      const onRail = railShowsTasks(tasks.map((task) => task.taskId));
-      // Self-heal the other surface: no live rail (or it does not list these tasks) → bring it back.
-      if (!onRail) ensureRailSurface();
-      const line = onRail
-        ? `${frame} waiting ${elapsed}${tail}`
-        : detailedRow(frame, tasks, elapsed, width, tail);
+      const tail = " — Esc stops waiting";
+      const plain = waitingRow(frame, elapsed);
+      const head = plain.endsWith(tail) ? plain.slice(0, -tail.length) : plain;
+      // The separator `waitingRow` puts between head and detail is part of the budget too: without it the
+      // final clamp would eat the Esc hint instead of the task list (see docs/reports/hold-in-rail.md).
+      const detailBudget = width - displayWidth(`${head} — `) - displayWidth(tail);
+      const row = waitingRow(frame, elapsed, fitTaskList(tasks, detailBudget));
       // Belt and braces: the budget above already fits, and an ellipsis here is still better than a
       // row the host wraps (the pathological case is a terminal narrower than the fixed wording).
-      const clamped = displayWidth(line) > width ? truncateToWidth(line, width) : line;
-      // SAFETY: `setWidget` is optional and may reject a placement; the call is inside the guard.
-      setWidget.call(ui, WIDGET_KEY, [clamped], { placement: "aboveEditor" });
+      const clamped = displayWidth(row) > width ? truncateToWidth(row, width) : row;
+      // SAFETY: `setWidget` was feature-detected above; the call is inside the guard.
+      setWidget.call(ui, HOLD_FALLBACK_WIDGET_KEY, [clamped], { placement: "aboveEditor" });
+      fallbackShown = true;
     } catch {
       // Cosmetic only: an old host without setWidget must not end the hold.
     }
   };
 
-  const clearProgress = (ctx: HoldContext | undefined): void => {
+  /**
+   * End the visible wait (§7.1 修订 8). Runs in `holdUntilSettled`'s `finally`, so it covers **every**
+   * exit — all-terminal, budget, Esc, queued message, dispose, a throwing registry. Withdrawing the
+   * claim is what makes the rail paint its summary row again.
+   */
+  const clearWaiting = (ctx: HoldContext | undefined): void => {
+    setHoldSurface(undefined);
+    railRepaint();
+    fallbackShown = false;
     try {
       const ui = ctx?.ui;
       const setWidget = ui?.setWidget;
       if (typeof setWidget !== "function") return;
-      setWidget.call(ui, WIDGET_KEY, undefined);
+      setWidget.call(ui, HOLD_FALLBACK_WIDGET_KEY, undefined);
     } catch {
       // Best-effort cleanup: never fatal.
     }
@@ -439,12 +480,12 @@ export function registerHold(
       }
     } catch { /* non-interactive host: no raw input */ }
 
-    setFooter(ctx, live.length, 0);
-    setProgress(ctx, live, 0, 0);
+    setFooter(ctx, live, 0);
+    setWaiting(ctx, live, 0, 0);
     let tick = 0;
-    const refresh = setInterval(() => setFooter(ctx, live.length, performance.now() - startedAt), footerRefreshMs);
+    const refresh = setInterval(() => setFooter(ctx, live, performance.now() - startedAt), footerRefreshMs);
     refresh.unref?.();
-    const progress = setInterval(() => setProgress(ctx, live, performance.now() - startedAt, ++tick), PROGRESS_FRAME_MS);
+    const progress = setInterval(() => setWaiting(ctx, live, performance.now() - startedAt, ++tick), PROGRESS_FRAME_MS);
     progress.unref?.();
     try {
       // A message queued before the hold opened is the same signal as one queued during it.
@@ -473,7 +514,7 @@ export function registerHold(
     } finally {
       clearInterval(refresh);
       clearInterval(progress);
-      clearProgress(ctx);
+      clearWaiting(ctx);
       clearFooter(ctx);
       for (const off of detach.splice(0)) {
         try { off(); } catch { /* the host ctx may already be stale */ }

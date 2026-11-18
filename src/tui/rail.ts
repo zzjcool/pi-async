@@ -4,7 +4,7 @@ import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
 import { inRailWindow, railLingerMs, railWindowCounts, summarySegments, type SummaryCounts } from "./status.ts";
-import { armRailSurface, mountRailDetail, railMounted, unmountRailDetail, type RailDetail } from "./surfaces.ts";
+import { armRailSurface, holdSurface, mountRailDetail, railMounted, unmountRailDetail, waitingRow, type RailDetail } from "./surfaces.ts";
 import { displayWidth, truncateToWidth } from "./width.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
@@ -117,6 +117,20 @@ function coloredSummary(counts: SummaryCounts, now: number, width: number, theme
 type SummarySegmentLike = { text: string; token: string };
 
 /**
+ * §7.1 修订 8: while the hold waits, row 0 is the hold's waiting row instead of the summary —
+ * `⠙ async_wait · running 2m 28s — Esc stops waiting`. Same truncation as the summary row; accent
+ * colored with the same best-effort fallback every other row uses.
+ */
+function coloredWaiting(frame: string, elapsed: string, width: number, theme: Theme): string {
+  const fitted = fitRailRow(waitingRow(frame, elapsed), width);
+  try {
+    return theme.fg("accent", fitted) ?? fitted;
+  } catch {
+    return fitted;
+  }
+}
+
+/**
  * The rail reads the **live** registry, not the one that happened to exist at registration time: a
  * generation that adopts its predecessor's work (`activeRegistry`) must keep the rail pointed at the
  * instance the hold and the tools use, or the rail renders nothing while tasks are running.
@@ -174,7 +188,10 @@ export function createRailFactory(pi: PiCtx, registry: RegistrySource, opts: { o
       const counts = railWindowCounts(all, now, lingerMs);
       hitRows = ["", ...visible.map((task) => task.taskId)];
       const used = [swatch(theme, "error"), swatch(theme, "dim")];
-      const rows = [coloredSummary(counts, now, width, theme), ...renderRailRows(visible, width).map((row, index) => {
+      // 修订 8: a waiting hold owns row 0 (it displaces the summary, it does not add a row — the
+      // four-line cap is frozen and the user's picture is "the waiting row plus three task rows").
+      const holding = holdSurface();
+      const rows = [holding ? coloredWaiting(holding.frame, holding.elapsed, width, theme) : coloredSummary(counts, now, width, theme), ...renderRailRows(visible, width).map((row, index) => {
         const task = visible[index];
         if (!task) return row;
         let token = "dim";
@@ -214,7 +231,11 @@ export function createRailFactory(pi: PiCtx, registry: RegistrySource, opts: { o
     // Publish what this widget paints so the hold can ask whether the detail is really on screen.
     // `dispose` withdraws it: the host disposes the widget when it clears or replaces the widget map,
     // which is exactly the moment the old "registered" latch used to become a lie.
-    const detail: RailDetail = { taskIds: () => windowed().visible.map((task) => task.taskId) };
+    // `repaint` lets the hold drive its 250 ms frame: the rail's own ticker is 1 Hz (修订 8).
+    const detail: RailDetail = {
+      taskIds: () => windowed().visible.map((task) => task.taskId),
+      repaint: () => { try { tui.requestRender(); } catch { /* repaint is best-effort */ } },
+    };
     mountRailDetail(detail);
     return {
       render,

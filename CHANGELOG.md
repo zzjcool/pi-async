@@ -2,6 +2,60 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.8 — 2026-11-18（等待行并进 rail：输入框上方不再有独立一行）
+
+hold 期间输入框上方原来会多出一行——与 rail 首行说同一件事。用户裁决：
+「外观版的话我觉得可以，这样输入框上方的 `⠙ waiting 2m 28s — Esc stops waiting` 这个我觉得就可以不要了」。
+0.4.8 把它并进 rail，rail 就是唯一那块：
+
+```
+⠙ async_wait · running 2m 28s — Esc stops waiting
+▶ watch-t71 · running · 4m 6s
+▶ watch-t6z2 · running · 4m 6s
+▶ watch-t73 · running · 4m 6s
+```
+
+### Changed
+
+- **hold 期间 rail 首行就是等待行（CONTRACT §7.1 修订 8）**：`⠙ async_wait · running <hold-elapsed> —
+  Esc stops waiting`。braille 首字符仍在 250ms 换帧（`agent_end` 已清掉宿主 working 行，换帧是这一行唯一
+  的「还活着」信号），文案仍为英文，唯一文案来源是 `src/tui/surfaces.ts` 的 `waitingRow()`。
+  它 **顶掉**首行汇总行，而不是新增一行：4 行上限不变，所以仍是「等待行 + 3 行任务」；`RAIL_TASK_SLOTS`
+  刻意保持 3——调小会让第三个任务失去 `▶` 名字行，`railShowsTasks` 变假，兜底行回来，同一件事说两遍。
+  hold 结束后首行自动回到汇总行（`clearWaiting` 在 `finally` 里，覆盖全终态/超时/Esc/入队/dispose/异常）。
+- **删除输入框上方那一行**：`WIDGET_KEY = "pi-async-hold"` 常量与 `setProgress`/`clearProgress` 里无条件写
+  widget 的分支全部删掉（`pi-async-hold` 现在只是 footer 的 status key）。0.4.7 已经把判定改成
+  「看画面而不是看注册」，但那一行本身仍然冗余；顺手把这一行在 0.4.4–0.4.7 的演化收尾：
+  0.4.4 起是 `⠋ waiting for N async task(s) <elapsed> — Esc stops waiting`（只有数量）；0.4.5 改成带名
+  `⠋ 1 async task 7m 13s — watch-t4q-yamlfix (running, 7m 19s) — Esc stops waiting`；
+  0.4.6 只留 `⠋ waiting 7m 13s — Esc stops waiting`（明细交给 rail）；0.4.7 把「rail 在不在」从注册标志改成
+  「此刻画不画这些任务」并让 rail 自愈；0.4.8 直接把这一行并进 rail 首行。
+- **兜底行只在 rail 画不出来时存在**（新键 `HOLD_FALLBACK_WIDGET_KEY = "pi-async-hold-fallback"`，不写进用户文档）：
+  宿主没有 `setWidget`、widget 被清且装不回来、rail 窗口没覆盖这些任务 ⇒ `setHoldSurface(undefined)` →
+  `ensureRailSurface()` 自愈并立即复检 → 仍不行才自己带名
+  `⠙ async_wait · running <elapsed> — <name> (status, elapsed) · … — Esc stops waiting`。
+  两面互斥，全屏任何时刻最多一处 `async_wait`（§8 不变式：每个等待中的任务名必须在屏幕上出现一次）。
+- **宿主完全没有 `setWidget` 时 footer 带名**（§8 的最后落点）：
+  `waiting for N task(s) <elapsed> — name (status, elapsed) · …`；有 `setWidget` 时 footer 保持原样。
+- 任务行 `▶ name · state · elapsed` 的格式、排序、hover/点击、wheel 滚动、溢出指示、`RAIL_MAX_LINES=4`
+  全部不变；无任务时 rail 仍返回 `[]`。`railShowsTasks`/`ensureRailSurface` 语义不退回 0.4.6 的「注册即信任」。
+- 复核后仍不借用宿主 working 行：`interactive-mode.js` 的 `setWorkingVisible()` 里是
+  `if (this.session.isStreaming && …) this.showWorkingStatusIndicator();`，hold 期间没有流式输出。
+
+### Tests
+
+- 新增 `tests/i-hold-in-rail.test.ts`（真实 `createRailFactory` + 自制宿主）：hold 期间 rail 首行是等待行且
+  三行任务名都在（4 行上限、帧在换、elapsed 在走）；等待行顶掉汇总行；全屏 `async_wait` 只出现一次
+  （含 rail 被清掉又装不回来的兜底帧）；无 widget 宿主时 footer 带名；hold 结束/Esc 后首行恢复汇总行。
+- `tests/h-hold.test.ts`：progress 相关用例按新语义重写（无 rail 时兜底行带名、rail 覆盖时自己一行都不画、
+  rail 不覆盖/被 dispose 立刻带名、三种出口首行消失、窄终端与无名任务）。
+  `tests/i-settle-owner.test.ts`、`tests/e-rail-liveness.test.ts` 改用新键并按 rail 首行断言。
+- 变异验证（改回去即红）：hold 无视 rail 照常画自己的行 → 9 红；等待行与汇总行并列而不是顶掉 → 7 红；
+  `RAIL_TASK_SLOTS` 调成 2 → 4 红；`finally` 里不调 `clearWaiting` → 7 红；footer 不带名 → 2 红。
+- 真实 hold 实测（`docs/reports/hold-in-rail.md`）：同一个脚本对 0.4.7 树与当前树各跑一次真实
+  `init()` + `async_run`（`sleep 3`）+ `agent_before_settle`，0.4.7 屏上 3 行（rail 2 行 + 独立等待行），
+  0.4.8 屏上 2 行（rail 首行即等待行），结束后两面都回到汇总行。
+
 ## 0.4.7 — 2026-11-17（rail 自愈：注册 ≠ 可见）
 
 0.4.6 把「`registerRail` 调通过一次 `setWidget`」当成「rail 就在屏幕上」，据此把任务名从 hold 行删掉。
