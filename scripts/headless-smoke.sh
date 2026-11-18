@@ -72,9 +72,11 @@ EOF
 EOF
     ;;
   off)
+    # A task long enough that "did the process wait for it?" is unambiguous: the disabled path
+    # exits within a couple of seconds (shutdown kills the child), far from the 15 s task.
     cat > "$WORK/scenario.json" <<'EOF'
 {"turns": [
-  {"text": "Starting work.", "tools": [{"name": "async_run", "arguments": {"command": "sleep 3; echo READY", "mode": "background", "name": "smoke-off"}}]},
+  {"text": "Starting work.", "tools": [{"name": "async_run", "arguments": {"command": "sleep 15; echo READY", "mode": "background", "name": "smoke-off"}}]},
   {"text": "Waiting for the task to finish."},
   {"text": "CONCLUSION-AFTER-TASK"}
 ]}
@@ -174,7 +176,8 @@ case "$CASE" in
     ;;
   off)
     ! grep -q "CONCLUSION-AFTER-TASK" "$WORK/stdout.txt" || fail "conclusion appeared even with the guarantee disabled"
-    [ "$WALL" -lt 3000 ] || fail "process still waited with PI_ASYNC_PRINT_WAIT=0 (${WALL}ms)"
+    # The task takes 15 s; the disabled path must give up in a couple of seconds, not sit near it.
+    [ "$WALL" -lt 8000 ] || fail "process still waited with PI_ASYNC_PRINT_WAIT=0 (${WALL}ms)"
     ;;
 esac
 echo "RESULT: PASS"
