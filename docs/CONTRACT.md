@@ -297,13 +297,24 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - **进度可见性（修订 4 / 修订 5 / 修订 6）**：`agent_end` 在 `before_settle` **之前**就把宿主的 working 行清掉了
   （`interactive-mode.js:3060-3064`），hold 期间屏幕看起来像死机。hold 因此自带一行 widget，每 250ms 换一帧
   （10 帧 braille），`finally` 里无条件清除。
-  **修订 6（0.4.6）：明细只属于 rail。** rail 已注册（`registerRail` 真的调通了
-  `setWidget("pi-async-rail", …)`，事实记录在 `src/tui/surfaces.ts`，不靠猜）时，hold 行只写
+  **修订 6（0.4.6）/ 修订 7（0.4.7）：明细只属于 rail，而“rail 在不在”看的是它此刻画什么。**
+  rail 正在列出本 hold 等待的**每一个** taskId 时（`railShowsTasks` 向已挂载 widget 的 `taskIds()`
+  取一次，与 rail 的渲染共用同一窗口/滚动状态），hold 行只写
   `setWidget("pi-async-hold", ["<frame> waiting <hold-elapsed> — Esc stops waiting"], { placement: "aboveEditor" })`
   ——`<hold-elapsed>` 是**这一轮被 hold 多久**，与任何任务的耗时都不是同一个数字，rail 上也看不到。
   任务名/状态/耗时由 rail 行承担：0.4.5 把它们搬到 hold 行后，同一终端里汇总行、rail 行、hold 行
   三行在说同一件事（用户截图报的冗余）。
-  **rail 未注册**（宿主没有 `setWidget`）时退回修订 5 的明细行，因为没有别处能看：
+  **其他一切情况**——宿主没有 `setWidget`、widget 已被宿主清掉、rail 的窗口没覆盖这些任务——都退回
+  修订 5 的明细行，并调 `ensureRailSurface()` 让 rail 在下一帧重装，因此不存在“两边都不列名字”的帧。
+  **0.4.6 的信赖链是错的（裁决，0.4.7）**：0.4.6 把 `registerRail` 成功过一次当成“rail 就在屏幕上”
+  （`surfaces.ts` 里一个只置位、永不撤销的标志）。宿主会在 `resetExtensionUI()` 里 dispose 并清空
+  **所有** extension widget（`interactive-mode.js:2004-2014`，由会话切换 `:383` 与 `/reload` `:5510`
+  触发），而 `registerRail` 当时只从首个 TUI ctx 绑定时调过一次——于是 rail 消失、标志仍为真、
+  hold 闭嘴，用户屏幕上只剩一行 `⠋ waiting …`。修订 7 把“注册”降级为“安装配方”：widget 由宿主
+  创建时挂上 `mountRailDetail`、被 `dispose()` 时撤销，hold 每帧现取一次；`registerRail` 幂等，
+  widget 不在就重装（`rail.ts` / `surfaces.ts`），首帧最多 1s 后自愈。退回修订 6 的写法会让
+  `tests/h-hold.test.ts` 的 fallback 用例与 `tests/e-rail-liveness.test.ts` 变红。
+  明细行内容（同名于修订 5）：
   `["<frame> N async task(s) <elapsed> — <name> (<status>, <elapsed>) · … — Esc stops waiting"]`，
   每项与模型侧 `<async-state>` 同形（`src/context/nudges.ts:75`）；无名/空白名用 `taskId` 前 8 位；
   按终端**格宽**截断（CJK 算 2 格，`src/tui/width.ts`），放不下的记 `+N more`，**永远单行**（换行会抖动 editor）。
@@ -373,6 +384,15 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 ## 8. TUI（冻结，仅主会话）
 
 - guard：所有 TUI 路径 `ctx.mode === "tui"`（hasUI 陷阱）；rail/面板跳过 rpc/json/print。
+- **rail 存在性（产品不变式，0.4.7）**：只要有 `running`/`pending` 任务，输入框上方就**必须**有 rail 行，
+  与 hold 生命周期无关（没有任何 hold 时也画）；没有活跃任务时按既有 linger/watermark 规则显示或返回 `[]`。
+  rail 的存在不许由“有没有 hold”“hold 结束没有”决定。`registerRail` 因此是**幂等且自愈**的：
+  宿主仍持有本 registry 的 widget → 什么都不做；widget 已被宿主 `dispose()`/清空 → 重装
+  （`armRailSurface` 保存安装配方，`ensureRailSurface` 以 1s 上限节流）。触发点：首个 TUI 绑定、
+  **每个** lifecycle 事件（`session_start`/`message_start`）、任务进入 `running`/`pending` 的 state 事件、
+  以及 hold 每帧发现自己没被 rail 覆盖时。rail 读的是**活** registry（`() => activeRegistry ?? registry`），
+  所以 `configure()` 采纳上一代工作后不会画出空列表。测试：`tests/e-rail-liveness.test.ts`
+  （无 hold 也有 rail / 任务结束行消失 / 宿主清空后自愈 / 无 setWidget 时 hold 带名 / 同一任务集合）。
 - **轨道图 widget**（`setWidget("pi-async-rail", factory, {placement:"aboveEditor"})`）：
   整体最多 4 行（`RAIL_MAX_LINES=4`），含首行汇总；任务槽位为 `RAIL_TASK_SLOTS=3`，溢出时为
   `RAIL_TASK_SLOTS_OVERFLOW=2`。无溢出时为汇总 1 行 + 最多 3 行任务；

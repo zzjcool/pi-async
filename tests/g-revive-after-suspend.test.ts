@@ -271,7 +271,10 @@ test("a kill() awaiting a TERM-ignoring child cannot settle the revived snapshot
   let pid: number | undefined;
   try {
     // `trap "" TERM` is inherited across exec, so killTree spends its full grace window waiting.
-    const task = registry.submit({ command: 'trap "" TERM; sleep 30', notifyOnCompletion: false });
+    // The loop keeps the group alive under the *same* pid: with a bare `sleep 30` a loaded runner
+    // could see the group die before the revive fences it (this test flaked ~1 in 3 full-suite runs
+    // on pristine 0.4.6), which is the very race this case is meant to pin down.
+    const task = registry.submit({ command: 'trap "" TERM; while :; do sleep 1; done', notifyOnCompletion: false });
     pid = task.pid;
     const killing = registry.kill(task.taskId, "user");
     await waitFor(() => registry.isProcessAlive(task.taskId), "the TERM-ignoring child to be alive");

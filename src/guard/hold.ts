@@ -6,7 +6,7 @@ import { envNumber } from "../core/env.ts";
 // SAFETY: `tui/width.ts` is a pure text utility (no TUI/host imports), so the guard layer may share
 // it instead of duplicating the CJK cell-width rules — the deps still point one way (tui → core).
 import { displayWidth, truncateToWidth } from "../tui/width.ts";
-import { isRailRegistered } from "../tui/surfaces.ts";
+import { ensureRailSurface, railShowsTasks } from "../tui/surfaces.ts";
 import type { HoldNotificationRelay } from "./hold-notify.ts";
 
 /** Default upper bound for one hold (D-5 / D-9): ten minutes. */
@@ -307,16 +307,17 @@ export function registerHold(
   };
 
   /**
-   * §7.1 修订 4 / 修订 5 / 修订 6: the visible "still working" row. A frame of `SPINNER_FRAMES`
-   * changes every `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the elapsed seconds
-   * tick with it.
+   * §7.1 修订 4 / 修订 5 / 修订 6 / 修订 7: the visible "still working" row. A frame of
+   * `SPINNER_FRAMES` changes every `PROGRESS_FRAME_MS` so the line is unambiguously alive, and the
+   * elapsed seconds tick with it.
    *
-   * 修订 5 listed the waiting tasks here (0.4.5); 修订 6 takes that back out when a rail is on
-   * screen — the rail's own rows already carry `name · state · elapsed`, so naming them twice said
-   * the same thing twice. What the rail cannot show is **how long this turn has been held**, which
-   * is a different number from any task's duration, so that is all the row says now. Without a rail
-   * (a host without `setWidget`) the 0.4.5 detail row remains the fallback: there the row is the
-   * only place the tasks are visible at all.
+   * 修订 5 listed the waiting tasks here; 修订 6 took the names out whenever a rail was "registered".
+   * That read a one-time fact as a live one and produced a blackout: the host disposes every
+   * extension widget on session invalidate / reload, so the rail can be gone while registration still
+   * holds — and the row then said nothing at all. 修订 7 decides from what the rail **paints now**:
+   * the names are omitted only when the mounted rail lists every task this hold waits for.
+   * Otherwise the hold names them and asks the rail to re-install itself for the next frame, so the
+   * window with no list anywhere is a single frame instead of "forever".
    *
    * Purely cosmetic: every failure is swallowed like the footer (D-8).
    */
@@ -329,7 +330,10 @@ export function registerHold(
       const elapsed = formatElapsedMs(elapsedMs);
       const tail = " — Esc stops waiting";
       const width = terminalColumns();
-      const line = isRailRegistered()
+      const onRail = railShowsTasks(tasks.map((task) => task.taskId));
+      // Self-heal the other surface: no live rail (or it does not list these tasks) → bring it back.
+      if (!onRail) ensureRailSurface();
+      const line = onRail
         ? `${frame} waiting ${elapsed}${tail}`
         : detailedRow(frame, tasks, elapsed, width, tail);
       // Belt and braces: the budget above already fits, and an ellipsis here is still better than a

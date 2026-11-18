@@ -14,7 +14,7 @@ import { registerTools, type ToolContext } from "../src/tools/index.ts";
 import { registerRail } from "../src/tui/rail.ts";
 import { initStatus } from "../src/tui/status.ts";
 import { registerPanelCommands } from "../src/tui/panel.ts";
-import { bindTuiHost } from "../src/tui/host.ts";
+import { bindTuiHost, tuiHost } from "../src/tui/host.ts";
 
 export type PiCtx = ExtensionAPI;
 
@@ -258,13 +258,35 @@ export async function init(pi: PiCtx): Promise<void> {
     }
   };
 
+  /** The registry this generation actually owns: `ensureConfigured` may adopt a predecessor's work. */
+  const liveRegistry = (): TaskRegistry => activeRegistry ?? registry;
+
+  /**
+   * Bind the TUI host once, but **re-ensure the rail on every lifecycle event** (0.4.7).
+   *
+   * The host disposes and drops every extension widget on `resetExtensionUI()`
+   * (`interactive-mode.js:2030` ← session invalidate `:383`, `/reload` `:5510`), and a dropped widget
+   * is never re-created by itself. Registration is therefore idempotent work, not a one-shot latch.
+   */
   const bindTui = (ctx: unknown): void => {
-    if (!bindTuiHost(ctx)) return;
-    tui = true;
-    initStatus(pi, registry);
-    registerRail(pi, registry);
-    registerPanelCommands(pi, registry);
+    const fresh = bindTuiHost(ctx);
+    if (!tuiHost()) return;
+    if (fresh) {
+      tui = true;
+      initStatus(pi, registry);
+      registerPanelCommands(pi, registry);
+    }
+    registerRail(pi, liveRegistry);
   };
+
+  // Product invariant (0.4.7): a running task must have a rail, independent of any hold. Re-ensure
+  // the surface when work appears so a rail the host dropped cannot stay missing until the next turn.
+  registry.subscribe((event) => {
+    if (event.type !== "state") return;
+    const { status } = event.snapshot;
+    if (status !== "running" && status !== "pending") return;
+    registerRail(pi, liveRegistry);
+  });
 
   // Lifecycle events: configure → (first only) resend missed notifications, and bind the TUI
   // synchronously on the first TUI-capable ctx (pi exposes ui only on event ctxs).

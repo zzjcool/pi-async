@@ -10,7 +10,7 @@ import { registerHold } from "../src/guard/hold.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { displayWidth } from "../src/tui/width.ts";
-import { markRailRegistered, resetSurfaceRegistrationForTests } from "../src/tui/surfaces.ts";
+import { mountRailDetail, resetRailSurfaceForTests, unmountRailDetail } from "../src/tui/surfaces.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 
 type Handler = (...args: unknown[]) => unknown;
@@ -101,9 +101,9 @@ const completed = (taskId: string) => makeSnapshot({ taskId, status: "completed"
 const named = (taskId: string, name: string, startedAt: number) =>
   makeSnapshot({ taskId, name, status: "running", startedAt, metadata: {} });
 
-// §7.1 修订 6: the hold row branches on whether a rail is registered, which is process-wide state.
-// Reset it per test so neither branch can leak into the next case (and so both are exercised).
-beforeEach(() => resetSurfaceRegistrationForTests());
+// §7.1 修订 7: the hold row branches on whether the *mounted* rail lists its tasks, which is
+// process-wide live state. Reset it per test so neither branch can leak into the next case.
+beforeEach(() => resetRailSurfaceForTests());
 
 type EnvName = "PI_ASYNC_HOLD" | "PI_ASYNC_HOLD_MS" | "PI_ASYNC_HOLD_POLL_MS" | "PI_LEGION_NODE_ID";
 
@@ -844,11 +844,13 @@ test("without a rail the progress row names every task it is waiting for (fallba
 });
 
 /**
- * §7.1 修订 6 (0.4.6): the rail is the one place that carries `name · state · elapsed` per task,
+ * §7.1 修订 6 / 修订 7: the rail is the one place that carries `name · state · elapsed` per task,
  * so the hold row must not repeat it — three lines of the same fact in one terminal was the bug.
  * What only the hold knows is how long *this turn* has been held, and that is all it says.
+ *
+ * 修订 7 makes the gate "the rail lists exactly these tasks" rather than "a rail was registered".
  */
-test("with a rail on screen the hold row leaves the detail to the rail", async () => {
+test("with a rail that lists the tasks on screen the hold row leaves the detail to the rail", async () => {
   await withEnv(CLEAN, async () => {
     const { pi, fireOne } = makePi();
     const now = Date.now();
@@ -857,14 +859,66 @@ test("with a rail on screen the hold row leaves the detail to the rail", async (
     registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
     const interactive = makeInteractiveCtx();
 
-    markRailRegistered(); // what `registerRail` does once the host accepted the widget
+    // A mounted rail whose window really covers the task the hold waits for.
+    const detail = { taskIds: () => [watch.taskId] };
+    mountRailDetail(detail);
     assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+    unmountRailDetail(detail);
 
     const row = String(interactive.progress()[0]?.content?.[0]);
     assert.equal(row, "⠋ waiting 0s — Esc stops waiting", `the row carries only the hold's own elapsed (got: ${row})`);
     assert.ok(!row.includes("watch-t4q-yamlfix"), `the task name is the rail's job (got: ${row})`);
     assert.ok(!row.includes("7m"), `the task's own elapsed must not leak in — this elapsed is the hold's (got: ${row})`);
     assert.equal(interactive.progress()[0]?.content?.length, 1, "still a single line");
+  });
+});
+
+/**
+ * §7.1 修订 7, the bug 0.4.6 shipped: registration is not visibility. A rail widget can be mounted
+ * and still paint nothing (empty / retired registry), or be gone while the old "registered" flag
+ * still said otherwise. In both cases the hold must name the tasks itself.
+ */
+test("a rail that does not list the waited task never silences the hold row", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-yamlfix", now - 64_000);
+    const registry = sequenceRegistry([[watch], [watch], []]);
+    registerHold(pi as never, registry as never, { holdMs: 2000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    // Mounted, but it paints no task rows (what a stale registry / a cleared widget looks like).
+    mountRailDetail({ taskIds: () => [] });
+    assertResultsResult(await fireOne("agent_before_settle", { entries: [] }, interactive.ctx));
+
+    const row = String(interactive.progress()[0]?.content?.[0]);
+    assert.ok(row.includes("watch-t4q-yamlfix"), `the hold names the task when the rail shows none (got: ${row})`);
+  });
+});
+
+/**
+ * §7.1 修订 7: a rail the host disposed (session invalidate / reload clears every extension widget)
+ * must restore the detail on the very next frame — no permanent "silent" window.
+ */
+test("a disposed rail restores the task names on the next hold frame", async () => {
+  await withEnv(CLEAN, async () => {
+    const { pi, fireOne } = makePi();
+    const now = Date.now();
+    const watch = named("t4q00001-aaaa-bbbb-cccc-dddddddddddd", "watch-t4q-yamlfix", now - 64_000);
+    const registry = sequenceRegistry([[watch], [watch], [watch], [watch], [watch], [watch], [watch], [watch], []]);
+    registerHold(pi as never, registry as never, { holdMs: 5000, pollMs: 40 });
+    const interactive = makeInteractiveCtx();
+
+    const detail = { taskIds: () => [watch.taskId] };
+    mountRailDetail(detail);
+    const pending = fireOne("agent_before_settle", { entries: [] }, interactive.ctx) as Promise<unknown>;
+    await new Promise((resolve) => setTimeout(resolve, 120)); // let the rail-quiet frames paint
+    unmountRailDetail(detail); // what the host's clearExtensionWidgets() → dispose() does
+    assertResultsResult(await pending);
+
+    const rows = interactive.progress().filter((entry) => entry.content !== undefined).map((entry) => String(entry.content?.[0]));
+    assert.ok(rows[0]?.includes("watch-t4q-yamlfix") === false, `early frames leave the detail to the rail (got: ${rows[0]})`);
+    assert.ok(rows.at(-1)?.includes("watch-t4q-yamlfix"), `after the rail is gone the hold names the task (got: ${rows.at(-1)})`);
   });
 });
 
