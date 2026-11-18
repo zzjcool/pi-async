@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { closeSync, copyFileSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { DEFAULT_EXIT_GRACE_MS, killTree, spawnDetached, streamPaths } from "./spawn.ts";
-import { stripLogControls, truncateUtf8Bytes } from "./output.ts";
+import { stripLogControls } from "./output.ts";
 import { assertSafeEnvKeys, envNumber } from "./env.ts";
-import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type SyncResult, type TaskMode, type TaskSnapshot, type TaskStatus, type WatchSpec, type WaitOutcome } from "./task.ts";
+import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type TaskSnapshot, type TaskStatus, type WatchSpec, type WaitOutcome } from "./task.ts";
 import { evalConditions, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
 
 export interface RegistryEvents {
@@ -239,16 +239,16 @@ export class TaskRegistry {
 
   submit(opts: RunOptions): TaskSnapshot {
     if (opts.mode && opts.mode !== "background") throw new Error("submit only accepts background mode");
-    return this.createAndStart(opts, "background");
+    return this.createAndStart(opts);
   }
 
   scheduleDelayed(opts: RunOptions, delayMs: number): TaskSnapshot {
     // Fail fast: delayed tasks spawn later, so dangerous env overrides must be rejected at submit
-    // time exactly like background/sync (spawnDetached would otherwise only fail at due time).
+    // time exactly like background ones (spawnDetached would otherwise only fail at due time).
     assertSafeEnvKeys(opts.env, "safe");
     this.assertAdmission(opts);
     if (!Number.isFinite(delayMs) || delayMs < 0) throw new Error("delayMs must be a non-negative finite number");
-    this.validateRunWatch(opts, "delayed");
+    this.validateRunWatch(opts);
     const createdAt = Date.now();
     const taskId = randomUUID();
     const outputFile = join(this.config.dataDir, `${taskId}.output`);
@@ -273,30 +273,6 @@ export class TaskRegistry {
     if (opts.watch) this.attachWatch(taskId, opts.watch);
     this.scheduleDelayedStart(task, Math.max(0, (task.dueAt ?? createdAt) - Date.now()));
     return task;
-  }
-
-  async runSync(opts: RunOptions, timeoutMs: number, onTimeout: "promote" | "abort", signal?: AbortSignal): Promise<SyncResult> {
-    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("timeoutMs must be a non-negative finite number");
-    this.validateRunWatch(opts, "sync");
-    const task = this.createAndStart(opts, "sync");
-    let promoted = false;
-    try {
-      const outcome = await this.wait([task.taskId], timeoutMs, signal);
-      // Timeout / Esc: stop waiting. promote → background + promoted flag; abort → Esc semantics
-      // (keep process, bookkeeping mode becomes background so the receipt is not "sync+running").
-      if ("notReady" in outcome && !isTerminal(task.status)) {
-        task.mode = "background";
-        if (onTimeout === "promote") promoted = true;
-        this.emitState(task);
-      }
-    } catch (error) {
-      if (!signal?.aborted) throw error;
-      if (!isTerminal(task.status) && task.mode === "sync") {
-        task.mode = "background";
-        this.emitState(task);
-      }
-    }
-    return this.syncResult(task, promoted);
   }
 
   /**
@@ -369,20 +345,19 @@ export class TaskRegistry {
     if (!opts.command.trim()) throw new Error("command must not be empty");
   }
 
-  private validateRunWatch(opts: RunOptions, mode: TaskMode): void {
+  private validateRunWatch(opts: RunOptions): void {
     if (!opts.watch) return;
-    if (mode === "sync") throw new Error("watch is only supported for background and delayed modes");
     const result = validateWatchSpec(opts.watch);
     if (!result.ok) throw new Error(`Invalid watch spec: ${result.error}`);
   }
 
-  private createAndStart(opts: RunOptions, mode: "background" | "sync"): TaskSnapshot {
+  private createAndStart(opts: RunOptions): TaskSnapshot {
     this.assertAdmission(opts);
-    this.validateRunWatch(opts, mode);
+    this.validateRunWatch(opts);
     const taskId = randomUUID();
     const outputFile = join(this.config.dataDir, `${taskId}.output`);
     const task: TaskSnapshot = {
-      taskId, name: opts.name ? capName(opts.name) : deriveName(opts.command), command: opts.command, mode, status: "running",
+      taskId, name: opts.name ? capName(opts.name) : deriveName(opts.command), command: opts.command, mode: "background", status: "running",
       createdAt: Date.now(), startedAt: Date.now(), taskTimeoutMs: opts.taskTimeoutMs, notified: false, outputConsumed: false,
       ...(opts.watch ? { watch: opts.watch } : {}),
       metadata: { notifyOnCompletion: opts.notifyOnCompletion ?? true, triggerOnCompletion: opts.triggerOnCompletion ?? true, outputFile },
@@ -680,19 +655,6 @@ export class TaskRegistry {
     const stderr = this.logs(taskId, { maxBytes: WATCH_READ_BYTES, tail: true, stream: "stderr" });
     // Streams stay distinct (#4); merged is the concatenation the watch has always evaluated.
     return { output: merged.text, stdout: stdout.text, stderr: stderr.text };
-  }
-
-  private syncResult(task: TaskSnapshot, promoted: boolean): SyncResult {
-    let outputTail = this.logs(task.taskId, { maxBytes: 8192, tail: true }).text;
-    const lines = outputTail.split("\n");
-    if (lines.length > 200) outputTail = lines.slice(-200).join("\n");
-    const bytes = Buffer.from(outputTail, "utf8");
-    if (bytes.byteLength > 8192) outputTail = truncateUtf8Bytes(bytes, 8192, true);
-    return {
-      taskId: task.taskId, name: task.name, status: task.status, mode: task.mode,
-      outputHint: `Use async_logs with taskId ${task.taskId} to inspect early output.`,
-      ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }), outputTail, promoted,
-    };
   }
 
   markWatchSuccess(taskId: string, detail: string): void { const task = this.tasks.get(taskId); if (!task || isTerminal(task.status)) return; task.metadata.watchSuccess = detail; this.finalize(task, "completed", task.exitCode); }

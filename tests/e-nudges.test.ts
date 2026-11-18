@@ -42,6 +42,19 @@ function makeRegistry(tasks: () => ReturnType<typeof makeSnapshot>[]) {
   } as unknown as TaskRegistry;
 }
 
+/** Run `fn` with PI_ASYNC_EXPOSE_WAIT set (or deleted), restoring the environment afterwards. */
+function withWaitExposed<T>(value: string | undefined, fn: () => T): T {
+  const previous = process.env.PI_ASYNC_EXPOSE_WAIT;
+  if (value === undefined) delete process.env.PI_ASYNC_EXPOSE_WAIT;
+  else process.env.PI_ASYNC_EXPOSE_WAIT = value;
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) delete process.env.PI_ASYNC_EXPOSE_WAIT;
+    else process.env.PI_ASYNC_EXPOSE_WAIT = previous;
+  }
+}
+
 /** Run `fn` with PI_ASYNC_NUDGE set, restoring the environment afterwards. */
 function withSwitch<T>(value: string | undefined, fn: () => T): T {
   const previous = process.env.PI_ASYNC_NUDGE;
@@ -61,7 +74,10 @@ test("bashNudge fires on wall time >= 60s and states the duration", () => {
   assert.match(nudge, /^\(took 92s in the foreground; /);
   assert.match(nudge, /async_run could have run it in the background/);
   assert.match(nudge, /mode=background with watch/);
-  assert.match(nudge, /mode=sync with timeoutMs/);
+  // D6 (0.5.0): the nudge no longer sells `mode=sync` (deleted) and never names the opt-in async_wait.
+  assert.match(nudge, /end the turn and the completion notification wakes you/);
+  // (word-bounded: `async_run` contains the letters "sync" but is not the deleted mode)
+  assert.doesNotMatch(nudge, /\bsync\b|async_wait/);
 });
 
 test("bashNudge stays quiet for a quick, ordinary command", () => {
@@ -95,7 +111,8 @@ test("asyncStateLine renders name, status and elapsed and is undefined when idle
   assert.match(line, /^<async-state>1 async task\(s\) active: /);
   assert.match(line, /build \(running, 1m 5s\)/);
   assert.match(line, /completion notification wakes you/);
-  assert.match(line, /async_wait/);
+  // D4/D6 (0.5.0): the default path may not advertise the unregistered async_wait.
+  assert.doesNotMatch(line, /async_wait/);
 });
 
 test("asyncStateLine collapses overflow into +K more", () => {
@@ -108,23 +125,37 @@ test("asyncStateLine collapses overflow into +K more", () => {
   assert.match(line, /\+2 more/);
 });
 
-test("asyncStateLine only claims a wake-up for tasks that will actually notify", () => {
-  const wakes = makeSnapshot({ taskId: "a", name: "build", status: "running", startedAt: 0 });
-  const quiet = makeSnapshot({ taskId: "b", name: "ci", status: "running", startedAt: 0, metadata: { notifyOnCompletion: false } });
-  const noTurn = makeSnapshot({ taskId: "c", name: "lint", status: "running", startedAt: 0, metadata: { triggerOnCompletion: false } });
+test("asyncStateLine only claims a wake-up for tasks that will actually notify (default: no async_wait)", () => {
+  withWaitExposed(undefined, () => {
+    const wakes = makeSnapshot({ taskId: "a", name: "build", status: "running", startedAt: 0 });
+    const quiet = makeSnapshot({ taskId: "b", name: "ci", status: "running", startedAt: 0, metadata: { notifyOnCompletion: false } });
+    const noTurn = makeSnapshot({ taskId: "c", name: "lint", status: "running", startedAt: 0, metadata: { triggerOnCompletion: false } });
 
-  const allWake = asyncStateLine([wakes], 1_000);
-  assert.match(allWake ?? "", /end the turn and the completion notification wakes you/);
-  assert.doesNotMatch(allWake ?? "", /no-notify/);
+    // All three states keep the per-task invariant; only the collect-half follows D4/D6.
+    const allWake = asyncStateLine([wakes], 1_000);
+    assert.match(allWake ?? "", /— end the turn and the completion notification wakes you\.<\/async-state>$/);
+    assert.doesNotMatch(allWake ?? "", /no-notify/);
 
-  const mixed = asyncStateLine([wakes, quiet, noTurn], 1_000);
-  assert.match(mixed ?? "", /ci \(running, 1s, no-notify\)/, "the quiet task is marked, not silently trusted");
-  assert.match(mixed ?? "", /lint \(running, 1s, no-notify\)/);
-  assert.match(mixed ?? "", /wake you where enabled, or call async_wait for the rest/);
+    const mixed = asyncStateLine([wakes, quiet, noTurn], 1_000);
+    assert.match(mixed ?? "", /ci \(running, 1s, no-notify\)/, "the quiet task is marked, not silently trusted");
+    assert.match(mixed ?? "", /lint \(running, 1s, no-notify\)/);
+    assert.match(mixed ?? "", /— end the turn and let notifications wake you where enabled; read the rest with async_logs\./);
 
-  const none = asyncStateLine([quiet], 1_000);
-  assert.match(none ?? "", /none of these will notify you; collect them with async_wait/);
-  assert.doesNotMatch(none ?? "", /wakes you/, "never promise a wake-up that cannot happen");
+    const none = asyncStateLine([quiet], 1_000);
+    assert.match(none ?? "", /— none of these will notify you; collect them with async_logs before you need the result\./);
+    assert.doesNotMatch(none ?? "", /wakes you/, "never promise a wake-up that cannot happen");
+
+    for (const line of [allWake, mixed, none]) assert.doesNotMatch(line ?? "", /async_wait/);
+  });
+
+  // Exposed: the historical wording comes back verbatim.
+  withWaitExposed("1", () => {
+    const wakes = makeSnapshot({ taskId: "a", name: "build", status: "running", startedAt: 0 });
+    const quiet = makeSnapshot({ taskId: "b", name: "ci", status: "running", startedAt: 0, metadata: { notifyOnCompletion: false } });
+    assert.match(asyncStateLine([wakes], 1_000) ?? "", /end the turn and the completion notification wakes you, or call async_wait if you need one now\./);
+    assert.match(asyncStateLine([wakes, quiet], 1_000) ?? "", /wake you where enabled, or call async_wait for the rest\./);
+    assert.match(asyncStateLine([quiet], 1_000) ?? "", /collect them with async_wait before you need the result\./);
+  });
 });
 
 test("registerNudges appends the bash nudge and preserves structuredContent", () => {
@@ -236,5 +267,41 @@ test("PI_ASYNC_NUDGE=0 registers nothing, and dispose releases every hook", () =
     dispose();
     assert.equal(handlers.size, 0, "dispose unsubscribes every hook");
     assert.doesNotThrow(() => dispose(), "dispose is idempotent");
+  });
+});
+
+/**
+ * D4/D6 (0.5.0): the `<async-state>` line a real session receives must agree with the tool surface.
+ * Default (no `PI_ASYNC_EXPOSE_WAIT`): no `async_wait` anywhere in the injected text; exposed: the
+ * all-wake tail keeps the historical async_wait half-sentence.
+ */
+test("the injected <async-state> line follows the async_wait exposure (D4/D6)", () => {
+  withSwitch(undefined, () => {
+    const active = () => [makeSnapshot({ taskId: "t1", name: "server", status: "running", startedAt: Date.now() - 5_000 })];
+
+    withWaitExposed(undefined, () => {
+      const { pi, fireOne } = makePi();
+      const dispose = registerNudges(pi as never, makeRegistry(active));
+      try {
+        const injected = fireOne("context_with_system", { messages: [] }) as { messages: Array<{ content: string }> } | undefined;
+        const line = injected?.messages.at(-1)?.content ?? "";
+        assert.match(line, /^<async-state>/);
+        assert.match(line, /completion notification wakes you/);
+        assert.doesNotMatch(line, /async_wait/, "the default session must not be told to call an unregistered tool");
+      } finally {
+        dispose();
+      }
+    });
+
+    withWaitExposed("1", () => {
+      const { pi, fireOne } = makePi();
+      const dispose = registerNudges(pi as never, makeRegistry(active));
+      try {
+        const injected = fireOne("context_with_system", { messages: [] }) as { messages: Array<{ content: string }> } | undefined;
+        assert.match(injected?.messages.at(-1)?.content ?? "", /async_wait/, "an exposed session may still point at async_wait");
+      } finally {
+        dispose();
+      }
+    });
   });
 });

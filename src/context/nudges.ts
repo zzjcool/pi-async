@@ -2,6 +2,7 @@ import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { formatElapsedMs } from "../core/duration.ts";
+import { waitToolExposed } from "../tools/index.ts";
 
 /**
  * Discoverability layer (PLAN-CONTEXT §D-C4/§D-C5).
@@ -38,6 +39,9 @@ const nudgesDisabled = (): boolean => process.env.PI_ASYNC_NUDGE === "0";
 /**
  * One-line advice after a long foreground shell call, or undefined when the call was quick
  * and did not look like a watcher. Text is frozen by PLAN-CONTEXT §D-C4 (tests assert it).
+ *
+ * D3/D6 (0.5.0): the blocking-mode escape hatch is gone from the product, so the nudge no longer
+ * sells it — background + watch (or ending the turn) is the whole recommendation.
  */
 export function bashNudge(input: { command: string; wallTimeSeconds?: number }): string | undefined {
   const raw = input.wallTimeSeconds;
@@ -47,7 +51,7 @@ export function bashNudge(input: { command: string; wallTimeSeconds?: number }):
   if (!overBudget && !isLongShapedCommand(input.command)) return undefined;
   // A host that reports no wall time still gets the advice, just without the duration claim.
   const prefix = seconds === undefined ? "" : `took ${seconds}s in the foreground; `;
-  return `(${prefix}async_run could have run it in the background — use mode=background with watch for servers/builds, or mode=sync with timeoutMs when you need the result soon)`;
+  return `(${prefix}async_run could have run it in the background — use mode=background with watch for servers/builds; end the turn and the completion notification wakes you)`;
 }
 
 /**
@@ -63,6 +67,9 @@ function wakesYou(task: TaskSnapshot): boolean {
  * Shape is frozen by PLAN-CONTEXT §D-C5 (tests assert it). The closing sentence follows what is
  * actually true for these tasks: a task started with notifications off cannot wake anyone, so
  * claiming otherwise would be the same class of lie the 0.3.0 review was about.
+ *
+ * D4/D6 (0.5.0): `async_wait` is not registered by default, so the tails may only mention it when
+ * this session actually exposes it; the default fallback points at `async_logs`.
  */
 export function asyncStateLine(tasks: TaskSnapshot[], now: number, max: number = DEFAULT_MAX_TASKS): string | undefined {
   if (tasks.length === 0) return undefined;
@@ -78,11 +85,20 @@ export function asyncStateLine(tasks: TaskSnapshot[], now: number, max: number =
   const hidden = tasks.length - shown.length;
   const more = hidden > 0 ? ` +${hidden} more` : "";
   const wakeable = tasks.filter(wakesYou).length;
+  // Per-task fact first, collection wording second: the three canonical tails stay unchanged when
+  // async_wait is exposed, and only their collect-half changes when it is not.
+  const waitExposed = waitToolExposed();
   const tail = wakeable === 0
-    ? "— none of these will notify you; collect them with async_wait before you need the result."
+    ? waitExposed
+      ? "— none of these will notify you; collect them with async_wait before you need the result."
+      : "— none of these will notify you; collect them with async_logs before you need the result."
     : wakeable === tasks.length
-      ? "— end the turn and the completion notification wakes you, or call async_wait if you need one now."
-      : "— end the turn and let notifications wake you where enabled, or call async_wait for the rest.";
+      ? waitExposed
+        ? "— end the turn and the completion notification wakes you, or call async_wait if you need one now."
+        : "— end the turn and the completion notification wakes you."
+      : waitExposed
+        ? "— end the turn and let notifications wake you where enabled, or call async_wait for the rest."
+        : "— end the turn and let notifications wake you where enabled; read the rest with async_logs.";
   return `<async-state>${tasks.length} async task(s) active: ${items}${more} ${tail}</async-state>`;
 }
 

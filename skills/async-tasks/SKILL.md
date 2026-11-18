@@ -12,9 +12,8 @@ description: Run long shell commands (builds, servers, watchers) as async tasks 
 | Situation | Call |
 |---|---|
 | Quick read/grep/ls, or a command that finishes in seconds | `bash` |
-| Build, test suite, or anything that may take more than ~60s | `async_run` (default `mode=background`), then `async_wait` when you need it |
+| Build, test suite, or anything that may take more than ~60s | `async_run` (default `mode=background`); end the turn and read the result later with `async_logs` |
 | Dev server, watcher, `tail -f`, anything that never exits | `async_run` `mode=background` + `watch` |
-| You need the result before the next step, it may exceed the bash window, but not forever | `async_run` `mode=sync` with `timeoutMs` (bounded; promotes to background on expiry) |
 | Start later (cool-down, retry window) | `async_run` `mode=delayed` with `delayMs` |
 
 Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that is the pattern `async_run` + `watch` replaces.
@@ -24,7 +23,7 @@ Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that 
 - Anything that finishes in seconds — a read, a grep, `ls`, `git status` — belongs in `bash`: one call,
   output on screen. `async_run` costs a receipt plus an `async_logs` round-trip for the same text.
 - The next step needs what the command prints and it will finish within a minute — `bash` returns it
-  inline; `async_run` then `async_wait` is strictly slower.
+  inline; `async_run` then `async_logs` is strictly slower.
 - Nothing else to do while it runs and it is short. Async pays only when the wait overlaps real work,
   or when the command outlives the turn.
 - Never as an escape hatch for a command that keeps failing: a detached task hides its exit code
@@ -35,20 +34,17 @@ Never wrap a long command in a `sleep`/`until` polling loop inside `bash`: that 
 Before the first edit, scan the request for commands that are (a) likely to outlive ~60s and
 (b) independent of each other: build, test suite, lint, install, `docker pull`, a watcher.
 Start them **together in one message** (several `async_run` calls in a single tool batch), then do the
-file work while they run, and collect the whole set with one `async_wait` (or let the completion
+file work while they run, and collect the whole set when you need the results (or let the completion
 notifications wake you; a legion child must always collect before reporting a verdict).
 
 - Two independent five-minute builds started together take five minutes, not ten.
 - Do not serialize: start the second build/test while the first still runs when nothing depends on it.
 - Do not pre-launch commands you may never need — a task you never collect still costs a notification and a rail entry.
 
-`mode=sync` also registers a real task: it shows up in the rail and counts as running until it ends.
-Use it only for a command you must finish before the next step **and** that may exceed the bash window.
-
 ## Collect, do not poll
 
-- `async_wait` blocks until the tasks finish or the budget expires. It never kills them.
-- Ending a turn with tasks still running is fine: the completion notification wakes the session. Call `async_wait` only when you need a result now.
+- `async_wait` is **not registered by default**: a host only exposes it when it sets `PI_ASYNC_EXPOSE_WAIT=1`. Where it exists, it blocks until the tasks finish or the budget expires, and it never kills them.
+- Ending a turn with tasks still running is fine: the completion notification wakes the session. Read a result when you need one now with `async_logs` (or `async_wait` where it is exposed); `async_status` shows what is still in flight.
 - `async_logs` reads output while the task is still running (bounded to 50 KiB by default, ANSI stripped).
 - `async_status` lists active tasks; `includeHistory: true` shows recent finished ones (newest first).
 - `async_kill` terminates the task and its whole process group.
@@ -58,12 +54,12 @@ Use it only for a command you must finish before the next step **and** that may 
 
 A background task with no `watch` gets a runtime reminder after **20 minutes** by default (`remindAfterMs` overrides it, `0` disables it); reminders back off 2× and stop after three. When one arrives the task is still running and **will not be killed automatically** — either renew it with `async_extend` (moving `remindAfterMs` and/or `taskTimeoutMs`) or stop it with `async_kill`. Ignoring a reminder only means the task keeps running unobserved.
 
-## Timeouts are four different knobs
+## Timeouts are two different knobs
 
-- `timeoutMs` (sync only): how long *you* wait before the task is promoted to background. The task keeps running.
-- `onTimeout: "promote"` (default) returns while the task continues; `onTimeout: "abort"` stops waiting only — the task keeps running and still notifies. Neither one kills the process.
 - `taskTimeoutMs` (any mode): kills the task after that many milliseconds. Use it for a hard deadline, not as a way to avoid blocking.
 - `remindAfterMs` (any mode): when to be reminded that the task is still running (default 20 minutes for a background task without `watch`; `0` disables). A reminder never kills and never changes the task's status.
+
+There is no blocking run: `async_run` always returns a receipt, and the wait is either a later `async_logs` read or the completion notification.
 
 ## Watch conditions
 
@@ -98,7 +94,7 @@ Two shapes that are rejected before any task is created: `output_matches` regexe
 
 ## Legion children
 
-Before returning a verdict, collect every task you started: `async_wait` (or `async_status` to decide what is still in flight). The settle guard reminds you up to three times; an aborted run gets one follow-up reminder. A verdict reported while work is in flight loses that work's output.
+Before returning a verdict, collect every task you started: `async_status` tells you what is still in flight and `async_logs` reads it (use `async_wait` when the host exposes it with `PI_ASYNC_EXPOSE_WAIT=1`). The settle guard reminds you up to three times; an aborted run gets one follow-up reminder. A verdict reported while work is in flight loses that work's output.
 
 ## Naming
 

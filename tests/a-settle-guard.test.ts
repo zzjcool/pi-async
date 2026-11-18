@@ -39,7 +39,9 @@ test("settle guard reminds three times, then permits settle while retaining unre
       assert.equal(draft?.customType, "async-task-settle-reminder");
       assert.equal(draft?.display, false);
       assert.match(JSON.stringify(draft), /pending-1/);
-      assert.match(JSON.stringify(draft), /async_wait/);
+      // D4 (0.5.0): the default session has no async_wait tool, so the reminder points at the readers.
+      assert.match(JSON.stringify(draft), /async_status or async_logs/);
+      assert.doesNotMatch(JSON.stringify(draft), /async_wait/);
     }
     const last = beforeSettle();
     assert.equal("continue" in (last ?? {}), false, "no forced provider request once the budget is spent");

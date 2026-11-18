@@ -55,8 +55,10 @@ function clashes(a: Swatch, b: Swatch): boolean {
   return Math.hypot(a.l - b.l, a.a - b.a, a.b - b.b) < 0.025;
 }
 function typeColor(theme: Theme, mode: string, used: Swatch[]): string {
-  const modeIndex = ["background", "sync", "delayed"].indexOf(mode);
-  const preferred = TYPE_TOKENS[modeIndex < 0 ? 0 : modeIndex]!;
+  // D3 (0.5.0): the blocking mode is gone. background keeps TYPE_TOKENS index 0 and delayed keeps 2, so
+  // the frozen palette assignment (and the rail colour tests) stay byte-identical.
+  const modeIndex = mode === "delayed" ? 2 : 0;
+  const preferred = TYPE_TOKENS[modeIndex]!;
   for (const token of [preferred, ...TYPE_TOKENS]) {
     const color = swatch(theme, token);
     if (!used.some((previous) => clashes(color, previous))) { used.push(color); return token; }

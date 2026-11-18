@@ -1,6 +1,7 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
+import { waitToolExposed } from "../tools/index.ts";
 
 /** `custom_message` draft pi accepts from `agent_before_settle` (PLAN §2.6). */
 interface CustomMessageDraft {
@@ -36,6 +37,13 @@ type MessageHost = {
 };
 
 const idsOf = (active: TaskSnapshot[]): string => active.map((task) => task.taskId).join(", ");
+
+/**
+ * D4 (0.5.0): `async_wait` is not registered by default, so guard copy may only name it when this
+ * session actually exposes it. `async_status` / `async_logs` are always registered.
+ */
+const waitWord = (): string => (waitToolExposed() ? "async_wait" : "async_logs");
+const collectPair = (): string => (waitToolExposed() ? "async_wait or async_status" : "async_status or async_logs");
 
 /**
  * Whether finishing really starts a new turn for the session (CONTRACT §17 修订 1).
@@ -113,13 +121,14 @@ export class SettleGuard {
         this.advisorySent = true;
         // CONTRACT §17 修订 1: the frozen sentence promises a wake-up, so it is only honest when
         // every listed task really will wake the session. The mixed/none variants say which tasks
-        // need an `async_wait` instead of asserting a per-run fact that is false for some of them.
+        // need a collect step instead of asserting a per-run fact that is false for some of them.
+        // D4: the collect step is only allowed to name `async_wait` when it is exposed.
         const wakeable = active.filter(wakesOnCompletion);
         const wakeLine = wakeable.length === active.length
-          ? "If this answer does not need them, stop here — their completion notifications will wake you. Otherwise collect them with async_wait."
+          ? `If this answer does not need them, stop here — their completion notifications will wake you.${waitToolExposed() ? " Otherwise collect them with async_wait." : ""}`
           : wakeable.length === 0
-            ? "None of them will start a new turn; collect them with async_wait if you need one now."
-            : `${wakeable.length} of them will wake you when they finish; collect the other ${active.length - wakeable.length} with async_wait if you need them now.`;
+            ? `None of them will start a new turn; collect them with ${waitWord()} if you need one now.`
+            : `${wakeable.length} of them will wake you when they finish; collect the other ${active.length - wakeable.length} with ${waitWord()} if you need them now.`;
         const advisory: CustomMessageDraft = {
           type: "custom_message",
           customType: "async-task-settle-advisory",
@@ -134,7 +143,7 @@ export class SettleGuard {
         const unresolved: CustomMessageDraft = {
           type: "custom_message",
           customType: "async-task-unresolved",
-          content: `${active.length} async task(s) left unresolved: ${ids}. Collect them with async_wait or async_status before finishing.`,
+          content: `${active.length} async task(s) left unresolved: ${ids}. Collect them with ${collectPair()} before finishing.`,
           display: false,
         };
         return { entries: [...entries, unresolved] };
@@ -143,7 +152,7 @@ export class SettleGuard {
       const reminder: CustomMessageDraft = {
         type: "custom_message",
         customType: "async-task-settle-reminder",
-        content: `${active.length} async task(s) not collected yet: ${ids}. Call async_wait or async_status before reporting a verdict.`,
+        content: `${active.length} async task(s) not collected yet: ${ids}. Call ${collectPair()} before reporting a verdict.`,
         display: false,
       };
       return { entries: [...entries, reminder], continue: true };
@@ -166,7 +175,7 @@ export class SettleGuard {
       try {
         ids = idsOf(this.registry.list({ includeHistory: false }));
       } catch { /* best effort: the snapshot is decoration for the message body */ }
-      const content = `This run was aborted with async task(s) still running${ids ? `: ${ids}` : ""}. Use async_wait or async_status to collect them.`;
+      const content = `This run was aborted with async task(s) still running${ids ? `: ${ids}` : ""}. Use ${collectPair()} to collect them.`;
       try {
         // SAFETY: sendMessage is part of ExtensionAPI; feature-detected because mocks and older
         // hosts may omit it, and a stale ctx getter throws on access.

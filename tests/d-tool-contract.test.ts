@@ -6,13 +6,23 @@ import test from "node:test";
 import { registerTools, type ToolContext } from "../src/tools/index.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import type { TaskSnapshot } from "../src/core/task.ts";
+import { withExposedWaitAsync } from "./helpers/index.ts";
 
 /**
  * 0.3.0 tool contract (PLAN §2.7 / D-08 / D-17 / D-18):
  * tools must not lie about failures — unknown ids are errors, names resolve,
- * sync failures are isError, status/logs support filtering and stream splits,
- * and reads never mutate the registry's live snapshots.
+ * status/logs support filtering and stream splits, and reads never mutate the
+ * registry's live snapshots.
  */
+
+/**
+ * D4 (0.5.0): `async_wait` is opt-in and the gate is read per call (registration **and** execute),
+ * so a test that registers or calls it holds `PI_ASYNC_EXPOSE_WAIT=1` for its whole body via this
+ * wrapper. The default five-tool surface is pinned in `tests/k-toolsurface.test.ts`.
+ */
+const exposedTest = (name: string, fn: () => Promise<void>): void => {
+  test(name, () => withExposedWaitAsync(fn));
+};
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details: { payload?: unknown }; isError: boolean };
 type Tool = {
@@ -83,11 +93,13 @@ const D_C1_SNIPPETS: Record<string, string> = {
   async_kill: "Stop an async task and its whole process group.",
 };
 
-const D_C2_DESCRIPTION = "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.";
+const D_C2_DESCRIPTION = "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=delayed starts after delayMs.";
 
 /**
  * D-34 (0.4.1): the batch-planning guideline joined the three D-C3 ones, so the always-on prompt
  * now pushes "plan the batch / launch together in one message" instead of only "~60s means async".
+ * D4 (0.5.0): these four are byte-frozen; the fifth line is appended only while `async_wait` is
+ * not exposed, so the prompt never sells a tool this session lacks.
  */
 const D_C3_GUIDELINES = [
   "Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.",
@@ -96,32 +108,46 @@ const D_C3_GUIDELINES = [
   "Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.",
 ];
 
+const WAIT_UNAVAILABLE_GUIDELINE = "async_wait is not available in this session (set PI_ASYNC_EXPOSE_WAIT=1 to expose it); end the turn and the completion notification wakes you, and read output with async_logs.";
+
 const MAX_SNIPPET_CHARS = 140;
 
-test("all five tools carry a single-line promptSnippet verbatim from D-C1", async () => {
-  const { tools, cleanup } = makeRegistry();
-  try {
-    for (const [name, expected] of Object.entries(D_C1_SNIPPETS)) {
-      const snippet = tool(tools, name).promptSnippet;
-      assert.equal(typeof snippet, "string", `${name} must carry a promptSnippet (D-C1)`);
-      assert.ok((snippet ?? "").length > 0, `${name} snippet must be non-empty`);
-      assert.equal(snippet, expected, `${name} snippet must equal D-C1 verbatim`);
-      assert.doesNotMatch(snippet ?? "", /[\r\n]/, `${name} snippet must be a single line`);
-      assert.ok((snippet ?? "").length <= MAX_SNIPPET_CHARS, `${name} snippet must be <= ${MAX_SNIPPET_CHARS} chars, got ${(snippet ?? "").length}`);
-    }
-  } finally { await cleanup(); }
+test("all six exposed tools carry a single-line promptSnippet verbatim from D-C1", async () => {
+  await withExposedWaitAsync(async () => {
+    const { tools, cleanup } = makeRegistry();
+    try {
+      for (const [name, expected] of Object.entries(D_C1_SNIPPETS)) {
+        const snippet = tool(tools, name).promptSnippet;
+        assert.equal(typeof snippet, "string", `${name} must carry a promptSnippet (D-C1)`);
+        assert.ok((snippet ?? "").length > 0, `${name} snippet must be non-empty`);
+        assert.equal(snippet, expected, `${name} snippet must equal D-C1 verbatim`);
+        assert.doesNotMatch(snippet ?? "", /[\r\n]/, `${name} snippet must be a single line`);
+        assert.ok((snippet ?? "").length <= MAX_SNIPPET_CHARS, `${name} snippet must be <= ${MAX_SNIPPET_CHARS} chars, got ${(snippet ?? "").length}`);
+      }
+    } finally { await cleanup(); }
+  });
 });
 
-test("async_run promptGuidelines equal the four D-C3 + D-34 guidelines, each a single line", async () => {
+test("async_run promptGuidelines are the four frozen D-C3 + D-34 lines, plus the no-wait note by default", async () => {
   const { tools, cleanup } = makeRegistry();
   try {
+    // Default surface (D4): async_wait is not registered, so the fifth line tells the model so.
     const guidelines = tool(tools, "async_run").promptGuidelines;
-    assert.deepEqual(guidelines, D_C3_GUIDELINES);
+    assert.deepEqual(guidelines, [...D_C3_GUIDELINES, WAIT_UNAVAILABLE_GUIDELINE]);
     for (const guideline of guidelines ?? []) {
       assert.doesNotMatch(guideline, /[\r\n]/, `guideline must stay one line: ${guideline}`);
     }
-    assert.equal(guidelines?.length, 4, "0.4.1 adds D-34 as the fourth always-on guideline");
+    assert.equal(guidelines?.length, 5, "four frozen guidelines plus the no-wait note");
   } finally { await cleanup(); }
+
+  await withExposedWaitAsync(async () => {
+    const exposed = makeRegistry();
+    try {
+      const guidelines = tool(exposed.tools, "async_run").promptGuidelines;
+      assert.deepEqual(guidelines, D_C3_GUIDELINES, "an exposed async_wait needs no apology line");
+      assert.equal(guidelines?.length, 4, "the base four stay byte-identical and last");
+    } finally { await exposed.cleanup(); }
+  });
 });
 
 test("async_run description is the two D-C2 sentences and no longer carries check discipline", async () => {
@@ -135,20 +161,14 @@ test("async_run description is the two D-C2 sentences and no longer carries chec
 });
 
 test("async_run field descriptions follow D-C2 verbatim (command and watch pinned)", async () => {
-  const previous = process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-  // Pin the default budget so the interpolated D-C2 template is deterministic.
-  delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
   const { tools, cleanup } = makeRegistry();
   try {
-    const maxSyncTimeoutMs = 600_000;
     const expected: Record<string, string> = {
       command: "Shell command to execute (/bin/sh -c) in the session cwd.",
       name: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars).",
-      mode: "background (default) returns a taskId now; sync waits up to timeoutMs; delayed starts after delayMs.",
-      timeoutMs: `sync only: how long to wait before promoting to background (max ${maxSyncTimeoutMs} ms, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).`,
+      mode: "background (default) returns a taskId now; delayed starts after delayMs.",
       delayMs: "delayed only: milliseconds to wait before starting.",
       taskTimeoutMs: "Kill the task after this many ms, in any mode.",
-      onTimeout: "sync only: promote (default) returns while the task keeps running; abort stops waiting only — the task keeps running and still notifies.",
       notifyOnCompletion: "Send a completion notification (default true).",
       triggerOnCompletion: "Start a new turn when the task finishes (default true).",
       env: "Extra environment variables for the child process (safe policy applied).",
@@ -160,12 +180,13 @@ test("async_run field descriptions follow D-C2 verbatim (command and watch pinne
       assert.ok((description as string).length > 0, `${field} description must be non-empty`);
       assert.equal(description, text, `${field} description must equal D-C2 verbatim`);
     }
+    // D3 (0.5.0): the sync knobs are gone with the mode, not merely undocumented.
+    assert.equal(properties.timeoutMs, undefined, "timeoutMs is not an async_run field anymore");
+    assert.equal(properties.onTimeout, undefined, "onTimeout is not an async_run field anymore");
     // Pinned by name per the L0 ticket: command and watch are spelled out; the rest only checked above.
     assert.equal(properties.watch?.description, "Poll output (>=1s) for success_when/failure_when; conditions are OR-ed, first match wins, and checks must not swallow errors (no `|| true`).");
   } finally {
     await cleanup();
-    if (previous === undefined) delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-    else process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS = previous;
   }
 });
 
@@ -197,96 +218,7 @@ test("async_run receipt states a notification exception only when one exists (D-
   } finally { await cleanup(); }
 });
 
-test("a promoted sync task carries the same notification exception", async () => {
-  const { registry, tools, cleanup } = makeRegistry();
-  try {
-    const run = tool(tools, "async_run");
-    const promoted = payload<{ taskId: string; status: string; promoted: boolean; willNotify?: boolean; outputHint: string }>(
-      await call(run, { command: "sleep 2", mode: "sync", timeoutMs: 100, notifyOnCompletion: false }),
-    );
-    assert.equal(promoted.promoted, true);
-    assert.equal(promoted.status, "running");
-    assert.equal(promoted.willNotify, false);
-    assert.match(promoted.outputHint, /Notifications are off for this task/);
-    await registry.kill(promoted.taskId, "user");
-  } finally { await cleanup(); }
-});
-
-test("async_run schema caps sync timeout at PI_ASYNC_MAX_SYNC_TIMEOUT_MS and rejects at runtime", async () => {
-  const previous = process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-  process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS = "1500";
-  const dir = mkdtempSync(join(tmpdir(), "pi-async-d-sync-max-"));
-  const registry = new TaskRegistry({ dataDir: dir });
-  const host = makeHost();
-  try {
-    registerTools(host.pi as never, registry);
-    const run = tool(host.tools, "async_run");
-    const timeoutSchema = (run.parameters?.properties?.timeoutMs ?? {}) as { maximum?: number };
-    assert.equal(timeoutSchema.maximum, 1500, "schema maximum follows PI_ASYNC_MAX_SYNC_TIMEOUT_MS");
-    await expectToolError(call(run, { command: "true", mode: "sync", timeoutMs: 2000 }), /at most 1500 ms/);
-  } finally {
-    await registry.shutdown();
-    rmSync(dir, { recursive: true, force: true });
-    if (previous === undefined) delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-    else process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS = previous;
-  }
-});
-
-test("async_run defaults the schema maximum to 600000 ms (10 minutes)", async () => {
-  const previous = process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-  delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-  const dir = mkdtempSync(join(tmpdir(), "pi-async-d-sync-default-"));
-  const registry = new TaskRegistry({ dataDir: dir });
-  const host = makeHost();
-  try {
-    registerTools(host.pi as never, registry);
-    const timeoutSchema = (tool(host.tools, "async_run").parameters?.properties?.timeoutMs ?? {}) as { maximum?: number };
-    assert.equal(timeoutSchema.maximum, 600_000);
-  } finally {
-    await registry.shutdown();
-    rmSync(dir, { recursive: true, force: true });
-    if (previous === undefined) delete process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS;
-    else process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS = previous;
-  }
-});
-
-test("async_run rejects onTimeout outside sync mode; sync isError follows D-19 (non-zero exit only)", async () => {
-  const { registry, tools, cleanup } = makeRegistry();
-  try {
-    const run = tool(tools, "async_run");
-    await expectToolError(call(run, { command: "true", mode: "background", onTimeout: "promote" }), /onTimeout is only valid for sync mode/);
-    await expectToolError(call(run, { command: "true", mode: "delayed", delayMs: 1000, onTimeout: "abort" }), /onTimeout is only valid for sync mode/);
-
-    // D-19: a promote timeout leaves the task running — that is not a non-zero exit, so not an error.
-    const promoted = await call(run, { command: "sleep 2", mode: "sync", timeoutMs: 100 });
-    assert.equal(promoted.isError, false, "promote timeout must not be a tool error (D-19 / PLAN §2.7)");
-    const promotedPayload = payload<{ taskId: string; status: string; promoted: boolean }>(promoted);
-    assert.equal(promotedPayload.status, "running");
-    assert.equal(promotedPayload.promoted, true);
-    await registry.kill(promotedPayload.taskId, "user");
-
-    // D-19: abort stops waiting only; the task still runs and the result is not an error either.
-    const aborted = await call(run, { command: "sleep 2", mode: "sync", timeoutMs: 100, onTimeout: "abort" });
-    assert.equal(aborted.isError, false, "abort timeout must not be a tool error (D-19 / PLAN §2.7)");
-    const abortedPayload = payload<{ taskId: string; status: string; promoted: boolean }>(aborted);
-    assert.equal(abortedPayload.status, "running");
-    assert.equal(abortedPayload.promoted, false);
-    await registry.kill(abortedPayload.taskId, "user");
-
-    const failed = await call(run, { command: "echo boom-marker; exit 7", mode: "sync", timeoutMs: 5000 });
-    assert.equal(failed.isError, true, "non-zero sync exit must be a tool error");
-    const failedPayload = payload<{ status: string; exitCode?: number; outputTail: string }>(failed);
-    assert.notEqual(failedPayload.status, "completed");
-    assert.equal(failedPayload.exitCode, 7, "payload keeps the full SyncResult");
-    assert.match(failedPayload.outputTail, /boom-marker/);
-
-    const ok = await call(run, { command: "echo fine", mode: "sync", timeoutMs: 5000 });
-    assert.equal(ok.isError, false, "clean sync exit is not an error");
-    assert.equal(payload<{ status: string; exitCode?: number }>(ok).status, "completed");
-  } finally { await cleanup(); }
-});
-
-test("async_run executes in ctx.cwd instead of the host process cwd", async () => {
+exposedTest("async_run executes in ctx.cwd instead of the host process cwd", async () => {
   const { tools, cleanup } = makeRegistry();
   const cwd = mkdtempSync(join(tmpdir(), "pi-async-d-cwd-"));
   try {
@@ -304,7 +236,7 @@ test("async_run executes in ctx.cwd instead of the host process cwd", async () =
   }
 });
 
-test("taskId resolves by name for async_wait/async_logs/async_kill", async () => {
+exposedTest("taskId resolves by name for async_wait/async_logs/async_kill", async () => {
   const { tools, cleanup } = makeRegistry();
   try {
     const run = tool(tools, "async_run");
@@ -332,7 +264,7 @@ test("async_kill on an unknown id/name is a tool error", async () => {
   } finally { await cleanup(); }
 });
 
-test("async_wait on a duplicated name reports both candidate taskIds", async () => {
+exposedTest("async_wait on a duplicated name reports both candidate taskIds", async () => {
   const { registry, tools, cleanup } = makeRegistry();
   try {
     const run = tool(tools, "async_run");
@@ -346,7 +278,7 @@ test("async_wait on a duplicated name reports both candidate taskIds", async () 
   } finally { await cleanup(); }
 });
 
-test("async_status filters by default-active/status/name and clamps limit (D-08)", async () => {
+exposedTest("async_status filters by default-active/status/name and clamps limit (D-08)", async () => {
   const { registry, tools, cleanup } = makeRegistry();
   try {
     const run = tool(tools, "async_run");
@@ -419,7 +351,7 @@ test("async_status redacts metadata.delayedEnv to *** without mutating the regis
   } finally { await cleanup(); }
 });
 
-test("async_logs enforces the 50 KiB runtime cap and accepts the exact boundary", async () => {
+exposedTest("async_logs enforces the 50 KiB runtime cap and accepts the exact boundary", async () => {
   const MAX_LOG_BYTES = 50 * 1024;
   const { tools, cleanup } = makeRegistry();
   try {
@@ -448,7 +380,7 @@ test("async_logs enforces the 50 KiB runtime cap and accepts the exact boundary"
   } finally { await cleanup(); }
 });
 
-test("async_logs splits stdout/stderr streams and reports a missing stream file", async () => {
+exposedTest("async_logs splits stdout/stderr streams and reports a missing stream file", async () => {
   const { dir, registry, tools, cleanup } = makeRegistry();
   try {
     const run = tool(tools, "async_run");

@@ -397,14 +397,19 @@ test("init registers the hold before the settle guard on agent_before_settle", a
     try {
       await init(pi as never);
       const beforeSettle = handlers.get("agent_before_settle") ?? [];
-      assert.equal(beforeSettle.length, 3, "hold + notification flush + guard listen on the boundary");
+      // 0.5.0 (D5): the headless wait registers first so `pi -p` owns the boundary. It is inert in a
+      // TUI session, so the TUI order below is unchanged in effect: hold → notification flush → guard.
+      assert.equal(beforeSettle.length, 4, "print wait + hold + notification flush + guard listen on the boundary");
+      const printWait = beforeSettle[0]({ entries: [] }, { mode: "tui" });
+      assert.ok(printWait instanceof Promise, "the print wait handler is async");
+      assert.equal(await printWait, undefined, "the print wait never waits in a TUI session");
       // The hold handler is async (it may sleep); the other two are sync. Order = registration order:
       // the flush must see a task the results entry already latched `notified` (CONTRACT §7.2).
-      const first = beforeSettle[0]({ entries: [] }, { mode: "tui" });
+      const first = beforeSettle[1]({ entries: [] }, { mode: "tui" });
       assert.ok(first instanceof Promise, "the hold is registered before the settle guard");
-      assert.match(String(beforeSettle[1]), /flushPendingNotifications/, "the deferred notifications are decided between hold and guard");
-      assert.equal(beforeSettle[1]({ entries: [] }), undefined, "the flush adds no entries");
-      assert.equal(beforeSettle[2]({ entries: [] }), undefined, "the guard runs after the hold, unchanged");
+      assert.match(String(beforeSettle[2]), /flushPendingNotifications/, "the deferred notifications are decided between hold and guard");
+      assert.equal(beforeSettle[2]({ entries: [] }), undefined, "the flush adds no entries");
+      assert.equal(beforeSettle[3]({ entries: [] }), undefined, "the guard runs after the hold, unchanged");
       assertBareResult(await first);
     } finally {
       rmSync(dir, { recursive: true, force: true });

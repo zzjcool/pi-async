@@ -2,6 +2,44 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.5.0 — 未发布（工具面收窄：删 sync / async_wait 默认不注册 / 文案）
+
+三条一起改的是模型的默认路径：能阻塞的东西没了，会唤醒的那条路少了一个岔口。
+
+### Removed（D3）
+
+- **`async_run` 的 `mode=sync` 彻底删除，无兼容层**：`timeoutMs` / `onTimeout` 不再是 `async_run` 的
+  参数（schema 里没有这两个字段，`additionalProperties: false` 让宿主直接拒绝），
+  `PI_ASYNC_MAX_SYNC_TIMEOUT_MS` 不再被读取。传 `mode: "sync"` 会得到
+  `Unsupported async_run mode: sync`；`mode` 只剩 `background`（默认）与 `delayed`（需 `delayMs`）。
+  需要「现在就拿到结果」时用可选的 `async_wait`（见下）或 `async_logs`。
+- 据此，TUI 的 mode 配色槽位固定为 background=0 / delayed=2（行为与配色都不变），rail 上不再有
+  「sync 期间也在跑」这一类任务。
+
+### Changed（D4）
+
+- **`async_wait` 默认不注册**：默认工具面是 5 个（`async_run` / `async_logs` / `async_status` /
+  `async_kill` / `async_extend`）。宿主设置 `PI_ASYNC_EXPOSE_WAIT=1` 才额外注册 `async_wait`（6 个）。
+  开关每次调用重新读，不需要改代码即可在 reload 后生效。
+- 旧会话/旧注册若仍调到 `async_wait`，**不再抛错**：返回 `{ taskId: null, available: false, error,
+  enableWith: "PI_ASYNC_EXPOSE_WAIT=1", alternatives: ["async_status","async_logs"] }`（`isError: true`，
+  正常 resolve），说明原因与开启方式。
+- 文案不再劝模型调用未暴露的工具：`async_run` 的第 5 条 guideline、receipt 的两条例外 hint、
+  `<async-state>` 的三条 tail、settle guard 的 advisory / reminder / unresolved / aborted 文案，
+  默认一律指向 `async_status` + `async_logs`；只有 `PI_ASYNC_EXPOSE_WAIT=1` 时才保留 `async_wait` 措辞。
+  默认路径生成的文本里不会出现 `async_wait`。
+
+### Changed（D6）
+
+- `bash` 长命令事后提示删掉 `or mode=sync with timeoutMs when you need the result soon`，改为
+  `… use mode=background with watch for servers/builds; end the turn and the completion notification
+  wakes you`。
+- `<async-state>` 的全唤醒分支删掉 `, or call async_wait if you need one now`，默认为
+  `— end the turn and the completion notification wakes you.`；混合/全不唤醒分支同样改用 `async_logs`。
+  三态（全唤醒 / 混合 / 全不唤醒）的 per-task 事实不变量不变。
+- `skills/async-tasks/SKILL.md` 删掉 sync 章节，`async_wait` 描述为「默认不存在，宿主设
+  `PI_ASYNC_EXPOSE_WAIT=1` 才暴露；默认做法是结束回合等完成通知」。
+
 ## 0.4.7 — 2026-11-17（rail 自愈：注册 ≠ 可见）
 
 0.4.6 把「`registerRail` 调通过一次 `setWidget`」当成「rail 就在屏幕上」，据此把任务名从 hold 行删掉。

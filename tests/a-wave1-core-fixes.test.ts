@@ -151,7 +151,7 @@ test("#43 mixed timeout preserves already-finished results", async () => {
   }
 });
 
-test("#45 execute reports missing sync/delayed params by name", async () => {
+test("#45 execute reports missing delayed params and rejects a retired mode by name", async () => {
   const f = fixture();
   const tools = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<unknown>; parameters: Record<string, unknown> }>();
   const pi = { registerTool: (tool: { name: string; execute: (id: string, params: Record<string, unknown>) => Promise<unknown>; parameters: Record<string, unknown> }) => tools.set(tool.name, tool) };
@@ -159,8 +159,9 @@ test("#45 execute reports missing sync/delayed params by name", async () => {
     registerTools(pi as never, f.registry);
     const run = tools.get("async_run")!;
     assert.ok(!("allOf" in run.parameters) || !(run.parameters as { allOf?: unknown[] }).allOf?.length);
-    await assert.rejects(run.execute("c", { command: "echo x", mode: "sync" }), /timeoutMs is required for sync mode/);
     await assert.rejects(run.execute("c", { command: "echo x", mode: "delayed" }), /delayMs is required for delayed mode/);
+    // D3 (0.5.0): `mode=sync` is gone; the whitelist names the rejected value instead of coercing it.
+    await assert.rejects(run.execute("c", { command: "echo x", mode: "sync" }), /Unsupported async_run mode: sync/);
   } finally {
     await f.cleanup();
   }

@@ -8,6 +8,7 @@ import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { registerHold } from "../src/guard/hold.ts";
+import { registerPrintWait } from "../src/guard/print-wait.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
 import { registerTools, type ToolContext } from "../src/tools/index.ts";
@@ -69,6 +70,9 @@ let activeNudges: (() => void) | undefined;
 
 /** Previous generation's settle hold (PLAN-HOLD D-1); released up front like the guard. */
 let activeHold: (() => void) | undefined;
+
+/** Previous generation's headless (`pi -p`) wait (D5); released up front like the hold. */
+let activePrintWait: (() => void) | undefined;
 
 /**
  * S7 (0.4.2) hardening: true while `init()` is awaiting the previous generation's `suspend()`.
@@ -139,15 +143,24 @@ export async function init(pi: PiCtx): Promise<void> {
   const previousRegistry = activeRegistry;
   const previousNudges = activeNudges;
   const previousHold = activeHold;
+  const previousPrintWait = activePrintWait;
   activeGuard = undefined;
   activeRegistry = undefined;
   activeNudges = undefined;
   activeHold = undefined;
+  activePrintWait = undefined;
   if (previousNudges) {
     try {
       previousNudges();
     } catch (error) {
       console.error("pi-async: previous context nudges disposal during reload failed", error);
+    }
+  }
+  if (previousPrintWait) {
+    try {
+      previousPrintWait();
+    } catch (error) {
+      console.error("pi-async: previous print wait disposal during reload failed", error);
     }
   }
   if (previousHold) {
@@ -444,6 +457,12 @@ export async function init(pi: PiCtx): Promise<void> {
     context.on("agent_start", () => { runActive = true; });
     context.on("agent_settled", () => { runActive = false; flushPendingNotifications(); });
 
+    // D5 (0.5.0): the headless wait registers BEFORE the hold, so in `pi -p` the boundary waits for
+    // the task first (the hold is inert there: it only serves `mode === "tui"`), while in the TUI
+    // this handler returns immediately and the hold still waits first in effect. The two are disjoint
+    // by mode, so neither can swallow the other's drafts. Same relay instance on purpose: one owner
+    // for the terminal event, never a second dedupe mechanism.
+    activePrintWait = registerPrintWait(pi, registry, { notify: holdNotify });
     // PLAN-HOLD D-1: the hold registers BEFORE the guard, so the settle boundary waits first and
     // the guard's advisory still runs afterwards on the same boundary. The relay is what lets the
     // hold own the completion of a task that finishes inside that wait (CONTRACT §7.1 修订 3).
