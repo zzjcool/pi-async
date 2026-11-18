@@ -2,6 +2,40 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.4.7 — 2026-11-17（rail 自愈：注册 ≠ 可见）
+
+0.4.6 把「`registerRail` 调通过一次 `setWidget`」当成「rail 就在屏幕上」，据此把任务名从 hold 行删掉。
+那条信赖链是错的：宿主会 dispose 并清空**所有** extension widget，而 rail 只在首个 TUI ctx 绑定时
+装过一次。结果两边同时静默——屏幕上只剩 `⠋ waiting 51s — Esc stops waiting`，用户看不到在跑什么。
+
+### Fixed
+
+- **rail 的存在由任务状态决定，与 hold 无关**（CONTRACT §8 产品不变式）：只要有 running/pending 任务，
+  输入框上方就必须有 rail 行，没有 hold 时也画。`registerRail` 变成**幂等且自愈**：宿主仍持有本 registry
+  的 widget → 什么都不做；widget 已被宿主清掉 → 重装。自愈触发点：每个 lifecycle 事件
+  （`session_start`/`message_start`）、任务进入 running/pending、以及 hold 每帧发现自己没被 rail 覆盖时
+  （节流上限 1s）。用户侧效果：会话切换（`/new`、`/resume`、`/fork`）或 `/reload` 之后 rail 不再永久消失。
+- **hold 行不再信标志，只信画面**（CONTRACT §7.1 修订 7）：省略任务名的唯一条件变成「已挂载的 rail
+  此刻列出的 taskId 集合覆盖了本 hold 等待的每一个任务」（`railShowsTasks` → widget 的 `taskIds()`，
+  与 rail 渲染共用同一窗口/滚动状态）。宿主没有 `setWidget`、widget 被清掉、rail 窗口没覆盖这些任务
+  ⇒ hold **立刻**自己带名，并请求 rail 下一帧重装，因此不存在「两边都不列名字」的帧。
+- **rail 读活 registry**：`registerRail(pi, () => activeRegistry ?? registry)`，`configure()` 采纳上一代
+  工作后 rail 不会对着被退休的实例画空列表。
+- 内部：`src/tui/surfaces.ts` 从「一次性注册标志」改为活记录（`armRailSurface` / `mountRailDetail` /
+  `unmountRailDetail` / `railShowsTasks` / `ensureRailSurface`），widget 的 `dispose()` 会撤销自己，
+  宿主清空 widget 后下一次取数就是真话。
+
+### Tests
+
+- `tests/e-rail-liveness.test.ts`（新增，按宿主 `setWidget`/`clearExtensionWidgets` 语义务实现）：
+  无 hold 也有 rail 行；任务结束后行消失；宿主清空 widget 后自愈重装；无 `setWidget` 时 hold 带名；
+  hold 等待集合与 rail 行集合同源；hold 期间宿主清空 rail ⇒ 下一帧重装且这一帧就带名；
+  `init()` 端到端：宿主清空 widget 后，**下一个 lifecycle 事件**与**下一个任务出现**各自都能把 rail 装回来。
+- `tests/h-hold.test.ts`：rail 覆盖 hold 的任务时省略明细；rail 不覆盖 / 被 dispose ⇒ 立刻恢复带名。
+- 三条不变式都做了变异验证（改回旧行为即变红）：hold 无条件闭嘴 → 7 红；widget 不挂 detail → 3 红；
+  `ensureRailSurface` 不重装 → 2 红；hold 不请求重装 → 1 红；`bindTui` 退回一次性注册 → 1 红；
+  去掉任务 state 事件的自愈钩子 → 1 红（就是“任务出现时重装”那条）。
+
 ## 0.4.6 — 2026-11-17（明细只在 rail：hold 行与汇总行不再重复任务信息）
 
 0.4.5 把「在等哪些任务」搬进了 hold 等待条，结果同一个终端里三行在说同一件事：
@@ -15,6 +49,8 @@
   `⠋ waiting 7m 13s — Esc stops waiting`——hold 的 elapsed 与任务耗时不是同一个数字，rail 上没有它。
   **回退**：rail 未注册（宿主没有 `setWidget`）时退回 0.4.5 的带名明细，因为那时没有别处能看。
   rail 是否注册由 `src/tui/surfaces.ts` 记录的事实标志决定（`registerRail` 真的调通 widget 后才置位），不靠猜。
+  > **0.4.7 更正**：这条信赖链错了——「注册」不等于「可见」。宿主会清空 widget 而标志仍然为真，
+  > 于是 rail 和 hold 同时静默。0.4.7 改为按 rail 此刻真正列出的任务判定，并让 rail 自愈。
 - **汇总行在只有一个 running/pending 任务时不再显示时长**（CONTRACT §8）：`▶ 1 running` 就够，
   那个数字就在唯一那行任务行的行尾；0 个活任务仍显示 `—`，≥2 个仍保留汇总时长（否则没有单行能读到）。
 - rail 行本身不变（它仍是明细来源）。宽度/截断规则不变；两处都是 best-effort（D-8）。

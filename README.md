@@ -156,8 +156,12 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
   the editor — a spinning `⠋⠙⠹…` frame every 250 ms, how long **this turn has been held**, and
   `Esc stops waiting` — and removes it in a `finally`. The per-task detail (`name · status · elapsed`)
   stays in the rail: repeating it in the hold row made one terminal say the same thing three times
-  (0.4.5). Only on a host without `setWidget`, where no rail exists, does the hold row fall back to
-  naming the tasks itself (`name (status, elapsed)`, `+N more`). The footer line
+  (0.4.5). "Stays in the rail" is decided from what the rail **paints right now**, not from "a rail
+  was registered earlier": the names are dropped only while the mounted rail lists every task the
+  hold waits for. A host without `setWidget`, a rail the host dropped, and a rail whose window does
+  not cover those tasks all fall back to the hold naming them itself (`name (status, elapsed)`,
+  `+N more`) — the rail is re-installed on the next frame, so the two surfaces never go dark
+  together (0.4.7). The footer line
   `waiting for N tasks <elapsed>` (15 s cadence) is still written when the host exposes `setStatus`,
   but it is no longer the only sign of life.
 - When every task in the snapshot finished, the boundary returns one

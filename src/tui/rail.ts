@@ -4,7 +4,7 @@ import type { TaskSnapshot } from "../core/task.ts";
 import { visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
 import { inRailWindow, railLingerMs, railWindowCounts, summarySegments, type SummaryCounts } from "./status.ts";
-import { markRailRegistered } from "./surfaces.ts";
+import { armRailSurface, mountRailDetail, railMounted, unmountRailDetail, type RailDetail } from "./surfaces.ts";
 import { displayWidth, truncateToWidth } from "./width.ts";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { openPanel } from "./panel.ts";
@@ -116,9 +116,20 @@ function coloredSummary(counts: SummaryCounts, now: number, width: number, theme
 
 type SummarySegmentLike = { text: string; token: string };
 
-export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onOpenTask?: (taskId: string) => void } = {}): (tui: TUI, theme: Theme) => RailWidget {
+/**
+ * The rail reads the **live** registry, not the one that happened to exist at registration time: a
+ * generation that adopts its predecessor's work (`activeRegistry`) must keep the rail pointed at the
+ * instance the hold and the tools use, or the rail renders nothing while tasks are running.
+ */
+export type RegistrySource = TaskRegistry | (() => TaskRegistry);
+
+const registryResolver = (source: RegistrySource): (() => TaskRegistry) =>
+  typeof source === "function" ? source : () => source;
+
+export function createRailFactory(pi: PiCtx, registry: RegistrySource, opts: { onOpenTask?: (taskId: string) => void } = {}): (tui: TUI, theme: Theme) => RailWidget {
   // Factory signature includes the extension context for future host-specific rail integrations.
   void pi;
+  const registryOf = registryResolver(registry);
   return (tui, theme) => {
     if (railTicker) clearInterval(railTicker);
     const ticker = setInterval(() => {
@@ -136,7 +147,7 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     // Rows and summary counts are drawn from one snapshot + one window so `✓N`
     // always has a matching row (0.3.0 §2.9).
     const listAll = (): TaskSnapshot[] => {
-      try { return registry.list({ includeHistory: true }); } catch { return []; }
+      try { return registryOf().list({ includeHistory: true }); } catch { return []; }
     };
     const ordered = (all: TaskSnapshot[], now = Date.now()): TaskSnapshot[] => all
       .filter((task) => inRailWindow(task, now, lingerMs))
@@ -144,15 +155,22 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
     const clampScroll = (count: number, taskSlots: number): void => {
       scroll = Math.max(0, Math.min(scroll, Math.max(0, count - taskSlots)));
     };
-    const render = (width = 120): string[] => {
-      const now = Date.now();
+    /**
+     * One window for both consumers: the paint below and the hold's probe (`taskIds`). Sharing it is
+     * what makes "the rail lists these tasks" mean exactly what the user sees, scroll included.
+     */
+    const windowed = (now = Date.now()): { all: TaskSnapshot[]; tasks: TaskSnapshot[]; visible: TaskSnapshot[]; overflow: boolean } => {
       const all = listAll();
       const tasks = ordered(all, now);
-      if (tasks.length === 0) { hitRows = []; return []; }
       const overflow = tasks.length > RAIL_TASK_SLOTS;
       const taskSlots = overflow ? RAIL_TASK_SLOTS_OVERFLOW : RAIL_TASK_SLOTS;
-      clampScroll(tasks.length, taskSlots);
-      const visible = tasks.slice(scroll, scroll + taskSlots);
+      if (tasks.length > 0) clampScroll(tasks.length, taskSlots);
+      return { all, tasks, visible: tasks.slice(scroll, scroll + taskSlots), overflow };
+    };
+    const render = (width = 120): string[] => {
+      const now = Date.now();
+      const { all, tasks, visible, overflow } = windowed(now);
+      if (tasks.length === 0) { hitRows = []; return []; }
       const counts = railWindowCounts(all, now, lingerMs);
       hitRows = ["", ...visible.map((task) => task.taskId)];
       const used = [swatch(theme, "error"), swatch(theme, "dim")];
@@ -193,6 +211,11 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
       }
       return rows;
     };
+    // Publish what this widget paints so the hold can ask whether the detail is really on screen.
+    // `dispose` withdraws it: the host disposes the widget when it clears or replaces the widget map,
+    // which is exactly the moment the old "registered" latch used to become a lie.
+    const detail: RailDetail = { taskIds: () => windowed().visible.map((task) => task.taskId) };
+    mountRailDetail(detail);
     return {
       render,
       handleMouse(event: TuiMouseEvent): { handled: boolean } | undefined {
@@ -218,6 +241,7 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
         const clicked = latchedId; latchedId = undefined; opts.onOpenTask?.(clicked); return { handled: true };
       },
       dispose(): void {
+        unmountRailDetail(detail);
         latchedId = undefined;
         if (railTicker === ticker) {
           clearInterval(ticker);
@@ -228,14 +252,45 @@ export function createRailFactory(pi: PiCtx, registry: TaskRegistry, opts: { onO
   };
 }
 
-/** The sole rail widget registration point. */
-export function registerRail(pi: PiCtx, registry: TaskRegistry): void {
+export const RAIL_WIDGET_KEY = "pi-async-rail";
+
+/** What the current widget was installed for: the same host + the same registry source means no churn. */
+let installedFor: { ui: unknown; registry: RegistrySource } | undefined;
+
+/**
+ * The sole rail widget registration point. Idempotent **and self-healing** (0.4.7):
+ *
+ * - when the host still holds our widget it does nothing (no churn, no extra ticker);
+ * - when the widget is gone — the host cleared the widget map, or replaced it, or never built it —
+ *   it installs a fresh one, and `armRailSurface` keeps the recipe so the hold can ask for it again.
+ *
+ * 0.4.6 called this once from the first TUI bind and never again, so one host-side clear left the
+ * rail dark for the rest of the process.
+ */
+export function registerRail(pi: PiCtx, registry: RegistrySource): void {
   // TUI surfaces bind from event contexts; the factory API has no mode/ui.
   const bound = tuiHost();
   if (!bound) return;
   const setWidget = bound.ui["setWidget"] as ((key: string, factory: ReturnType<typeof createRailFactory> | undefined, options?: { placement: "aboveEditor" }) => void) | undefined;
   if (typeof setWidget !== "function") return; // no widget surface → no rail → the hold keeps naming tasks
-  setWidget("pi-async-rail", createRailFactory(pi, registry, { onOpenTask: (id) => openPanel(pi, registry, id) }), { placement: "aboveEditor" });
-  // §7.1 修订 6: only a rail that the host actually accepted may suppress the hold row's detail.
-  markRailRegistered();
+  const registryOf = registryResolver(registry);
+  const install = (): void => {
+    setWidget.call(bound.ui, RAIL_WIDGET_KEY, createRailFactory(pi, registry, { onOpenTask: (id) => openPanel(pi, registryOf(), id) }), { placement: "aboveEditor" });
+  };
+  // Idempotent: the host still holds the widget we installed for this very registry → nothing to do.
+  if (installedFor?.ui === bound.ui && installedFor.registry === registry && railMounted()) return;
+  armRailSurface(() => {
+    try {
+      install();
+      return railMounted();
+    } catch {
+      return false; // a host that rejects the widget stays without a rail; the hold keeps naming tasks
+    }
+  });
+  installedFor = { ui: bound.ui, registry };
+  try {
+    install();
+  } catch {
+    // Best-effort surface: D-8, a rejected widget must never break the session.
+  }
 }
