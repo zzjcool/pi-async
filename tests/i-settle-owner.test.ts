@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
+import { HOLD_FALLBACK_WIDGET_KEY } from "../src/guard/hold.ts";
 
 /**
  * 0.4.2 regression (report 2026-11-17): one terminal event, two announcements.
@@ -94,12 +95,12 @@ function makeHost(cwd: string) {
 
   /** Raw terminal-input subscription, exactly like `ui.onTerminalInput` (tui.js:719-735). */
   let press: ((data: string) => undefined) | undefined;
-  /** Every progress row the hold writes (`setWidget("pi-async-hold", …)`). */
+  /** Every row the hold paints itself (`setWidget(HOLD_FALLBACK_WIDGET_KEY, …)`, §7.1 修订 8). */
   const progressRows: Array<string[] | undefined> = [];
   const ui = {
     setStatus: () => undefined,
     setWidget: (key: string, content: string[] | undefined) => {
-      if (key === "pi-async-hold") progressRows.push(content);
+      if (key === HOLD_FALLBACK_WIDGET_KEY) progressRows.push(content);
     },
     onTerminalInput: (handler: (data: string) => undefined) => {
       press = handler;
@@ -135,11 +136,16 @@ function makeHost(cwd: string) {
      * advisory after the hold on the same boundary. Both are other people's proposals — the question
      * every test in this file asks is what the hold owned.
      */
-    boundary: async (...args: unknown[]): Promise<BeforeSettleResult[]> =>
-      ((await fire("agent_before_settle", ...args)) as Array<BeforeSettleResult | undefined>)
-        .filter((result): result is BeforeSettleResult => result !== undefined && result !== null)
-        .filter((result) => (result.entries as Array<{ customType?: unknown }>)
-          .some((entry) => entry?.customType === "async-task-settle-results")),
+    boundary: async (...args: unknown[]): Promise<BeforeSettleResult[]> => {
+      const results = (await fire("agent_before_settle", ...args)) as Array<BeforeSettleResult | undefined>;
+      const drafts: BeforeSettleResult[] = [];
+      for (const result of results) {
+        if (!result) continue;
+        const entries = result.entries as Array<{ customType?: unknown }>;
+        if (entries.some((entry) => entry?.customType === "async-task-settle-results")) drafts.push(result);
+      }
+      return drafts;
+    },
     pressEscape: () => press?.("\x1b"),
     hasEscapeListener: () => press !== undefined,
     fire,

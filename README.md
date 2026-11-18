@@ -159,16 +159,18 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
   deliver your message on the next turn. Programmatic aborts that do not type Esc (an extension
   calling `ctx.abort()`, `/tree` navigation) still cannot preempt the handler; see Known limitations.
 - **It visibly moves.** pi clears its own working row at `agent_end`, i.e. before this boundary, so a
-  hold would otherwise look like a frozen screen. While it waits, the plugin renders its own row above
-  the editor — a spinning `⠋⠙⠹…` frame every 250 ms, how long **this turn has been held**, and
-  `Esc stops waiting` — and removes it in a `finally`. The per-task detail (`name · status · elapsed`)
-  stays in the rail: repeating it in the hold row made one terminal say the same thing three times
-  (0.4.5). "Stays in the rail" is decided from what the rail **paints right now**, not from "a rail
-  was registered earlier": the names are dropped only while the mounted rail lists every task the
-  hold waits for. A host without `setWidget`, a rail the host dropped, and a rail whose window does
-  not cover those tasks all fall back to the hold naming them itself (`name (status, elapsed)`,
+  hold would otherwise look like a frozen screen. While it waits, the **rail's first row** becomes the
+  wait — a spinning `⠋⠙⠹…` frame every 250 ms, how long **this turn has been held**, and
+  `Esc stops waiting` — and it hands row 0 back to the summary row in a `finally`. 0.4.8 removed the
+  separate line the plugin used to paint above the editor: the two said the same thing in one terminal
+  (0.4.4–0.4.7). The per-task detail (`name · status · elapsed`) is the rail's own task rows: repeating
+  it in the waiting row made one terminal say the same thing three times (0.4.5). "The detail is on
+  screen" is decided from what the rail **paints right now**, not from "a rail was registered
+  earlier": the names are dropped only while the mounted rail lists every task the hold waits for. A
+  host without `setWidget`, a rail the host dropped, and a rail whose window does not cover those
+  tasks all fall back to a hold-owned line that names them itself (`name (status, elapsed)`,
   `+N more`) — the rail is re-installed on the next frame, so the two surfaces never go dark
-  together (0.4.7). The footer line
+  together, and exactly one waiting line is on screen either way (0.4.7/0.4.8). The footer line
   `waiting for N tasks <elapsed>` (15 s cadence) is still written when the host exposes `setStatus`,
   but it is no longer the only sign of life.
 - When every task in the snapshot finished, the boundary returns one
@@ -195,6 +197,10 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
 | `PI_ASYNC_HOLD` | `on` | Set `0` to disable the hold entirely (no handler is registered at all). |
 | `PI_ASYNC_HOLD_MS` | `600000` (10 min) | Upper bound for one hold; **≤ 0** disables the feature (a negative value is not replaced by the default; non-integer values fall back to the default). |
 | `PI_ASYNC_HOLD_POLL_MS` | `1000` | How often the task list is re-read while holding. |
+| `PI_ASYNC_PRINT_WAIT` | `on` | Set `0` to disable the headless (`pi -p`) backstop entirely (the process may exit while tasks still run, 0.4.x behaviour). |
+| `PI_ASYNC_PRINT_WAIT_MS` | `600000` (10 min) | Overall budget for the headless wait, accumulated across turns and continuation requests. |
+| `PI_ASYNC_PRINT_POLL_MS` | `500` | How often the task list is re-read while a print run is waiting (minimum 50). |
+| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | Forced provider requests the headless backstop may spend before it reports the still-running tasks and exits non-zero. |
 
 Start long-lived services (a dev server, a watcher you keep across turns) with
 `notifyOnCompletion: false`: such a task is still running at every turn end, so with the default it
@@ -208,6 +214,32 @@ the host's `clearAllQueues()` to drop. A task that finishes after the Esc is not
 notification is delivered normally and still wakes the session. If you had already queued text when
 you pressed Esc, the host moves it back into the editor (`restoreQueuedMessagesToEditor`), so nothing
 you typed is lost.
+
+## Headless (`pi -p`) — the process waits for the work
+
+A print run is one prompt in, one answer out, then `process.exit`. Nothing in the host keeps that
+process alive while a background task still runs, so pi-async does it structurally (0.5.0):
+
+- When the run reaches the settle boundary in a **print** session with `running` tasks, the extension
+  keeps the boundary open until they all finish (polled, no TUI). It then commits one
+  `async-task-print-results` entry (name/status/exit only — never an output tail) and returns
+  `continue: true`, so the host issues one more provider request. The model gets a real turn to read
+  the result and **its answer is what `pi -p` prints** — not an empty stdout after an early exit.
+- The wait reuses the completion-notification ownership relay, so a task finishing inside it is
+  announced exactly once (the results entry) and `notified` is latched; nothing is lost or doubled.
+- It is bounded twice: `PI_ASYNC_PRINT_MAX_CONTINUATIONS` forced turns (default 5) and one overall
+  `PI_ASYNC_PRINT_WAIT_MS` budget (default 10 min). Over budget the run is allowed to end, but not
+  silently: stderr gets `pi-async: still running N async task(s) after C continuation(s) and Ts: <id>
+  (<name>), …` naming every taskId, and the process exits with code 1.
+- Only `running` tasks block the exit. A `mode: delayed` task sits in `pending` by definition (its
+  `dueAt` may be an hour away), so it is scheduled work, not in-flight work — it survives on disk for
+  the next session instead of burning the budget.
+- `agent_before_settle` in print mode has no host timeout and Esc does not reach it; the two bounds
+  above are what make that safe. `PI_ASYNC_PRINT_WAIT=0` disables the whole backstop (0.4.x behaviour).
+
+The real-process proof lives in the repository: `scripts/headless-smoke.sh wait` starts a task that
+outlives the model's turn and asserts the conclusion is what stdout carries; `cap` asserts the
+non-zero exit plus the taskId line; `off` reproduces the pre-0.5.0 early exit.
 
 ## Watches
 
@@ -238,8 +270,8 @@ In a legion child session, collect task results before returning a verdict (`asy
 
 - Crash-durability is not guaranteed: metadata is atomically replaced, but captured output is not fsynced. After a crash, orphaned running tasks are marked `failed`/`lost` on the next start, and pending delayed tasks are restored with their remaining delay by whichever session next loads the same data directory (process identity does not matter). Recovery inside the same process is complete for `/reload` (`cwd`, `taskTimeoutMs` deadline, and watch deadline are rebuilt from disk).
 - Cross-turn wake-up in legion children depends on the host delivering follow-up messages (upstream pi-legion issue [#156](https://github.com/zzjcool/pi-legion/issues/156)); the extension does not patch Pi or legion.
-- The settle hold keeps the OSC 7501 status in `working` and now renders its own live progress row
-  (spinner + elapsed + `Esc stops waiting`) because pi cleared the built-in working row at `agent_end`.
+- The settle hold keeps the OSC 7501 status in `working` and renders its live wait as the rail's first
+  row (spinner + elapsed + `Esc stops waiting`) because pi cleared the built-in working row at `agent_end`.
   Esc releases the hold through the raw terminal listener; a **programmatic** abort that produces no
   Esc keystroke (an extension calling `ctx.abort()`, `/tree` navigation → `await session.abort()`) still
   cannot preempt an awaiting `agent_before_settle` handler — pi's `AgentBeforeSettleEvent` carries no
@@ -251,7 +283,10 @@ In a legion child session, collect task results before returning a verdict (`asy
   progress (e.g. `/tree` navigation — `interactive-mode.js:4758` → `agent-session.js:1999`). Esc itself
   is a keystroke, so it reaches the hold first and releases it; `void abort()` stays non-blocking.
 - TUI rail and panel are available only in the main TUI session, not in RPC/print/child contexts.
-- `pi --print` notification delivery requires an available configured provider. If no provider is available, end-to-end print-mode verification remains pending a user run.
+- In a print run a task that never finishes ends the process with a non-zero exit code and one stderr
+  line naming the still-running taskIds (see [Headless](#headless-pi--p--the-process-waits-for-the-work)).
+  The host still kills those process groups at shutdown, exactly as before.
+- A `delayed` task is not waited for in print mode: it is pending, not in flight.
 
 ## Development checks
 
@@ -261,6 +296,7 @@ npm test
 npm run verify           # typecheck + test (same gate as prepublishOnly)
 npm run adoption         # adoption report from real session JSONL (last 15 sessions)
 npm pack --dry-run
+scripts/headless-smoke.sh wait   # real `pi -p` + scripted mock endpoint (also: cap, off)
 ```
 
 `npm run adoption` reads `~/.pi/agent/sessions/*/*.jsonl` (`--dir` / `--limit` / `--json` to change scope)
@@ -290,4 +326,6 @@ mounts, and why L3 must not be skipped.
 `pi --print` + background task completing **after** the agent settles: the wake happens but the woken
 run's `turn_end` boundary fails with `Extension error (<boundary>): turn_end could not resolve the persisted assistant entry ID` (pi 1.2.0 core, reproduced identically with pi-background-tasks —
 upstream issue https://github.com/earendil-works/pi/issues/11001). **RPC mode (legion subagents) and
-turn-internal waits are unaffected.**
+turn-internal waits are unaffected.** It is still present on pi 1.5.2 for runs woken by a `followUp`
+(visible on stderr with `PI_ASYNC_PRINT_WAIT=0`); the 0.5.0 headless backstop avoids that path because
+it owns the terminal event and continues in-run.

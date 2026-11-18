@@ -17,10 +17,16 @@
  * So the record is **live**: the mounted widget publishes the task ids it would render right now
  * (`mountRailDetail`), `dispose()` withdraws it, and the hold asks per frame. When no widget is
  * mounted, `ensureRailSurface` re-installs one — the rail heals itself instead of staying dark.
+ *
+ * §7.1 修订 8 (0.4.8) moves the hold's own row *into* the rail (first row, with the frame/elapsed the
+ * hold owns), so the record also carries a `repaint` channel and the hold publishes a `HoldSurface`
+ * instead of a widget of its own.
  */
 export interface RailDetail {
   /** Task ids the rail renders right now, in row order (the same window `render()` paints). */
   taskIds(): string[];
+  /** Ask the host to paint again — the hold's 250 ms frame is faster than the rail's own 1 Hz ticker. */
+  repaint?(): void;
 }
 
 /** How to (re)install the rail widget — held separately from the widget, which the host may drop. */
@@ -33,6 +39,53 @@ let mounted: RailDetail | undefined;
 let lastRearmAt = Number.NEGATIVE_INFINITY;
 /** At most one re-install attempt per second: a host that rejects widgets must not be hammered. */
 const REARM_INTERVAL_MS = 1_000;
+
+/**
+ * The hold's own contribution to the rail's first row (§7.1 修订 8): one animation frame plus how long
+ * *this turn* has been held. Both are formatted already — the rail is a renderer, not a clock.
+ */
+export interface HoldSurface {
+  /** One braille frame of `SPINNER_FRAMES`; it changes every 250 ms while the hold waits. */
+  frame: string;
+  /** How long this turn has been held, e.g. `2m 28s` (never a task's own elapsed). */
+  elapsed: string;
+}
+
+let hold: HoldSurface | undefined;
+
+/** Publish (or withdraw, with `undefined`) the hold's waiting row; the rail paints it as row 0. */
+export function setHoldSurface(state: HoldSurface | undefined): void {
+  hold = state;
+}
+
+/** What the hold is waiting with right now; `undefined` once the wait is over. */
+export function holdSurface(): HoldSurface | undefined {
+  return hold;
+}
+
+/**
+ * §7.1 修订 8: the **only** place the waiting row's wording is built — the rail's first row and the
+ * hold's fallback widget both call this, so the two surfaces can never drift apart, and 0.4.8's
+ * "exactly one `async_wait` on screen" invariant is decidable by counting the string.
+ *
+ * `detail` lists the waited tasks (`name (status, elapsed) · …`) and is only passed when the rail
+ * cannot carry them itself. Task rows on the rail never go through here.
+ */
+export function waitingRow(frame: string, elapsed: string, detail?: string): string {
+  const head = `${frame} async_wait · running ${elapsed}`;
+  const tail = " — Esc stops waiting";
+  const body = typeof detail === "string" && detail.length > 0 ? ` — ${detail}` : "";
+  return `${head}${body}${tail}`;
+}
+
+/** Repaint the mounted rail through its own request channel; best-effort, never fatal. */
+export function railRepaint(): void {
+  try {
+    mounted?.repaint?.();
+  } catch {
+    // A stale/disposed host must not take the hold down with it (same rule as every TUI surface).
+  }
+}
 
 /** Record how to install the rail widget. Called by `registerRail`; the widget itself mounts later. */
 export function armRailSurface(rearm: () => boolean): void {
@@ -91,9 +144,10 @@ export function ensureRailSurface(now = Date.now()): boolean {
   }
 }
 
-/** Test-only: forget both the installation recipe and the mounted widget. */
+/** Test-only: forget the installation recipe, the mounted widget and any published hold surface. */
 export function resetRailSurfaceForTests(): void {
   surface = undefined;
   mounted = undefined;
   lastRearmAt = Number.NEGATIVE_INFINITY;
+  hold = undefined;
 }

@@ -281,7 +281,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - 条件：存在 holdable 任务——`status === "running"` + `notifyOnCompletion !== false` +
   `triggerOnCompletion !== false`（`pending`/delayed 任务不 hold：预算内不可能终态）。
   仅在交互 TUI 会话 hold（`ctx.mode === "tui"` 或 ctx 缺失）；军团 child（`PI_LEGION_NODE_ID` 存在）、
-  `print`/`json`/`rpc` 都不 hold。
+  `print`/`json`/`rpc` 都不 hold。**print 会话由另一条结构性保底负责（§23 REV-30），不是 hold**：
+  它不需要唤醒型任务的过滤，也没有 TUI 表面。
 - 行为：在边界内轮询等待（`PI_ASYNC_HOLD_POLL_MS`，默认 1000ms），直到快照内的 holdable 任务全部
   终态或到达 `PI_ASYNC_HOLD_MS`（默认 600000ms，单调时钟计时）。
 - **出口（修订 4，0.4.3）**：0.4.2 的两条（全终态 / 预算耗尽）加上三条「让位于用户」的出口 ——
@@ -307,6 +308,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   取一次，与 rail 的渲染共用同一窗口/滚动状态），hold 行只写
   `setWidget("pi-async-hold", ["<frame> waiting <hold-elapsed> — Esc stops waiting"], { placement: "aboveEditor" })`
   ——`<hold-elapsed>` 是**这一轮被 hold 多久**，与任何任务的耗时都不是同一个数字，rail 上也看不到。
+  > **修订 8（0.4.8）已删除这一行**：`pi-async-hold` 这个 widget key 不复存在，`pi-async-hold` 只剩 footer 的
+  > status key；等待行改为 rail 首行（见下文修订 8），因此本节描述的“输入框上方独立一行”是 0.4.4–0.4.7 的历史。
   任务名/状态/耗时由 rail 行承担：0.4.5 把它们搬到 hold 行后，同一终端里汇总行、rail 行、hold 行
   三行在说同一件事（用户截图报的冗余）。
   **其他一切情况**——宿主没有 `setWidget`、widget 已被宿主清掉、rail 的窗口没覆盖这些任务——都退回
@@ -330,6 +333,29 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   均为英文，中英混排会割裂。两点都是有意为之，不是待办。
   不借用 `setWorkingVisible`/`setWorkingMessage`：`workingVisible` 是会话级持久状态，hold 结束后没有
   任何事件会把它收回，会留下永久 spinner。
+  **修订 8（0.4.8）：等待行并进 rail，输入框上方不再单独一行。** 修订 6/7 把明细收进 rail 之后，
+  `⠙ waiting 2m 28s — Esc stops waiting` 与 rail 首行仍是两块界面在说同一件事，用户裁决
+  「外观版的话我觉得可以，这样输入框上方的 `⠙ waiting 2m 28s — Esc stops waiting` 这个我觉得就可以不要了」。
+  因此 hold 期间 **rail 首行就是等待行**：`⠙ async_wait · running <hold-elapsed> — Esc stops waiting`
+  （braille 首字符保留、250ms 换帧；文案英文；唯一来源是 `src/tui/surfaces.ts` 的
+  `waitingRow(frame, elapsed, detail?)`，rail 首行与 hold 兜底行都调它，别处不许再拼一遍 `async_wait`）。
+  它 **顶掉**首行汇总行而不是新增一行：`RAIL_MAX_LINES=4` 冻结，用户示意正是「等待行 + 3 行任务」，
+  所以 `RAIL_TASK_SLOTS` 仍是 3 —— 调小会让第三个任务失去名字行 ⇒ `railShowsTasks` 变假 ⇒ 兜底行回来，
+  同一件事又说两遍。hold 每帧 `setHoldSurface({frame, elapsed})` + `railRepaint()` 驱动 250ms 重绘
+  （rail 自己的 ticker 是 1Hz，不够用）；`clearWaiting` 在 `holdUntilSettled` 的 `finally` 里撤销声明，
+  因此结束后首行自动回到汇总行（覆盖全终态 / 超时 / Esc / 用户入队 / dispose / registry 抛错全部出口）。
+  兜底键改为 `pi-async-hold-fallback`，**只在 rail 画不出来时存在**（宿主没有 `setWidget`、widget 被清且
+  装不回来、rail 窗口没覆盖这些任务），内容
+  `⠙ async_wait · running <elapsed> — <name> (status, elapsed) · … — Esc stops waiting`；
+  §8 不变式（每个等待中的任务名必须在屏幕上出现一次）因此保住：rail 正常画 ⇒ 名字只在 `▶` 行；
+  否则先 `setHoldSurface(undefined)`，再 `ensureRailSurface()` 自愈并**立即复检**，仍不行才由 hold 自己带名。
+  两面互斥：任何时刻全屏最多一处 `async_wait` 文本（测试用 `split("async_wait").length - 1 === 1` 断言）。
+  宿主**完全没有** `setWidget` 时 footer 追加任务名
+  （`waiting for N task(s) <elapsed> — name (status, elapsed) · …`），这是 §8 的最后落点；有 `setWidget` 时
+  footer 保持原样（不重复任务名）。
+  **宿主 working 行仍不可借用（复核，0.4.8）**：`interactive-mode.js` 的 `setWorkingVisible()` 中
+  `if (this.session.isStreaming && …) this.showWorkingStatusIndicator();` —— hold 期间 `agent_end` 已过、
+  没有流式输出，借用无效，修订 4 的裁决继续保留。
 - 返回：全部终态 → 追加一条 `custom_message`（`customType: "async-task-settle-results"`、`display: false`、
   不含 outputTail、指路 `async_logs`）并 **`continue: true`**；其余出口 → 原样 `undefined`（不带 entries/continue）。
   `continue` 不会成环：再次进入边界时快照内任务已终态。
@@ -346,7 +372,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - 仍然：不 consume 输出、不改任务状态、不内联 outputTail；`notified` 仅在「results entry 已播报」
   这一种情况下由 hold 置位（修订 3 取代 0.4.2 的「不动 `notified`／不抑制通知」）。
 - footer：`waiting for N task(s) <elapsed>`（key `pi-async-hold`），15s 刷新，结束后清除；全部 best-effort
-  （0.4.3 起它只是辅助信号，主信号是上面的 250ms widget —— 实测 16s hold 只触发 3 次 footer 写）。
+  （0.4.3 起它只是辅助信号，主信号是上面的 250ms 等待行 —— 修订 8 起那行在 rail 首行；实测 16s hold 只触发
+  3 次 footer 写）。宿主**完全没有** `setWidget` 时 footer 追加任务名（修订 8，§8 的最后落点）。
 - 开关：`PI_ASYNC_HOLD=0` 不注册任何 handler；`PI_ASYNC_HOLD_MS <= 0` 同样关闭。
 
 ### 7.2 终态播报唯一性（0.4.3，D-15）
@@ -407,6 +434,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   鼠标事件仅在 fullscreen / alt-screen（开启鼠标上报）时可用；regular 模式用 `/async` + 键盘。
   `renderRailRows(snapshots, width, now?)` 为纯函数，内部最多渲染 3 个任务行；没有可见任务时
   整个 widget 返回 `[]`，不显示汇总行。
+  **hold 期间首行不是汇总行（修订 8，0.4.8）**：hold 在等时首行换成等待行
+  `⠙ async_wait · running <hold-elapsed> — Esc stops waiting`（顶掉汇总行，不是新增一行），
+  `▶ name · state · elapsed` 任务行、任务槽位数与总行数上限（4）都不变；hold 结束后首行自动回到汇总行。
 - **汇总行**：由 `summarySegments`/`formatSummary` 生成，段序为 `▶ N running · N pending · <elapsed> · ✓N · ✗N`；
   `pending` 仅在数量大于 0 时显示；`✓N` 与 `✗N` 对称，均仅在各自数量大于 0 时显示
   （全失败场景不再出现绿色的 `✓0`）；无 running 时 elapsed 为 `—`。
@@ -545,6 +575,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_HOLD` | 开启（未设） | `0` → settle hold 关闭，一个 handler 都不注册（D-14） |
 | `PI_ASYNC_HOLD_MS` | `600_000`（10 分钟） | 单次 hold 上限（单调时钟计时）；**≤ 0 关闭**（负数不会回退到默认值） |
 | `PI_ASYNC_HOLD_POLL_MS` | `1_000` | hold 期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
+| `PI_ASYNC_PRINT_WAIT` | 开启（未设） | `0` → headless（`pi -p`）保底关闭，一个 handler 都不注册，回到 0.4.x「进程可以带着未完成任务退出」（REV-30） |
+| `PI_ASYNC_PRINT_WAIT_MS` | `600_000`（10 分钟） | print 会话等待的整体预算（单调时钟，跨回合累计，不重置）；用尽 → 打印仍在跑的任务并 `exitCode=1` |
+| `PI_ASYNC_PRINT_POLL_MS` | `500` | print 会话等待期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
+| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | print 保底允许消耗的强制续跑次数（整个进程累计，宿主不提供上限，见 REV-30） |
 | `PI_ASYNC_FOOTER` | 关闭（未设） | `1` 且宿主 `ui.setStatus` 存在时额外渲染一行 footer 汇总；rail 首行仍是默认状态面 |
 | `PI_ASYNC_RETENTION_MS` | `604_800_000`（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
@@ -608,8 +642,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 
 1. `npm run verify` 全绿（= `npm run typecheck` && `npm test`），且 `npm pack --dry-run` 包含
    `extensions/`、`src/`、`README.md`、`LICENSE`、`docs/CONTRACT.md`、`CHANGELOG.md`
-2. background 任务：启动→立即 receipt→完成通知唤醒（print/RPC 模式实测：`pi --print` 会话收到
-   `<async-task-notification>` 并继续 turn）
+2. background 任务：启动→立即 receipt→完成通知唤醒（RPC 模式实测；**print 模式改为 §23 REV-30 的
+   结构性保底**：`scripts/headless-smoke.sh wait` 断言任务完成后模型被再次唤醒且其结论进入 stdout）
 3. ~~sync：短命令阻塞返回 exitCode；长命令 timeoutMs 到点 promote 转 background~~ **REV-29 删除**：
    验收改为「`mode=sync` 被 execute 白名单拒绝（`Unsupported async_run mode: sync`），schema 不再含
    `timeoutMs`/`onTimeout`」（`tests/k-toolsurface.test.ts`、`tests/w2-safety.test.ts`）
@@ -1218,3 +1252,71 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - 删除 `tests/b-sync-mode.test.ts`（delayed 断言迁入 `tests/b-delayed.test.ts`）；`tests/w2-safety.test.ts`
   的 `syncResult` UTF-8 用例删除（#17 仍由同文件 `truncateUtf8Bytes` 用例覆盖）；`tests/f-reminder.test.ts`
   的工具面断言改为默认 5 个 + §17 的 5+1 口径。
+
+## 23. 0.5.0 headless 保底：`pi -p` 不得带着未完成任务退出（REV-30，冻结）
+
+### 23.1 事故面
+
+`pi -p` 是「一个 prompt 进、一条 assistant 回答出、进程退出」。宿主没有任何东西把一个运行中的后台任务
+和进程寿命绑在一起（`print-mode.js` 的完成判据是 `session.prompt()` resolve）。0.4.x 的实测：任务需要
+3s，进程 **565 ms** 就退出，`session_shutdown` 把任务杀掉，stdout 为空、退出码 0 —— 一次没有任何信号的
+静默失败。凭模型自觉调用 `async_wait` 不能解决：默认工具面里已经没有它（REV-29），而且「进程什么时候
+退出」本来就不是模型的决定。
+
+### 23.2 裁决（结构性，不依赖模型动作）
+
+- **只在 `ctx.mode === "print"` 生效**（`src/guard/print-wait.ts`）。`tui`/`rpc`/`json`/缺失 ctx 一律
+  立即返回：print 是这个模块唯一服务的模式，缺失 ctx 不得被当成 print（否则每个模式都会白等十分钟）。
+- **等待位置**：`agent_before_settle`。宿主对该 handler 的 `await` 没有超时（`runner.js:779`），
+  所以这是 headless 进程唯一合法的「花墙钟时间」的地方。
+- **等待对象**：`status === "running"` 的任务。`pending`（delayed）不算：`dueAt` 可能在一小时外，
+  把它算进来只会每次打印运行都烧掉整个预算；它的快照留在磁盘上给下一个会话。
+  **不**按 `notifyOnCompletion` 过滤——print 模式没有别的播报通道，静默任务同样不能带着输出一起走。
+- **正常出口**：全部终态 → 提交一条 `custom_message`（`customType: "async-task-print-results"`，
+  `display: false`，内容只含 name/status/exitCode + `Read the output with async_logs before answering.`，
+  最多 8 行 + `+N more`，**绝不内联 outputTail**）并返回 `continue: true`。
+  host 因此再发一次 provider 请求（`agent-session.js:1521-1525`，不受模式限制），
+  模型的回答成为最后一条 assistant 消息，也就是 `print-mode.js:117-138` 打印的东西。
+- **终态归属**：复用 0.4.3 的 `HoldNotificationRelay`（`open`/`claim`/`commit`/`release`，与 hold 同一个
+  实例），全终态时 `commit` 掉的 id 逐个 `markNotified`。等待期间落地的完成通知不会变成一条没人读的
+  followUp，也不会在下一个 `session_start` 被 `resendUnnotified` 重播。
+- **两道界**（缺一不可，宿主不提供上限：`PI/docs/extensions.md:748` 明确 `continue: true` 可成环）：
+  1. **续跑上限** `PI_ASYNC_PRINT_MAX_CONTINUATIONS`（默认 5，整个进程累计，`agent_start` **不**重置）；
+  2. **整体预算** `PI_ASYNC_PRINT_WAIT_MS`（默认 600000ms，单调时钟 `performance.now()`，从第一次真正
+     等待开始累计，跨回合不重置）。
+- **限流出口**：cap 或预算用尽 → `notify.release()`（扣住的通知原样交还）→ **stderr** 一行
+  `pi-async: still running N async task(s) after C continuation(s) and Ts: <taskId> (<name>), …`
+  （**必须含每个 taskId**）→ `process.exitCode = 1` → 返回 `undefined`（允许 settle）。
+  扩展里设的 `process.exitCode` 有效：`main.js:877` 只在 `runPrintMode()` 返回非零时覆盖。
+- **失败面**：registry 抛错 / dispose → 释放通知、返回 `undefined`、**不改退出码**（teardown 或坏 registry
+  不是任务失败）。任何路径都不 throw、不 `process.exit()`。
+- **开关**：`PI_ASYNC_PRINT_WAIT=0` → 一个 handler 都不注册（0.4.x 行为），用于对照实验与紧急回退。
+- **不做的事**：不改 `hold.ts`（0.4.8 的 hold 仍只在 TUI 生效）、不渲染任何 TUI、不消费输出、
+  不写 `consumedAt`；它与 hold 按 `ctx.mode` 完全互斥。
+
+### 23.3 宿主事实（实测，pi 1.5.2）
+
+| 事实 | 证据 |
+|---|---|
+| print 模式 `ctx.mode === "print"`，`hasUI === false` | `print-mode.js:55-60` → `agent-session.js:2756-2762` → `runner.js:630-633` |
+| `agent_before_settle` handler 无超时、按注册顺序串行 await | `runner.js:767-814` |
+| `{entries, continue:true}` 在 print 模式真会再发一次 provider 请求 | `agent-session.js:1521-1525`；`scripts/headless-smoke.sh wait` 实测 3 次请求 |
+| `custom_message` draft 让 `canContinue` 为真 | `agent-session.js:670-689` |
+| print 只打印**最后一条** assistant 消息的 text | `print-mode.js:117-138` |
+| `process.exitCode = 1` 在扩展里设置有效 | `main.js:877` |
+| print 模式的 `console.log`/`process.stdout.write` 落 stderr | `output-guard.js:38-59`（所以限流提示用 `console.error`） |
+| 扩展无法拦截未注册工具名 | `agent-loop.js:479-492`（`Tool <name> not found`，不触发任何钩子） |
+
+### 23.4 验收清单（REV-30）
+
+- `tests/j-print-wait.test.ts`（新增）：任务完成前 handler 不 resolve（≥100ms，结果 `continue: true` +
+  `async-task-print-results`）；relay 扣住的通知不被发送且 `markNotified` 落盘；cap 用尽 → `undefined`
+  + stderr 含 taskId + `process.exitCode === 1`；整体预算用尽 → 同上且 `release` 被调用；
+  `tui`/`rpc`/缺失 ctx 立即返回且不读 registry；`PI_ASYNC_PRINT_WAIT=0` → 0 个 handler；
+  entries 不含 outputTail；预算跨回合累计；hook 恰好 3 个且 dispose 幂等。
+- `scripts/headless-smoke.sh`（真实 `pi -p` + `test/docker/tools/mock-llm.py` 脚本化 endpoint）：
+  - `wait`：任务 3s、进程 wall ≥ 3s、请求 ≥ 3、**stdout 含 `CONCLUSION-AFTER-TASK`**、退出码 0；
+  - `cap`：第一个任务完成花掉 1 次续跑，第二个永不完成 → 退出码非 0、stderr 含
+    `after 1 continuation(s)` 与仍在跑的 taskId；
+  - `off`：`PI_ASYNC_PRINT_WAIT=0` 复现 0.4.x（wall < 任务时长、stdout 无结论）= 变异证据。
+- 全量 `npm test` 与 `npm run typecheck` 全绿。

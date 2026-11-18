@@ -3,7 +3,7 @@ import test, { afterEach } from "node:test";
 import { RAIL_WIDGET_KEY, createRailFactory, registerRail } from "../src/tui/rail.ts";
 import { bindTuiHost, resetTuiHostForTests, tuiHost } from "../src/tui/host.ts";
 import { ensureRailSurface, mountRailDetail, railMounted, railShowsTasks, resetRailSurfaceForTests } from "../src/tui/surfaces.ts";
-import { registerHold } from "../src/guard/hold.ts";
+import { registerHold, HOLD_FALLBACK_WIDGET_KEY } from "../src/guard/hold.ts";
 import { makeSnapshot } from "./helpers/index.ts";
 import type { TaskSnapshot } from "../src/core/task.ts";
 
@@ -203,7 +203,7 @@ test("a rail the host clears mid-turn comes back while the hold is waiting", asy
     ui: {
       setStatus: () => undefined,
       setWidget: (key: string, content: string[] | undefined) => {
-        if (key === "pi-async-hold") holdRows.push(content);
+        if (key === HOLD_FALLBACK_WIDGET_KEY) holdRows.push(content);
         host.ui.setWidget(key, content);
       },
       onTerminalInput: () => () => {},
@@ -220,9 +220,14 @@ test("a rail the host clears mid-turn comes back while the hold is waiting", asy
 
     assert.ok(host.installs() > installsBefore, "the hold asking for the detail re-installs the rail");
     assert.ok(host.render(RAIL_WIDGET_KEY).some((row) => row.includes(task.name)), "the list is back above the editor");
-    // And no silent frame: the very first row written after the clear already names the task.
-    const afterClear = holdRows.filter((row) => row !== undefined).at(-1);
-    assert.ok(String(afterClear?.[0]).includes("waiting"), `the hold row is still painting (got: ${afterClear})`);
+    // And no silent frame: the re-installed rail's own first row is the hold's waiting row (§7.1 修订 8),
+    // so the hold never has to paint a line of its own here.
+    assert.equal(holdRows.filter((row) => row !== undefined).length, 0, "the rail owns the waiting row");
+    assert.match(
+      String(host.render(RAIL_WIDGET_KEY)[0] ?? ""),
+      /async_wait · running \d+s — Esc stops waiting$/,
+      "the first row of the healed rail says what is being waited for, and for how long",
+    );
   } finally {
     stop = true;
     await pending;
@@ -251,7 +256,7 @@ test("hold + rail are one source: the rail lists exactly the tasks the hold wait
     ui: {
       setStatus: () => undefined,
       setWidget: (key: string, content: string[] | undefined) => {
-        if (key === "pi-async-hold") writes.push(content);
+        if (key === HOLD_FALLBACK_WIDGET_KEY) writes.push(content);
         host.ui.setWidget(key, content);
       },
       onTerminalInput: () => () => {},
@@ -264,10 +269,13 @@ test("hold + rail are one source: the rail lists exactly the tasks the hold wait
   // hold reads (`railShowsTasks`) agrees with what the rail paints.
   assert.equal(railShowsTasks([task.taskId]), true, `the rail covers the waited task (got ${JSON.stringify(railRows())})`);
   assert.equal(railRows().filter((row) => row.includes(task.name)).length, 1, `exactly one rail row for the waited task (got ${JSON.stringify(railRows())})`);
-  assert.equal(railRows().length, 2, "one summary row plus the task row");
-  const holdRow = String(writes.at(-1)?.[0] ?? "");
-  assert.ok(!holdRow.includes(task.name), `the rail owns the detail, so the hold does not repeat it (got: ${holdRow})`);
-  assert.match(holdRow, /waiting \d+s — Esc stops waiting$/);
+  // §7.1 修订 8: the waiting row **displaces** the summary row instead of adding a third line.
+  const rows = host.render(RAIL_WIDGET_KEY);
+  assert.equal(railRows().length, 1, `only the task row starts with ▶ (got ${JSON.stringify(rows)})`);
+  assert.match(String(rows[0]), /async_wait · running \d+s — Esc stops waiting$/, `row 0 is the hold's waiting row (got: ${rows[0]})`);
+  assert.equal(writes.filter((row) => row !== undefined).length, 0, "the rail owns the row, so the hold paints nothing of its own");
+  assert.equal(rows.length, 2, "one waiting row plus the task row — still inside the four-line cap");
+  assert.ok(rows.length <= 4, "the rail never grows past RAIL_MAX_LINES");
 
   stop = true;
   await pending;

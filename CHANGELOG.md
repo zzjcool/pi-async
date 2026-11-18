@@ -2,9 +2,12 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
-## 0.5.0 — 未发布（工具面收窄：删 sync / async_wait 默认不注册 / 文案）
+## 0.5.0 — 未发布（agent 不再需要知道「等待」这件事）
 
-三条一起改的是模型的默认路径：能阻塞的东西没了，会唤醒的那条路少了一个岔口。
+四条一起改的是同一个问题：等任务是运行时的事，不是模型的事。能阻塞的模式删了，会唤醒的那条路少了一个
+岔口，模型不再被劝去调一个默认不存在的工具，headless 进程也不会再带着未完成的任务退出。
+
+基于 0.4.8（`feat/hold-in-rail`，已合入 main）的代码线；本条目只描述相对 0.4.8 的差异。
 
 ### Removed（D3）
 
@@ -39,6 +42,72 @@
   三态（全唤醒 / 混合 / 全不唤醒）的 per-task 事实不变量不变。
 - `skills/async-tasks/SKILL.md` 删掉 sync 章节，`async_wait` 描述为「默认不存在，宿主设
   `PI_ASYNC_EXPOSE_WAIT=1` 才暴露；默认做法是结束回合等完成通知」。
+
+### Added（D5）
+
+- **headless（`pi -p`）结构性保底**：print 会话在 `agent_before_settle` 边界等到所有 `running` 任务终态，
+  提交一条 `async-task-print-results`（只含 name/status/exit，不含 output tail）并返回 `continue: true`，
+  宿主因此再发一次 provider 请求——**模型的结论成为最终输出**，而不是 0.4.x 的「565 ms 退出 + 空 stdout + 任务被杀」。
+  等待复用完成通知归属中继：等待期间落地的通知由 results entry 独占播报并落 `notified`。
+- 两道界：`PI_ASYNC_PRINT_MAX_CONTINUATIONS`（默认 5）与 `PI_ASYNC_PRINT_WAIT_MS`（默认 10 分钟）。
+  超限 **stderr** 打印 `still running N async task(s) after C continuation(s) and Ts: <taskId> …` 并以
+  `exitCode = 1` 退出（不静默）；`PI_ASYNC_PRINT_WAIT=0` 关闭整条保底（0.4.x 行为，用于对照/紧急回退）。
+- 只等 `running`；`delayed`/`pending` 是「已排期的工作」，不阻塞退出（否则每次打印运行都会烧掉整个预算）。
+- `scripts/headless-smoke.sh`（真 `pi -p` + 脚本化 mock endpoint）：`wait` / `cap` / `off` 三态可复跑。
+
+## 0.4.8 — 2026-11-18（等待行并进 rail：输入框上方不再有独立一行）
+
+hold 期间输入框上方原来会多出一行——与 rail 首行说同一件事。用户裁决：
+「外观版的话我觉得可以，这样输入框上方的 `⠙ waiting 2m 28s — Esc stops waiting` 这个我觉得就可以不要了」。
+0.4.8 把它并进 rail，rail 就是唯一那块：
+
+```
+⠙ async_wait · running 2m 28s — Esc stops waiting
+▶ watch-t71 · running · 4m 6s
+▶ watch-t6z2 · running · 4m 6s
+▶ watch-t73 · running · 4m 6s
+```
+
+### Changed
+
+- **hold 期间 rail 首行就是等待行（CONTRACT §7.1 修订 8）**：`⠙ async_wait · running <hold-elapsed> —
+  Esc stops waiting`。braille 首字符仍在 250ms 换帧（`agent_end` 已清掉宿主 working 行，换帧是这一行唯一
+  的「还活着」信号），文案仍为英文，唯一文案来源是 `src/tui/surfaces.ts` 的 `waitingRow()`。
+  它 **顶掉**首行汇总行，而不是新增一行：4 行上限不变，所以仍是「等待行 + 3 行任务」；`RAIL_TASK_SLOTS`
+  刻意保持 3——调小会让第三个任务失去 `▶` 名字行，`railShowsTasks` 变假，兜底行回来，同一件事说两遍。
+  hold 结束后首行自动回到汇总行（`clearWaiting` 在 `finally` 里，覆盖全终态/超时/Esc/入队/dispose/异常）。
+- **删除输入框上方那一行**：`WIDGET_KEY = "pi-async-hold"` 常量与 `setProgress`/`clearProgress` 里无条件写
+  widget 的分支全部删掉（`pi-async-hold` 现在只是 footer 的 status key）。0.4.7 已经把判定改成
+  「看画面而不是看注册」，但那一行本身仍然冗余；顺手把这一行在 0.4.4–0.4.7 的演化收尾：
+  0.4.4 起是 `⠋ waiting for N async task(s) <elapsed> — Esc stops waiting`（只有数量）；0.4.5 改成带名
+  `⠋ 1 async task 7m 13s — watch-t4q-yamlfix (running, 7m 19s) — Esc stops waiting`；
+  0.4.6 只留 `⠋ waiting 7m 13s — Esc stops waiting`（明细交给 rail）；0.4.7 把「rail 在不在」从注册标志改成
+  「此刻画不画这些任务」并让 rail 自愈；0.4.8 直接把这一行并进 rail 首行。
+- **兜底行只在 rail 画不出来时存在**（新键 `HOLD_FALLBACK_WIDGET_KEY = "pi-async-hold-fallback"`，不写进用户文档）：
+  宿主没有 `setWidget`、widget 被清且装不回来、rail 窗口没覆盖这些任务 ⇒ `setHoldSurface(undefined)` →
+  `ensureRailSurface()` 自愈并立即复检 → 仍不行才自己带名
+  `⠙ async_wait · running <elapsed> — <name> (status, elapsed) · … — Esc stops waiting`。
+  两面互斥，全屏任何时刻最多一处 `async_wait`（§8 不变式：每个等待中的任务名必须在屏幕上出现一次）。
+- **宿主完全没有 `setWidget` 时 footer 带名**（§8 的最后落点）：
+  `waiting for N task(s) <elapsed> — name (status, elapsed) · …`；有 `setWidget` 时 footer 保持原样。
+- 任务行 `▶ name · state · elapsed` 的格式、排序、hover/点击、wheel 滚动、溢出指示、`RAIL_MAX_LINES=4`
+  全部不变；无任务时 rail 仍返回 `[]`。`railShowsTasks`/`ensureRailSurface` 语义不退回 0.4.6 的「注册即信任」。
+- 复核后仍不借用宿主 working 行：`interactive-mode.js` 的 `setWorkingVisible()` 里是
+  `if (this.session.isStreaming && …) this.showWorkingStatusIndicator();`，hold 期间没有流式输出。
+
+### Tests
+
+- 新增 `tests/i-hold-in-rail.test.ts`（真实 `createRailFactory` + 自制宿主）：hold 期间 rail 首行是等待行且
+  三行任务名都在（4 行上限、帧在换、elapsed 在走）；等待行顶掉汇总行；全屏 `async_wait` 只出现一次
+  （含 rail 被清掉又装不回来的兜底帧）；无 widget 宿主时 footer 带名；hold 结束/Esc 后首行恢复汇总行。
+- `tests/h-hold.test.ts`：progress 相关用例按新语义重写（无 rail 时兜底行带名、rail 覆盖时自己一行都不画、
+  rail 不覆盖/被 dispose 立刻带名、三种出口首行消失、窄终端与无名任务）。
+  `tests/i-settle-owner.test.ts`、`tests/e-rail-liveness.test.ts` 改用新键并按 rail 首行断言。
+- 变异验证（改回去即红）：hold 无视 rail 照常画自己的行 → 9 红；等待行与汇总行并列而不是顶掉 → 7 红；
+  `RAIL_TASK_SLOTS` 调成 2 → 4 红；`finally` 里不调 `clearWaiting` → 7 红；footer 不带名 → 2 红。
+- 真实 hold 实测（`docs/reports/hold-in-rail.md`）：同一个脚本对 0.4.7 树与当前树各跑一次真实
+  `init()` + `async_run`（`sleep 3`）+ `agent_before_settle`，0.4.7 屏上 3 行（rail 2 行 + 独立等待行），
+  0.4.8 屏上 2 行（rail 首行即等待行），结束后两面都回到汇总行。
 
 ## 0.4.7 — 2026-11-17（rail 自愈：注册 ≠ 可见）
 
