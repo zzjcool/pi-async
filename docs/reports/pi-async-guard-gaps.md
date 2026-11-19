@@ -1,7 +1,7 @@
 # 守卫缺口收口（#105 的 3 处实现/文档不一致 + 1 处守卫盲区）— 交付报告
 
 - Issue：zzjcool/pi-async#107（**Fixes #107**；条目原样来自 PR #105 报告 `docs/reports/contract-cleanup.md` §2）
-- PR：zzjcool/pi-async#<pending>（创建后回填）
+- PR：zzjcool/pi-async#108
 - 分支：`fix/guard-gaps`（worktree 分支 `pi-subagent/pi-async-inconsistencies-6ab404ba`，同一 commit）
 - 基线：`origin/main` @ `d0407d1`（`git fetch` 确认相对开工点 `985a083` 前进：#105 / #104 / #101 / #102 已合入；worktree `reset --hard` 到该 commit 后开工）
 - 范围：**只做任务卡四件事**。未改工具 schema、spawn/TUI 行为、版本号；`src/` 的行为改动只有 activity 上报路径（下一节）。
