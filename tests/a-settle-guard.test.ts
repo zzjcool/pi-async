@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
 import { makeSnapshot } from "./helpers/index.ts";
@@ -63,7 +64,7 @@ test("settle guard clears activity when no tasks remain", () => {
   });
 });
 
-test("settle guard activity message singularizes for one task", () => {
+test("settle guard reports through the bus wording: one implementation, one literal", () => {
   asLegionChild(() => {
     const handlers = new Map<string, Handler>();
     const calls: unknown[][] = [];
@@ -75,10 +76,58 @@ test("settle guard activity message singularizes for one task", () => {
       hasActiveWork: () => tasks.length > 0,
     };
     new SettleGuard(pi as never, registry as never).register();
-    assert.deepEqual(calls.at(-1)?.[1], { message: "1 async task" });
+    // §7 / #105: the aggregate message is bus's literal — the private singular copy is gone.
+    assert.deepEqual(calls, [["pi-async", { message: "1 async tasks" }]], "one report at register, bus wording");
     tasks = [makeSnapshot({ taskId: "A" }), makeSnapshot({ taskId: "B" })];
     handlers.get("agent_before_settle")!({ entries: [] });
-    assert.deepEqual(calls.at(-1)?.[1], { message: "2 async tasks" });
+    assert.equal(calls.length, 2, "the settle boundary reports exactly once");
+    assert.deepEqual(calls.at(-1), ["pi-async", { message: "2 async tasks" }]);
+  });
+});
+
+test("settle-guard keeps no private activity copy; the bus shim is the only writer (§7 / #105)", () => {
+  const source = readFileSync(new URL("../src/guard/settle-guard.ts", import.meta.url), "utf8");
+  assert.match(source, /import \{ reportActivity \} from "\.\.\/core\/bus\.ts"/, "the guard must import the shared shim");
+  assert.doesNotMatch(source, /\.setActivity\s*\(/, "a direct host activity call would be a second implementation");
+});
+
+test("a throwing setActivity cannot change the settle decision; the stale generation detaches after answering", () => {
+  asLegionChild(() => {
+    const handlers = new Map<string, Handler>();
+    const unsubscribed: string[] = [];
+    let live = true;
+    const pi = {
+      on: (event: string, cb: Handler) => {
+        handlers.set(event, cb);
+        return () => { handlers.delete(event); unsubscribed.push(event); };
+      },
+      ui: {
+        setActivity: () => {
+          if (!live) throw new Error("This extension ctx is stale after session replacement or reload.");
+        },
+      },
+    };
+    const registry = {
+      list: () => [makeSnapshot({ taskId: "A" })],
+      activeCount: () => ({ running: 1, pending: 0 }),
+      hasActiveWork: () => true,
+    };
+    const guard = new SettleGuard(pi as never, registry as never);
+    assert.doesNotThrow(() => guard.register());
+    assert.equal(unsubscribed.length, 0, "a live host leaves the generation attached");
+
+    live = false;
+    let result: BeforeSettleResult | undefined;
+    assert.doesNotThrow(() => {
+      result = handlers.get("agent_before_settle")!({ entries: [] }) as BeforeSettleResult | undefined;
+    }, "the host rejection is swallowed by the shared shim");
+    assert.equal(result?.continue, true, "the reminder still fires: activity is not part of the decision");
+    assert.equal(result?.entries?.at(-1)?.customType, "async-task-settle-reminder");
+    assert.deepEqual(
+      [...unsubscribed].sort(),
+      ["agent_before_settle", "agent_settled", "agent_start", "session_shutdown"],
+      "the dead generation detaches after answering, as the 0.3.2 stale-ctx fix requires",
+    );
   });
 });
 

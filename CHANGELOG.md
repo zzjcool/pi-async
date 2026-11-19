@@ -707,7 +707,9 @@ session cwd 执行、通知诚实标注 best-effort、工具契约对未知输�
 - **`output_matches` 的正则现在以 `m` 编译**（REV-10）。`^` / `$` 从「整段锚点」变成
   「行锚点」，多行输出下匹配结果可能变化。
 - **per-task activity id 形状变更**：`pi-async/<taskId>` → `plugin/pi-async/<taskId>`
-  （REV-8）。OSC 7501 / legion viz 侧可见。
+  （REV-8）。这是 **id 形状约束，不是可见性承诺**：写入唯一走宿主的 `ui.setActivity`
+  （feature-detect；官方 pi 1.2–1.5 无该 API 时是 no-op），本仓库不自行发 OSC 转义，
+  legion 侧要等上游 #156 的转发通道。
 - **`async_logs` 输出文本清洗范围扩大**：从 `stripAnsi` 改为同时剥离裸 C0 控制字符，
   并用 `truncateUtf8Bytes` 替代按字节 `subarray` 截断 —— 含 BEL/BS/FF 或多字节字符时
   返回文本与 0.1.0 不同。

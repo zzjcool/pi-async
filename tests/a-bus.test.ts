@@ -5,8 +5,8 @@ import { clearTaskActivity, raiseTaskActivity, reportActivity, taskActivityId } 
 test("reportActivity raises and clears activity when host supports setActivity", () => {
   const calls: unknown[][] = [];
   const pi = { ui: { setActivity: (...args: unknown[]) => calls.push(args) } };
-  reportActivity(pi as never, { running: 2, pending: 1 });
-  reportActivity(pi as never, { running: 0, pending: 0 });
+  assert.equal(reportActivity(pi as never, { running: 2, pending: 1 }), true);
+  assert.equal(reportActivity(pi as never, { running: 0, pending: 0 }), true);
   assert.deepEqual(calls, [["pi-async", { message: "3 async tasks" }], ["pi-async", undefined]]);
 });
 
@@ -23,5 +23,18 @@ test("task activity uses plugin/pi-async/<task-id> (legion #156 / CONTRACT §7)"
 });
 
 test("reportActivity silently degrades without optional UI api and does not emit OSC", () => {
-  assert.doesNotThrow(() => reportActivity({} as never, { running: 0, pending: 0 }));
+  assert.equal(reportActivity({} as never, { running: 0, pending: 0 }), true, "no API is not a failure");
+});
+
+test("reportActivity swallows a stale-ctx rejection and reports it instead of throwing", () => {
+  const pi = {
+    ui: {
+      setActivity: () => {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      },
+    },
+  };
+  let result: boolean | undefined;
+  assert.doesNotThrow(() => { result = reportActivity(pi as never, { running: 1, pending: 0 }); });
+  assert.equal(result, false, "the caller learns the host rejected the write");
 });

@@ -342,8 +342,8 @@ test("async_status defaults to active tasks only (#22)", async () => {
   }
 });
 
-// --- #16 grammar ---
-test("settle-guard activity message singularizes for one task (#16)", async () => {
+// --- #16 grammar / #105 one implementation ---
+test("settle-guard activity message uses the shared bus wording for one task (#16 / #105)", async () => {
   const { SettleGuard } = await import("../src/guard/settle-guard.ts");
   const calls: Array<{ id: string; v: unknown }> = [];
   const fakePi = { on: () => {}, off: () => {}, ui: { setActivity: (id: string, v: unknown) => calls.push({ id, v }) } };
@@ -356,12 +356,11 @@ test("settle-guard activity message singularizes for one task (#16)", async () =
   const guard = new SettleGuard(fakePi as never, fakeReg as never);
   guard.register();
   tasks = [{ taskId: "A", status: "running" }];
-  // reportActivity is private; trigger via register's initial call then re-call through activeCount change —
-  // SettleGuard.reportActivity is private. Use setActivity by constructing and calling register which calls reportActivity.
+  // The guard reports through the bus shim (§7 / #105); every repaint must repeat bus's literal.
   // Force another report by re-registering after mutating tasks.
   guard.register();
   const last = calls.at(-1);
-  assert.deepEqual(last?.v, { message: "1 async task" });
+  assert.deepEqual(last?.v, { message: "1 async tasks" });
   tasks = [{ taskId: "A", status: "running" }, { taskId: "B", status: "running" }];
   guard.register();
   assert.deepEqual(calls.at(-1)?.v, { message: "2 async tasks" });
