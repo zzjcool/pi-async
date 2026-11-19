@@ -1,6 +1,7 @@
 # #100 契约/文档收口 — 交付报告
 
 - Issue：zzjcool/pi-async#100（**Fixes #100**）
+- PR：zzjcool/pi-async#105
 - 分支：`fix/contract-cleanup-100`（worktree `pi-subagent/host-workspace/pi-async-100d-db3c3a44`，同一 commit）
 - 基线：`origin/main` @ `2344449`（`git fetch` 成功确认前进；本地分支 fast-forward 到该 commit 后开工）
 - 性质：纯文档/注释/契约文本，零行为变更；未改任何工具 schema、spawn/TUI 行为
