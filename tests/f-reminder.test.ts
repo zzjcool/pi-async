@@ -401,15 +401,100 @@ test("§18.11 tool surface: five default tools, each with a snippet; async_run e
   assert.equal(extendFields.taskTimeoutMs?.minimum, 0);
 });
 
-test("§18.11 docs: CONTRACT §17 states the 5 + 1 tool surface (D4 / REV-29)", () => {
+/**
+ * Tool-surface drift sweep over CONTRACT §17 + §18 (including §18.11) — #105 found the old gate
+ * sliced only §17, so the §18.11 seat claim could drift without any test noticing.
+ *
+ * The sweep returns the sections it actually reached and the number of checks it ran, so the test can
+ * assert a lower bound: a scan that loses a section fails instead of passing vacuously ("contains 18").
+ */
+function scanToolSurfaceContract(contract: string): { sections: string[]; checks: number; findings: string[] } {
+  const findings: string[] = [];
+  const sections: string[] = [];
+  let checks = 0;
+  const check = (ok: boolean, message: string): void => {
+    checks++;
+    if (!ok) findings.push(message);
+  };
+  const sectionOf = (from: string, to: string): string | undefined => {
+    const start = contract.indexOf(from);
+    const end = start < 0 ? -1 : contract.indexOf(to, start + from.length);
+    return start < 0 || end < 0 ? undefined : contract.slice(start, end);
+  };
+
+  const s17 = sectionOf("## 17.", "## 18.");
+  const s18 = sectionOf("## 18.", "## 19.");
+  if (s17 === undefined) findings.push("CONTRACT must keep §17 (tool-surface REV rule)");
+  else sections.push("§17");
+  if (s18 === undefined) findings.push("CONTRACT must keep §18 (reminder/renewal, including §18.11)");
+  else sections.push("§18");
+
+  if (s17 !== undefined) {
+    check(!/6 个工具/.test(s17), "§17 must not claim a default surface of six tools (REV-29)");
+    check(/5 个工具/.test(s17), "§17 must state the default five tools");
+    check(/PI_ASYNC_EXPOSE_WAIT/.test(s17), "§17 must say how the sixth (async_wait) is exposed");
+  }
+
+  if (s18 !== undefined) {
+    const start1811 = s18.indexOf("### 18.11");
+    const end1811 = start1811 < 0 ? -1 : s18.indexOf("### 18.12", start1811);
+    check(start1811 >= 0 && end1811 > start1811, "§18 must keep its §18.11 acceptance list");
+    if (start1811 >= 0 && end1811 > start1811) {
+      const s1811 = s18.slice(start1811, end1811);
+      // REV-29: §18.11 carries the seat claim. Turning `6 个` into `5 个` is exactly the #105 drift
+      // this sweep exists to catch — it must never be phrased as "mentions 18".
+      check(/暴露\s+`async_wait`\s+时\s+6\s+个/.test(s1811), "§18.11 must keep the sixth seat (暴露 async_wait 时 6 个)");
+    }
+  }
+
+  return { sections, checks, findings };
+}
+
+/** Lower bounds for the drift sweep: both sections plus every check inside them must actually run. */
+const MIN_TOOL_SURFACE_CHECKS = 5;
+
+test("§18.11 docs: CONTRACT §17 + §18 (incl. §18.11) state the 5 + 1 tool surface (D4 / REV-29)", () => {
   const contract = readFileSync(new URL("../docs/CONTRACT.md", import.meta.url), "utf8");
-  const start = contract.indexOf("## 17.");
-  const end = contract.indexOf("## 18.");
-  assert.ok(start > 0 && end > start, "CONTRACT must keep §17 and §18");
-  const section = contract.slice(start, end);
-  assert.doesNotMatch(section, /6 个工具/, "REV-29: six is the exposed surface, not the default one");
-  assert.match(section, /5 个工具/, "§17 must state the default five tools");
-  assert.match(section, /PI_ASYNC_EXPOSE_WAIT/, "§17 must say how the sixth (async_wait) is exposed");
+  const scan = scanToolSurfaceContract(contract);
+  assert.deepEqual(scan.findings, [], "the contract must not drift from the frozen tool surface");
+  assert.deepEqual(scan.sections, ["§17", "§18"], "the sweep must actually reach both sections (#105)");
+  assert.ok(
+    scan.checks >= MIN_TOOL_SURFACE_CHECKS,
+    `the sweep must run at least ${MIN_TOOL_SURFACE_CHECKS} checks, ran ${scan.checks} ` +
+      "(a lower bound keeps 'extended but nothing scanned' from passing)",
+  );
+});
+
+test("§18.11 drift self-test: turning the sixth seat into five is caught (#107)", () => {
+  const contract = readFileSync(new URL("../docs/CONTRACT.md", import.meta.url), "utf8");
+  const anchor = contract.indexOf("### 18.11");
+  assert.ok(anchor > 0, "the self-test anchor must exist");
+  const mutated = contract.slice(0, anchor) + contract.slice(anchor).replace("时 6 个", "时 5 个");
+  assert.notEqual(mutated, contract, "the mutation must actually change the text");
+  const scan = scanToolSurfaceContract(mutated);
+  assert.ok(
+    scan.findings.some((finding) => finding.includes("§18.11")),
+    `the sweep must report §18.11 drift, got ${JSON.stringify(scan.findings)}`,
+  );
+});
+
+test("§17 drift self-test: a default surface of six is still caught (#107)", () => {
+  const contract = readFileSync(new URL("../docs/CONTRACT.md", import.meta.url), "utf8");
+  const anchor = contract.indexOf("## 17.");
+  assert.ok(anchor > 0, "the self-test anchor must exist");
+  const mutated = contract.slice(0, anchor) + contract.slice(anchor).replace("默认 5 个工具", "默认 6 个工具");
+  assert.notEqual(mutated, contract, "the mutation must actually change the text");
+  const scan = scanToolSurfaceContract(mutated);
+  assert.ok(scan.findings.some((finding) => finding.includes("§17")), `the sweep must report §17 drift, got ${JSON.stringify(scan.findings)}`);
+});
+
+test("a contract that lost §18 cannot pass the sweep (lower bound, not 'mentions 18')", () => {
+  const contract = readFileSync(new URL("../docs/CONTRACT.md", import.meta.url), "utf8");
+  const truncated = contract.slice(0, contract.indexOf("## 18."));
+  const scan = scanToolSurfaceContract(truncated);
+  assert.equal(scan.sections.includes("§18"), false, "a truncated contract cannot reach §18");
+  assert.ok(scan.findings.some((finding) => finding.includes("§18")), "the missing section must be a finding");
+  assert.ok(scan.checks < MIN_TOOL_SURFACE_CHECKS, "and the check count drops below the lower bound");
 });
 
 test("§18.3 end-to-end through init(): the extension delivers the reminder via sendMessage", async () => {

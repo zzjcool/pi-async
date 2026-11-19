@@ -281,13 +281,13 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   `agent_before_settle`，Esc 中断场景需要单独覆盖。
 - 开关：`PI_ASYNC_SETTLE_GUARD=0` → 整个守卫不注册任何 handler。`dispose()` 幂等，退订所有 handler。
 - **无心跳**：不建 `setInterval`、不写 `async-task-heartbeat` entry、不读 `PI_ASYNC_HEARTBEAT_MS`。
-- **OSC busy 上报只是 host-API shim，不是已实现能力**（官方 pi 1.2–1.5 均无 `ui.setActivity`；四处
-  `typeof ui?.setActivity !== "function"` 特性检测在生产上是 no-op：`src/core/bus.ts:15,26,34` 与
-  `src/guard/settle-guard.ts:222`）。保留它只为上游将来加 API 时自动生效；README/CHANGELOG 不得把它
-  写成已实现能力。
+- **OSC busy 上报只是 host-API shim，不是已实现能力**（官方 pi 1.2–1.5 均无 `ui.setActivity`；
+  `src/core/bus.ts` 的三个 shim 函数都做 `typeof ui?.setActivity !== "function"` 特性检测，生产上是
+  no-op；settle 守卫也走同一个 shim，不自带副本）。保留它只为上游将来加 API 时自动生效；
+  README/CHANGELOG 不得把它写成已实现能力。
   - **它能表达什么**：一次 write-only 的 `(id, { message: string } | undefined)` 调用
-    （`src/core/bus.ts:14,25,33`）。两个 id：聚合 `"pi-async"`（`bus.ts:4,17`）与每任务
-    `plugin/pi-async/<task-id>`（`bus.ts:6-9`）。清除 = 传 `undefined`（没有 idle/working 枚举，
+    （`src/core/bus.ts:31,45,53`）。两个 id：聚合 `"pi-async"`（`bus.ts:10,31`）与每任务
+    `plugin/pi-async/<task-id>`（`bus.ts:13-15`）。清除 = 传 `undefined`（没有 idle/working 枚举，
     也没有结构化字段）。
   - **它不能表达什么**：不能读回（`src/` / `extensions/` 无 getActivity，activity 不进模型上下文）、
     不能表达每任务进度/耗时/优先级、**不能证明「真的在干活」或「没有工具在飞」**。legion 跨机场景
@@ -295,17 +295,18 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     恒缺/恒错；**任何消费者不得把 activity 的有无当作工作证据**。外部唯一诚实的 busy 信号是 settle
     hold 不结束 run（§7.1 / README「Settle hold」，OSC 7501 保持 `working`）。
   - **shim 形状（上游落地后才生效的形状约束，不是能力承诺）**：
-    - 聚合文案 `{ message: "N async tasks" }`（`bus.ts:17`，恒复数）；每任务 raise/clear 与任务状态
-      同步（`extensions/index.ts:411-413`）。
+    - 聚合文案 `{ message: "N async tasks" }`（`src/core/bus.ts` 的 `reportActivity`，恒复数）；每任务
+      raise/clear 与任务状态同步（`extensions/index.ts:411-413`）。
     - 每任务 id 必须带 `plugin/` 前缀 —— **REV-8 裁决（#26）**：对齐 legion
       `docs/contracts/osc-busy-plugin.md` 的 `plugin/<name>/…`；聚合源仍为 `pi-async`（§7 冻结）。
       此前实现漏前缀会导致宿主按 `plugin/` 路由时 per-task activity 静默无效。
     - **禁止 printf OSC**；尊重 `PI_PROGRAM_STATUS`
     - 上报时机：任务启动、终态、以及 `agent_before_settle`（闭合 retire 竞态窗口的关键，见 #156 补充评论）
-  - **已知实现分叉（不在本次文档变更内改实现）**：`src/guard/settle-guard.ts:217-230` 有一份不 import
-    `src/core/bus.ts` 的私有 `reportActivity()`（第 4 处 shim；带 try/catch + stale-ctx `dispose()`，
-    文案会单数化为 `1 async task`，与 bus 的 `1 async tasks` 不同）。同一聚合 id 因此有两个写入者；
-    收敛实现另开 issue（见 `docs/reports/contract-cleanup.md`）。
+  - **实现收敛（#107，替换此前的「已知实现分叉」）**：`src/guard/settle-guard.ts` 不再自带私有
+    `reportActivity()`；`agent_before_settle` 与 `register()` 都调 `src/core/bus.ts` 的
+    `reportActivity`（一处实现、一个文案 `N async tasks`，恒复数）。该 shim 在宿主拒写（stale ctx）时
+    吞掉异常并返回 `false`；守卫据此在答完当前 settle 边界后 `dispose()` 死代——异常不参与、也不改变
+    settled 判定（0.3.2 stale-ctx 自愈保留）。
 - RPC（legion child）内：setActivity 依赖 legion `extension_activity` 转发（#156 落地后生效），
   未落地时静默降级，不影响工具面；**因此 RPC/跨机侧没有可用的 activity 证据**。
 

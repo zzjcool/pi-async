@@ -1,3 +1,4 @@
+import { reportActivity } from "../core/bus.ts";
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
@@ -101,12 +102,11 @@ export class SettleGuard {
       else unsubscribers.push(() => hooks.off?.(event, handler));
     };
 
-    const beforeSettle = (event?: unknown): BeforeSettleResult | undefined => {
-      if (this.disposed) return undefined;
-      const active = this.registry.list({ includeHistory: false });
-      this.reportActivity();
-      // A stale ctx made reportActivity tear us down; the generation is gone, so stay silent.
-      if (this.disposed) return undefined;
+    /**
+     * The settle decision for one boundary (CONTRACT §17). Activity never participates in it: the
+     * shim is write-only and best-effort, so a rejected host call cannot change the answer.
+     */
+    const decideBeforeSettle = (active: TaskSnapshot[], event?: unknown): BeforeSettleResult | undefined => {
       if (active.length === 0) {
         this.reminders = 0;
         return undefined;
@@ -158,6 +158,16 @@ export class SettleGuard {
       return { entries: [...entries, reminder], continue: true };
     };
 
+    const beforeSettle = (event?: unknown): BeforeSettleResult | undefined => {
+      if (this.disposed) return undefined;
+      const active = this.registry.list({ includeHistory: false });
+      const activityOk = reportActivity(this.pi, this.registry.activeCount());
+      const result = decideBeforeSettle(active, event);
+      // A stale ctx is a dead generation: answer this boundary, then detach instead of retrying it.
+      if (!activityOk) this.dispose();
+      return result;
+    };
+
     const agentStart = (): void => {
       this.reminders = 0;
       this.advisorySent = false;
@@ -203,7 +213,7 @@ export class SettleGuard {
         try { unsubscribe(); } catch { /* best effort: the host ctx may already be stale */ }
       }
     });
-    this.reportActivity();
+    if (!reportActivity(this.pi, this.registry.activeCount())) this.dispose();
   }
 
   /** Idempotent teardown; a second call is a no-op. */
@@ -211,21 +221,6 @@ export class SettleGuard {
     this.disposed = true;
     for (const remove of this.removeHooks.splice(0)) {
       try { remove(); } catch { /* best effort: the host ctx may already be stale */ }
-    }
-  }
-
-  private reportActivity(): void {
-    if (this.disposed) return;
-    try {
-      // SAFETY: `pi.ui` itself throws on a stale ctx, so the read is guarded with the call.
-      const ui = (this.pi as unknown as { ui?: { setActivity?: (id: string, value: { message: string } | undefined) => void } }).ui;
-      if (typeof ui?.setActivity !== "function") return;
-      const count = this.registry.activeCount();
-      const total = count.running + count.pending;
-      ui.setActivity("pi-async", total ? { message: `${total} async task${total === 1 ? "" : "s"}` } : undefined);
-    } catch {
-      // The host abandoned this generation; detach instead of retrying into a dead API.
-      this.dispose();
     }
   }
 }
