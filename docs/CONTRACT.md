@@ -456,14 +456,17 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   {width:"80%", maxHeight:"70%", anchor:"center"}})`；从 rail 点击直入详情时为
   `{width:"85%", maxHeight:"80%", anchor:"center"}`。固定百分比尺寸，不提供环境变量开关。
   自绘 mask+frame（legion live-overlay 模式）；左列任务列表（含历史，`h` 切换），点击/Enter 进详情：
-  identity/status/elapsed/command/metadata + 输出 tail（128KiB UI 缓冲；窗口按剩余高度分配、最少 1 行，
-  跟随滚动，上滚暂停；见 §21.1）；
+  identity/status/elapsed/command/metadata + 输出 tail（128KiB UI 缓冲；详情体是一个**视口**：title/status
+  与 footer 键位提示固定，中间全部内容（三条分隔线、command、metadata、output 标签、全部输出行）
+  一起滚动，跟随滚动、上滚暂停；见 §21.1 / §24）；
   键位 `x`（或 `K`）kill（二次确认）/`R` rerun/`c` **显示** output 路径（不是复制）/`q` 关闭；
-  列表内 `k` 是**上移**，不是 kill（REV-18）。Esc 层级：rail 点击直入详情后 Esc 关闭；列表内进入详情后
-  Esc 回落列表。面板为单例：已打开时再次 `/async` 只 `ui.notify("Async panel is already open")` 后
+  **详情内 `↑`/`↓`/`j`/`k` 只滚视口、不改选中任务，换任务用 `[`（上一个）/`]`（下一个）**（REV-31）；
+  列表内 `↑`/`↓`/`j`/`k` 仍是选择，`k` 不是 kill（REV-18）。Esc 层级：rail 点击直入详情后 Esc 关闭；
+  列表内进入详情后 Esc 回落列表。面板为单例：已打开时再次 `/async` 只 `ui.notify("Async panel is already open")` 后
   返回（不叠加 overlay、也不主动 re-render）；面板刷新 = `registry.subscribe` 事件驱动 **+ 面板自有
-  1Hz ticker**（§21.1），`dispose()` 退订并清 timer；详情帧保留 header + footer 键位提示
-  （超预算时保留最后 N 行并插 `… (+K lines)`）。
+  1Hz ticker**（§21.1），`dispose()` 退订并清 timer；详情帧保留 header（title + status）+ footer 键位提示，
+  高度不足时 command/metadata 落在窗口外（顶部 `… (+K lines)` 的 K = 窗口上方隐藏行数，上滚可读回），
+  退化到连一行内容都放不下时先留 footer（告警 + 键位提示）再补 title。
 - **rail 不按 mode 过滤**：background 与 delayed 都注册成真实任务，delayed 的 pending 期与到期后的
   running 期都出现在 rail（REV-29：sync 已删除，rail 配色槽位不变 —— background=0 / delayed=2）；
   任务行只渲染 `name · state · elapsed`，不显示 mode，仅用配色区分（见上方任务行格式）。
@@ -1127,32 +1130,36 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 ### 21.1 详情页把 stdout 当主视图（REV-26）
 
-- **输出窗口按剩余高度分配（带下限）**：`outputRows = max(MIN_OUTPUT_ROWS = 8, budget - chrome)`，
-  其中 `budget = height - 2`，`chrome` = title 1 + status 1 + 分隔线 3 + command 行数 + metadata 行数 +
-  output 标签 1 + `actionError`/`killHint` + footer 1。旧实现固定 `PANEL_ROWS = 12`。
+- **详情体是一个视口（#101 / REV-31 起）**：`budget = height - 2`；`header` = title + status（2 行）与
+  `footer` = `actionError`/kill 确认提示 + 键位提示（1–3 行）固定，`viewportRows = budget - header - footer`
+  是中间内容的窗口。内容 = 三条分隔线 + command 行 + metadata 行 + output 标签 + **全部**输出行；
+  `scroll` = 距尾部的行数（0 = 尾部），`pageStep = viewportRows`。0.5.0 的实现把中间内容**永久**折进
+  `… (+K lines)`（`withBodyBudget`）、且 `scroll` 只切输出尾窗，于是折叠区不可达（#101 D2）；
+  现在同一个标记只是「窗口上方被隐藏的行数」，上滚即读回。
   实测（80 列、running 任务、200 行输出）：
 
-  | 终端行数 | metadata 键数 | 渲染出的输出行 | 折叠 |
+  | 终端行数 | metadata 键数 | 渲染出的输出行 | 折叠标记 |
   |---|---|---:|---|
-  | 40 | 3（真实任务的 outputFile/notifyOnCompletion/triggerOnCompletion） | 17 | 否 |
-  | 24（xterm 默认） | 3 | 8 | 是（`… (+K lines)`） |
-  | 40 / 24 | 0 | 20 / 8 | 否 / 是 |
+  | 40 | 3（真实任务的 outputFile/notifyOnCompletion/triggerOnCompletion） | 27 | 否 |
+  | 24（xterm 默认） | 3 | 13 | 是（`… (+K lines)`） |
+  | 40 / 24 | 0 | 27 / 13 | 否 / 是 |
 
-  下限存在的理由：真实任务 metadata 恒有 3 个键，24 行终端下 `budget - chrome` 只剩 3–5 行，
-  会**比旧的固定 12 行更差**（review R2-3 实测 4 行）；加下限后超发行由 `withBodyBudget` 折叠，
-  尾部正好是输出行 + footer，矮终端也能看到 ≥8 行最新输出。`PANEL_ROWS` 退化为「初始页步长」语义。
-  `withBodyBudget` 的 `… (+K lines)` 语义不变。
-- **PageUp/PageDown 步长 = 当前输出窗口行数**（模块级 `pageStep`，每次详情渲染更新），不再是固定 12。
+  `MIN_OUTPUT_ROWS = 8` 保留为**折叠判据**：`middle + MIN_OUTPUT_ROWS > viewportRows` 时（例：24 行终端 +
+  真实 metadata）才出现标记，40 行终端 + 长日志不出现 —— R2-3 与 D-30 两条既有断言都不改不放宽。
+  极端高度：`budget <= header + 1` 时只留 header + footer（0.5.0 只返回 footer，header 消失，见 #101 D3）。
+- **PageUp/PageDown 步长 = 当前视口高度**（模块级 `pageStep`，每次详情渲染更新），不再是固定 12，
+  也不是 0.5.0 的「输出窗口行数」。
 - **1Hz 自刷新**：面板 widget 工厂内 `setInterval(1000)` + `unref`，`teardown()` 统一 `clearInterval`
   —— `done` / `dispose` / `custom()` 失败三条路径共用同一 teardown（前两条直接调用；`custom()` 的
   reject/throw 发生在工厂闭包之外，通过 `killWidget` 句柄回调 `teardown`；工厂未执行时句柄为
   `undefined`，无需清理）。理由：running 任务的输出增长不产生 `registry` 事件，纯事件驱动会把尾部
   冻结在打开那一刻。固定 1000ms，**无环境变量开关**（与 rail ticker 同模式）。
-- **上滚锚定**：`follow=false` 且输出行数增长时 `scroll += delta`，用户正在读的行原地不动；
-  `follow=true` 仍贴尾部；切换任务时重置锚点（不拿上一个任务的计数补偿）。两条归一化防止幽灵
-  offset：夹取后 `scroll === 0 ⇒ follow = true`；上一窗口没有隐藏任何行
-  （`lastOutputCount <= lastOutputRows`）时直接 `scroll = 0; follow = true` —— 否则「输出还没超
-  窗口时按了一次 ↑/`k`」会让视图永久锚在按键那一刻的行（R2-1 回归）。
+- **上滚锚定**：`follow=false` 且内容行数（#101 起 = 整个详情体）增长时 `scroll += delta`，用户正在读的
+  行原地不动；command/metadata 行数恒定，所以增长只来自输出。`follow=true` 仍贴尾部；切换任务时重置
+  锚点（不拿上一个任务的计数补偿）。两条归一化防止幽灵 offset：夹取后 `scroll === 0 ⇒ follow = true`；
+  上一帧没有隐藏任何内容（`contentCount <= viewportRows`，变量名 `lastHadOverflow`）时直接
+  `scroll = 0; follow = true` —— 否则「输出还没超视口时按了一次 ↑/`k`」会让视图永久锚在按键那一刻的行
+  （R2-1 回归）。
 - **output 标签**（`outputSection` 第 5 个可选参数 `live`）：`output:` / `output (tail truncated):` /
   `output (live):` / `output (live, tail truncated):`；`live = status ∈ {running, pending}`。
   4 参调用保持原标签，既有调用与测试不受影响。
@@ -1334,3 +1341,57 @@ Async task admission is closed (registry suspended: a reload or resume retired t
     `after 1 continuation(s)` 与仍在跑的 taskId；
   - `off`：`PI_ASYNC_PRINT_WAIT=0` 复现 0.4.x（wall < 任务时长、stdout 无结论）= 变异证据。
 - 全量 `npm test` 与 `npm run typecheck` 全绿。
+
+## 24. 0.5.1 详情视口：选择与滚动分离（REV-31，冻结）
+
+基线 `main` `985a083`（0.5.0 已发）；来源 issue #101（`docs/reports/pi-async-81-triage.md` 的 4.1 + 4.2）。
+三个缺陷都在 `src/tui/panel.ts` 一个文件里；本修订只改详情视图的键义与视口语义，不动 rail、不动 `R` rerun
+的字段策略、不新增快捷键注册。
+
+### 24.1 三个缺陷与裁决
+
+- **D1（选择/滚动分离）**：详情内 `↑`/`↓`/`j`/`k` **只滚视口，不改 `selected`**。0.5.0 的 `move()` 先改
+  `selected` 再改 `scroll`，而详情渲染读的是 `selected` —— 滚一下日志就跳到相邻任务（与 README 的
+  「in task details, scroll output」冲突）。换任务新增 **`[`（上一个）/`]`（下一个）**；列表模式键义不变
+  （`↑`/`↓`/`j`/`k` 仍是选择，`k` 不是 kill，REV-18）。
+- **D2（折叠区可达）**：采用 issue 的 **(a) 统一视口** —— 详情体 = 固定 header（title + status）+ 可滚动
+  内容（三条分隔线 + command + metadata + output 标签 + **全部**输出行）+ 固定 footer（`actionError` /
+  kill 二次确认 + 键位提示）。0.5.0 的 `withBodyBudget` 把中间内容**永久**折进 `… (+K lines)`，而 `scroll`
+  只作用于输出尾窗，折叠区没有任何按键可达；现在标记是「窗口上方被隐藏的行数」，`↑`/`k` 滚一行、
+  `PageUp` 滚一个视口即可读回。
+- **D3（退化视口）**：`budget <= header + footer`（约 5–7 行终端；footer 最多 3 行：error + kill 确认 +
+  键位提示）时先留 **footer**（告警与键位提示永不先丢）再补 title；0.5.0 的 `if (tailCount <= 0) return [last]`
+  只返回 footer，§8 承诺的 header 消失。只要还剩一行内容就留给视口（`budget = 4` 时是最新输出那行）。
+- **D5（顺带修正，不属原 issue）**：详情里滚轮方向与 `↑`/`↓` 相反 —— 0.5.0 的 `scroll += wheelDelta` 在
+  宿主「向下 = 正值」的编码下等于上滚。现在 `scroll -= wheelDelta`：滚轮向下 = `↓` = 朝最新行。
+  （列表视图一直是对的，本次不动。）
+
+### 24.2 语义与不变量
+
+- `viewportRows = budget - header - footer`；`scroll` = 距尾部的行数（0 = 尾部，与 0.5.0 同向）；
+  `pageStep = viewportRows`（D-30「一页 = 一个窗口」不变，但窗口从「输出窗口」变成「视口」）。
+- 既有裁决全部保留，**判据换成视口量**：
+  - **R2-3**：折叠条件 `middle + MIN_OUTPUT_ROWS > viewportRows`（旧 `chrome + MIN_OUTPUT_ROWS > budget`）。
+    40 行 + 200 行输出**不**出现标记（D-30 断言），24 行 + 真实 metadata 出现标记（R2-3 断言）。
+  - **R2-1**：「上一帧没有隐藏任何内容」判据 `contentCount <= viewportRows`（变量 `lastHadOverflow`），
+    夹取后 `scroll === 0 ⇒ follow = true` 不变。
+  - **D-32**：锚定按内容行数差补偿；command/metadata 恒定，所以增长只来自输出行。
+  - **D-33**：`output (live):` 标签不变（现在是可滚动内容的一员，长日志时在窗口上方）。
+- **用户可见差异**（两处，均写进 README）：
+  - `… (+K lines)` 的 K 是「窗口上方隐藏的总行数」（含输出行）；0.5.0 只数被折叠的 command/metadata 行。
+  - `output (live):` 标签随内容滚动，不再常驻窗口顶部；`actionError` / kill 提示反而**上移**成固定 footer。
+- **回退开关**：无。回退方式是把 `renderBody` 的详情分支整段退回 0.5.0 的 `withBodyBudget` 实现
+  （本修订前一个 commit），无环境变量、无双实现开关。
+
+### 24.3 验收清单
+
+- `tests/d-tui-keys.test.ts`：详情内 `↑`/`k`/`j`/`↓` 后 `selected` 不变且视口滚动；列表内 `↑`/`↓` 仍改选择；
+  `[`/`]` 在详情内换任务；`k` 永不 kill（既有断言保留，改成「不换任务」）。
+- `tests/c-panel-live.test.ts`：14 行终端 + 30 行 command 时折叠（`… (+37 lines)` 的 K 被逐字钉住），
+  `PageUp` 后能读到 `command:` 与前几行；退化高度（7/6 行）仍见 title 与 footer，8 行时保留 1 行最新输出；
+  滚轮向下与 `↓` 同向。
+- `tests/d-tui-keys.test.ts`：8 行终端 + 错误行 + kill 二次确认同时存在（footer 3 行）时，键位提示仍是
+  最后一行（`viewportRows` 不得变负、`pageStep` 不得反向）。
+- 既有 D-30 / R2-1 / R2-3 / D-32 / D-33 / d-tui-refresh「短终端折叠 + footer」断言不改不放宽。
+- 全量 `npm test` 441 条全绿（0.5.0 基线 435 条，只增不减）；`npm run typecheck` 全绿。
+- 变异：逐个撤掉 D1/D2/D3 修复 → 对应断言必须红（证据见 `docs/reports/tui-detail-viewport.md`）。

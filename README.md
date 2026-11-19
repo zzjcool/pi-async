@@ -87,8 +87,10 @@ Tool notes:
 |---|---|
 | `/async` | Open the task panel. The panel is a singleton: running it again while open only shows an `Async panel is already open` notice and does not stack another overlay — the open panel refreshes itself from registry events plus a 1 Hz ticker, so a running task's output is live while you watch it. |
 | `/async-clear` | Clear completed-task history badges. |
-| `↑` / `↓` / `j` / `k` | Select tasks; in task details, scroll output (new output does not move a view you scrolled up). |
-| `Enter` | Open selected task details: the detail body gives the command's stdout the height that command and metadata do not take, at least 8 rows (on a short terminal the command and metadata collapse into `… (+K lines)` instead), labelled `output (live):` while the task still runs. |
+| `↑` / `↓` / `j` / `k` | Select tasks in the list. In task details the same keys scroll the body one line and leave the selected task alone (new output does not move a view you scrolled up). |
+| `PageUp` / `PageDown` | Task details only: scroll one viewport (one page = one window). |
+| `[` / `]` | Task details only: previous / next task without going back to the list. |
+| `Enter` | Open selected task details: the name/status lines and the key hints stay fixed, and everything between them scrolls — command, metadata and the whole output tail. When the height cannot hold the command/metadata block *and* 8 output rows, the block collapses into a `… (+K lines)` marker that scrolling reads back. The output section is labelled `output (live):` while the task still runs. |
 | `h` | Toggle history in the task list. |
 | `x` (or `K`) | Kill a running task (press again to confirm). |
 | `R` | Rerun the selected task command in that task's original `cwd`. |

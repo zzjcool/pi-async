@@ -2,6 +2,36 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## [Unreleased] — 0.5.1 (patch)
+
+只改任务详情视图（`src/tui/panel.ts`）：选择与滚动分开，被折叠的行变成可读回，极窄终端不再只剩 footer。
+不发版、不打 tag。契约修订见 `docs/CONTRACT.md` §24（REV-31）。
+
+### Fixed
+
+- **详情里 `↑`/`↓`/`j`/`k` 不再切换选中的任务**（#101 D1）：这四个键在详情内只滚视口，换任务改用
+  `[`（上一个）/`]`（下一个）；列表内键义不变（仍是选择）。此前滚一下日志就会跳到相邻任务，
+  与 README 的「in task details, scroll output」直接矛盾。
+- **`… (+K lines)` 折叠区不再不可达**（#101 D2）：详情体改成一个视口 —— title/status 与 footer 键位提示
+  固定，中间的分隔线、command、metadata、output 标签与全部输出行一起滚动。折叠标记现在是「窗口上方被
+  隐藏的行数」，`↑`/`k` 滚一行、`PageUp` 滚一个视口即可读回。
+- **极窄终端不再只剩 footer**（#101 D3）：高度退化到放不下一行内容时仍保留 title + status 与键位提示
+  （旧实现只返回最后一行，header 消失）。footer 涨到 3 行（错误 + kill 确认 + 提示）时也先留 footer，
+  键位提示永远是最后一行。
+- **详情里的滚轮方向与 `↑`/`↓` 一致**（#101 顺带修正）：宿主把「滚轮向下」编码为正的 `wheelDelta`，
+  旧代码 `scroll += delta` 于是向下滚反而上滚；现在向下 = `↓` = 朝最新行。列表视图方向一直是对的。
+
+### Changed
+
+- 详情 footer 键位提示：`↑/↓ scroll · [ ] task · x kill · R rerun · c show output path`
+  （新增 `[`/`]`；为把整行压在 80 列的内宽 76 格里，`x kill/cancel` 缩成 `x kill`，
+  `c show output path` 仍完整可见）。
+- `… (+K lines)` 的 K 改为统计「窗口上方隐藏的总行数」（含输出行）；此前只统计被折叠的
+  command/metadata 行。
+- `output (live):` 标签随内容滚动（长日志时在窗口上方，不再常驻）；`actionError` 与 kill 二次确认提示
+  改为固定 footer，永不滚出屏幕。
+- `PageUp`/`PageDown` 仍是一页 = 一个窗口，窗口的定义从「输出窗口」变成「视口」。
+
 ## 0.5.0 — 未发布（agent 不再需要知道「等待」这件事）
 
 四条一起改的是同一个问题：等任务是运行时的事，不是模型的事。能阻塞的模式删了，会唤醒的那条路少了一个
