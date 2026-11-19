@@ -128,11 +128,13 @@ test("D-30: PageUp/PageDown step by the current output window, not a fixed 12 li
   const logsText = `${rows(100).join("\n")}\n`;
   withTerminalSize(40, 100, () => {
     const panel = createPanel({ task: { taskId: "step-1", status: "running" }, logsText });
-    panel.plain(80); // 20-row window at 40 terminal rows
+    panel.plain(80); // #101: 27-row viewport at 40 terminal rows (budget 30 - header 2 - footer 1)
     panel.component.handleInput("\u001b[5~");
     const paged = panel.plain(80).join("\n");
-    // 100 lines, window 20, one page up → rows 061..080.
-    assert.match(paged, /row 061/, `one PageUp must move a whole window, got:\n${paged}`);
+    // 100 lines + 7 middle lines = 107 content rows, one page up = 27 → rows 047..073.
+    assert.match(paged, /row 047/, `one PageUp must move a whole viewport, got:\n${paged}`);
+    assert.match(paged, /row 061/, `the middle of the window is still there, got:\n${paged}`);
+    assert.doesNotMatch(paged, /row 074/, "the window stopped one page above the tail");
     assert.doesNotMatch(paged, /row 100/, "PageUp leaves the tail");
     panel.component.handleInput("\u001b[6~");
     const back = panel.plain(80).join("\n");
@@ -231,8 +233,8 @@ test("R2-3: 24 rows with a real task's three metadata keys still render a full o
     assert.match(lines.at(-1)!, /^╰─+╯$/, "the bottom border survives the overflow");
     for (const line of lines) assert.equal(Array.from(line).length, 80, `padded to the requested width: ${JSON.stringify(line)}`);
 
-    // chrome (13) is taller than the body budget (17 - 13 = 4), so the window keeps its floor
-    // and withBodyBudget collapses the overflow into the `… (+K lines)` marker.
+    // #101: middle (10) + MIN_OUTPUT_ROWS (8) > viewport (14) → the block is folded behind the
+    // `… (+K lines)` marker, and the window keeps 13 output rows.
     assert.match(lines.join("\n"), /… \(\+\d+ lines\)/, "the overflow is marked, not silently dropped");
     const outputRows = lines.filter((line) => /^│\s+row \d{3}\s+│$/.test(line)).length;
     assert.ok(
@@ -346,4 +348,89 @@ test("R2-4: dispose calls clearInterval with the very handle it created", () => 
     clearSpy.mock.restore();
     intervalSpy.mock.restore();
   }
+});
+
+// ---------------------------------------------------------------------------
+// #101 — one viewport: the folded block is reachable, the header never goes away
+// ---------------------------------------------------------------------------
+
+test("#101 D2: a command folded behind `… (+K lines)` is reachable by scrolling up", () => {
+  const command = Array.from({ length: 30 }, (_, i) => `echo step ${String(i + 1).padStart(2, "0")}`).join("\n");
+  withTerminalSize(14, 100, () => {
+    const panel = createPanel({
+      task: { taskId: "fold-1", status: "running", command, metadata: { outputFile: "/tmp/live.log" } },
+      logsText: `${rows(5).join("\n")}\n`,
+    });
+    // 14 rows * 0.8 => an 11-line frame / 9-line body: the 30-line command cannot fit next to
+    // the 8-row output floor, so it is folded behind the marker.
+    const tail = panel.plain(80).join("\n");
+    assert.doesNotMatch(tail, /echo step/, "precondition: the command block starts folded away");
+    // K counts every line hidden above the window: 36 (37 middle+output lines above + the line the
+    // marker replaces) — the number the contract promises, not just "some marker".
+    assert.match(tail, /… \(\+37 lines\)/, "the fold is marked with the hidden-line count");
+    assert.match(tail, /row 005/, "precondition: the viewport is glued to the newest line");
+
+    // Scrolling the one viewport up reads the folded lines back — before #101 they were permanent.
+    for (let press = 0; press < 6; press += 1) panel.component.handleInput("\u001b[5~"); // PageUp
+    const top = panel.plain(80).join("\n");
+    assert.match(top, /command:/, "PageUp reaches the command label");
+    assert.match(top, /echo step 01/, "…and the first command line");
+    assert.match(top, /echo step 04/, "…and the lines that used to be unreachable");
+    assert.doesNotMatch(top, /… \(\+\d+ lines\)/, "nothing is hidden above the window any more");
+    panel.component.dispose();
+  });
+});
+
+test("#101 D3: a degenerate viewport keeps the identity lines, not just the footer", () => {
+  // 7 rows * 0.8 => a 5-line frame / 3-line body: header + hints own it, no content row is left.
+  // Before #101 `withBodyBudget` returned the footer alone here — the header disappeared.
+  for (const rows of [7, 6]) {
+    withTerminalSize(rows, 100, () => {
+      const panel = createPanel({
+        task: { taskId: "tiny-1", status: "running", metadata: { outputFile: "/tmp/live.log" } },
+        logsText: "out line\n",
+      });
+      const lines = panel.plain(80);
+      const body = lines.join("\n");
+      assert.match(body, /tiny-1/, `rows=${rows}: the title line survives the degenerate viewport`);
+      assert.match(body, /x kill/, `rows=${rows}: the key hints are still the last body line`);
+      assert.match(lines.at(-2)!, /x kill/, `rows=${rows}: hints sit directly above the bottom border`);
+      panel.component.dispose();
+    });
+  }
+});
+
+test("#101 D3: the one content row a tiny terminal has still shows the newest output", () => {
+  withTerminalSize(8, 100, () => {
+    const panel = createPanel({
+      task: { taskId: "tiny-2", status: "running", metadata: { outputFile: "/tmp/live.log" } },
+      logsText: "out line\n",
+    });
+    const lines = panel.plain(80);
+    // 8 rows * 0.8 => a 6-line frame: 2 borders + title + status + one content row + hints.
+    assert.equal(lines.length, 6, `detail frame must stay height-bounded, got:\n${lines.join("\n")}`);
+    const body = lines.join("\n");
+    assert.match(body, /tiny-2/, "the title line survives");
+    assert.match(body, /status:/, "the status line survives too");
+    assert.match(body, /out line/, "the one content row still shows the newest output");
+    assert.match(lines.at(-2)!, /x kill/, "the key hints keep the last row");
+    panel.component.dispose();
+  });
+});
+
+test("#101: the detail wheel scrolls the same way as ↓/PageDown", () => {
+  withTerminalSize(40, 100, () => {
+    const panel = createPanel({ task: { taskId: "wheel-1", status: "running" }, logsText: `${rows(100).join("\n")}\n` });
+    assert.match(panel.plain(80).join("\n"), /row 100/, "precondition: the viewport is at the tail");
+    // Wheel up (negative delta) reads older lines, exactly like ↑.
+    panel.component.handleMouse({ type: "wheel", wheelDelta: -1 });
+    const older = panel.plain(80).join("\n");
+    assert.match(older, /row 073/, "wheel up moves one line off the tail (window is now 073..099)");
+    assert.match(older, /row 099/, "the line just above the tail is visible");
+    assert.doesNotMatch(older, /row 100/, "…the newest line left the window");
+    // Wheel down (positive delta, which is how the host encodes it) goes back to the tail, like ↓.
+    panel.component.handleMouse({ type: "wheel", wheelDelta: 1 });
+    assert.match(panel.plain(80).join("\n"), /row 100/, "wheel down returns to the newest line");
+    panel.component.dispose();
+  });
 });

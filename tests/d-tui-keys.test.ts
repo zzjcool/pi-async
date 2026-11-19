@@ -132,7 +132,7 @@ test("list k only moves up and never kills", async () => {
   panel.component.dispose();
 });
 
-test("detail k scrolls up instead of killing", async () => {
+test("detail k scrolls the body without killing or switching tasks (#101)", async () => {
   const tasks = [
     makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
     makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
@@ -143,8 +143,73 @@ test("detail k scrolls up instead of killing", async () => {
   assert.match(panel.component.render(100).join("\n"), /\[b\]/);
   panel.component.handleInput("k");
   assert.equal(panel.killed.length, 0);
-  assert.match(panel.component.render(100).join("\n"), /\[a\]/, "k in detail moves to the previous task");
+  // #101 D1: `k` is a scroll key in the detail view, so the task under the cursor cannot move.
+  assert.match(panel.component.render(100).join("\n"), /\[b\]/, "k in detail must not switch tasks");
+  // …and switching tasks still has its own keys.
+  panel.component.handleInput("[");
+  assert.match(panel.component.render(100).join("\n"), /\[a\]/, "[ moves to the previous task in detail");
+  panel.component.handleInput("]");
+  assert.match(panel.component.render(100).join("\n"), /\[b\]/, "] moves to the next task in detail");
   panel.component.dispose();
+});
+
+/** Terminal geometry is part of the contract here, so pin it instead of reading the runner's tty. */
+function withTerminalSize(rows: number, columns: number, run: () => void): void {
+  const previousRows = process.stdout.rows;
+  const previousColumns = process.stdout.columns;
+  Object.defineProperty(process.stdout, "rows", { value: rows, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: columns, configurable: true });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(process.stdout, "rows", { value: previousRows, configurable: true });
+    Object.defineProperty(process.stdout, "columns", { value: previousColumns, configurable: true });
+  }
+}
+
+test("#101 D1: ↑/↓/j/k scroll the detail body and never move the selection", () => {
+  const logsText = `${Array.from({ length: 40 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}`).join("\n")}\n`;
+  const tasks = [
+    makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
+    makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
+  ];
+  withTerminalSize(24, 100, () => {
+    const panel = setup({ tasks, logsText });
+    const body = (): string => (panel.component.render(100) as string[]).join("\n");
+
+    // List mode keeps the keys as pure selection (unchanged).
+    assert.match(body(), /▶ alpha/);
+    panel.component.handleInput("\u001b[B");
+    assert.match(body(), /▶ beta/, "list ↓ moves the selection");
+    panel.component.handleInput("\u001b[A");
+    assert.match(body(), /▶ alpha/, "list ↑ moves the selection");
+
+    // Detail mode: the same keys scroll, and the selection stays put.
+    panel.component.handleInput("\r");
+    assert.match(body(), /\[a\]/, "precondition: the detail view shows the selected task");
+    assert.match(body(), /row 40/, "precondition: the viewport is glued to the newest line");
+
+    for (const key of ["\u001b[A", "k"]) {
+      panel.component.handleInput(key);
+      const scrolled = body();
+      assert.match(scrolled, /\[a\]/, `↑/${key} in detail must not switch tasks`);
+      assert.doesNotMatch(scrolled, /row 40/, `↑/${key} in detail must scroll one line off the tail`);
+      assert.match(scrolled, /row 39/, "the line just above the tail is now the newest visible one");
+      panel.component.handleInput("\u001b[B"); // back to the tail before the next key
+      assert.match(body(), /row 40/, "↓ returns to the tail");
+      assert.match(body(), /\[a\]/, "↓ in detail must not switch tasks either");
+    }
+
+    panel.component.handleInput("j");
+    assert.match(body(), /row 40/, "j in detail scrolls down at the tail without leaving it");
+    assert.match(body(), /\[a\]/, "j in detail must not switch tasks");
+
+    panel.component.handleInput("]");
+    assert.match(body(), /\[b\]/, "] is the detail-mode \"next task\" key");
+    panel.component.handleInput("[");
+    assert.match(body(), /\[a\]/, "[ is the detail-mode \"previous task\" key");
+    panel.component.dispose();
+  });
 });
 
 test("a rejected kill surfaces as an error line and a notification instead of throwing", async () => {
@@ -235,4 +300,34 @@ test("R rerun omits cwd when the original task has none", () => {
   panel.component.handleInput("R");
   assert.deepEqual(panel.submitted, [{ command: "echo example", name: "alpha", mode: "background" }]);
   panel.component.dispose();
+});
+
+test("#101 D3: a degenerate viewport keeps the alerts and the key hints", async () => {
+  const previousRows = process.stdout.rows;
+  const previousColumns = process.stdout.columns;
+  Object.defineProperty(process.stdout, "rows", { value: 8, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  try {
+    // 8 rows * 0.8 => a 6-line frame / 4-line body: the footer can grow to 3 rows (error + kill
+    // confirmation + hints), which used to leave `viewportRows = -1` and slice the hints off.
+    const panel = setup({ killMode: "reject" });
+    panel.component.handleInput("\r");
+    panel.component.handleInput("x"); // arm the confirmation
+    assert.match(panel.component.render(100).join("\n"), /press x again/, "the confirmation row survives a 4-row body");
+    assert.match(panel.component.render(100).join("\n"), /x kill/, "the key hints stay the last body line");
+
+    panel.component.handleInput("x"); // rejected kill → the error row joins the footer
+    await new Promise((resolve) => setImmediate(resolve));
+    panel.component.handleInput("x"); // re-arm: error + confirmation + hints = 3 footer rows
+    const lines = panel.component.render(100) as string[];
+    const body = lines.join("\n");
+    assert.equal(lines.length, 6, `the frame must stay height-bounded, got:\n${body}`);
+    assert.match(body, /error:.*kill denied/, "the error row survives");
+    assert.match(body, /press x again/, "the kill confirmation survives");
+    assert.match(lines.at(-2)!, /x kill/, "the key hints are still directly above the bottom border");
+    panel.component.dispose();
+  } finally {
+    Object.defineProperty(process.stdout, "rows", { value: previousRows, configurable: true });
+    Object.defineProperty(process.stdout, "columns", { value: previousColumns, configurable: true });
+  }
 });
