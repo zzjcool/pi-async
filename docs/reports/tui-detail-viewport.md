@@ -2,6 +2,7 @@
 
 - 分支：`pi-subagent/host-workspace/piasync-101-074e4c57`（独立 worktree `/root/code/.pi-worktrees/piasync-101`）
 - 基线：`origin/main` `985a083`（0.5.0 已发）
+- PR：https://github.com/zzjcool/pi-async/pull/104（正文写 `Fixes #101`）
 - 版本：`CHANGELOG.md` 顶部新增 `## [Unreleased] — 0.5.1 (patch)`；**未发版、未打 tag、未 `npm publish`**，
   `package.json` 仍是 `0.5.0`（版本号由 release 提交单独抬，沿用 0.4.x 的做法）。
 - 契约：`docs/CONTRACT.md` §8（键位表）、§21.1（视口语义）、新增 §24（REV-31）。
