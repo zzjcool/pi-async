@@ -138,7 +138,7 @@ git log --oneline --all -- src/core/watch.ts src/core/registry.ts src/tui/panel.
 |---|---|---|---|
 | 2.1 同窗口多任务合并成一条通知 | ❌ 放弃 | CONTRACT:231-234（REV-9：v1 **每任务一条**、**不合并**，「真合并需改多任务 XML schema + 窗宽策略，另开后续 REV」）；`extensions/index.ts:404-405` 挂起 + `:225-233` flush（同一边界仍 N 条）；per-task 闩 `src/core/registry.ts:836-841` | 0.5.0 真正解决的是「N 次 `triggerTurn` 各自冷启动」，不是「N 条消息」：所有 pending 在同一 turn boundary 一起投递（`turn_end`/`before_settle`/`settled`）。内容合并会与 per-task `claimNotification`/`consumedAt`（一个终态恰好一个消费者）正面冲突，收益只剩 token |
 | 2.2 每任务字段可追溯 + schema 变更走 REV | ✅ 已完成 | `src/core/notify.ts:29-38`（task-id/name/status/exit-code/kill-kind/failure-kind/output-file/summary/summary-truncated/guidance）、`:42-56` details 孪生；CONTRACT:236-243 失败矩阵 | 字段齐全；0.5.0 未改 XML schema，无需 REV |
-| 2.3 `async_wait` 消费后的通知抑制语义 | ✅ 已完成（且被推广） | `src/core/registry.ts:1225-1234`（`waitResult` 先 `consume()`）、`:812`（`outputConsumed`）、`:822-833`（`consumedAt`）、`:836-841`/`:979-985`（claim/resend 都查）；`src/tools/index.ts:333/357/388`（wait/logs/status 都置闩）；`tests/i-settle-owner.test.ts:430,465` | 抑制从 wait 独占升级为通用不变量（0.4.3 `43e5c29`）。`async_wait` 默认下线后语义不但没退化，反而由 `async_status`/`async_logs` 接管了「消费即抑制」 |
+| 2.3 `async_wait` 消费后的通知抑制语义 | ✅ 已完成（且被推广） | `src/core/registry.ts:1225-1234`（`waitResult` 先 `consume()`）、`:812`（`outputConsumed`）、`:822-833`（`consumedAt`）、`:836-841`/`:979-985`（claim/resend 都查）；`src/tools/index.ts:333/357/388`（wait/logs/status 都置闩）；`tests/i-settle-owner.test.ts:430-457,465` | 抑制从 wait 独占升级为通用不变量（0.4.3 `43e5c29`）。`async_wait` 默认下线后语义不但没退化，反而由 `async_status`/`async_logs` 接管了「消费即抑制」 |
 
 ### §3 跨进程 / 持久 waiter
 
