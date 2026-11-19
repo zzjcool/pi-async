@@ -204,8 +204,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - **REV-7 裁决（#43）**：原契约只写「全终态 → results」与「超时 → notReady」两极，导致混合超时
   路径丢弃已完成结果、且无法对已完成侧置 `outputConsumed`（通知抑制失效）。正式登记超集三态：
   判据仍是「有 notReady ⇒ 超时分支」；`results` 可选并存。实现见 #56，本 REV 只改契约。
-- **代际边界（#100，判据）**：waiter 属于**发起它的那个 registry 实例**（`waiters = new Set<Waiter>()`，
-  `src/core/registry.ts:60,131`）；任务 finalize 只唤醒本实例注册的 waiter（`:1258,:1263`）。每次
+- **代际边界（#100，判据）**：waiter 属于**发起它的那个 registry 实例**（`Waiter` 接口 + `waiters =
+  new Set<Waiter>()` 容器，`src/core/registry.ts:60,131`）；任务 finalize 只唤醒本实例注册的 waiter（`:1258,:1263`）。每次
   `async_wait` 调用先 `configure(ctx)` 再由 `resolveRegistry()` 解析当前活代（`src/tools/index.ts:326-327`）。
   仓库没有跨代 epoch/token —— 代边界就是实例边界。
   1. `/reload` 即丢：`suspend()` 调 `this.waiters.clear()`，原文「Pending waiters belong to the retired
