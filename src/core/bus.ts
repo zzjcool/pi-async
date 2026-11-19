@@ -1,5 +1,11 @@
 import type { PiCtx } from "./notify.ts";
 
+/**
+ * Host activity shim (CONTRACT §7). `ui.setActivity` is write-only and feature-detected: callers cannot
+ * read the value back, absence of activity is not evidence of idleness, and pi 1.2–1.5 does not expose
+ * the API at all. Never use activity as a work-in-flight signal.
+ */
+
 /** Aggregate activity source id (frozen §7). */
 const AGGREGATE_ACTIVITY_ID = "pi-async";
 
