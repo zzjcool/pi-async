@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
+import { withExposedWaitAsync } from "./helpers/index.ts";
 
 type Tool = {
   name: string;
@@ -27,7 +28,12 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
   }
 }
 
-test("Step I wiring integrates real tasks, notifications, watch, sync, and shutdown", async () => {
+/**
+ * D4 (0.5.0): `async_wait` is opt-in (`PI_ASYNC_EXPOSE_WAIT=1`) and the gate is read per call, so this
+ * end-to-end run holds the switch for its whole body. The default five-tool surface (and the degraded
+ * `async_wait` path) is pinned in `tests/k-toolsurface.test.ts`.
+ */
+test("Step I wiring integrates real tasks, notifications, watch, and shutdown", () => withExposedWaitAsync(async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-async-i-e2e-"));
   const tools = new Map<string, Tool>();
   const hooks = new Map<string, Hook>();
@@ -47,7 +53,8 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
 
   try {
     await init(pi as never);
-    assert.deepEqual([...tools.keys()].sort(), ["async_extend", "async_kill", "async_logs", "async_run", "async_status", "async_wait"]);
+    assert.deepEqual([...tools.keys()].sort(), ["async_extend", "async_kill", "async_logs", "async_run", "async_status", "async_wait"],
+      "six tools while PI_ASYNC_EXPOSE_WAIT=1 (default is five, D4)");
 
     const run = tools.get("async_run")!.execute;
     const wait = tools.get("async_wait")!.execute;
@@ -118,12 +125,6 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     assert.equal(typeof delayedTask?.metadata.watchSuccess, "string");
     assert.match(String(delayedTask?.metadata.watchSuccess), /watch-marker/);
 
-    // Sync mode returns exit code and captured output directly.
-    const synchronous = payload(await run("e2e-sync", { command: "printf sync-marker", mode: "sync", timeoutMs: 5000 }));
-    assert.equal(synchronous.status, "completed");
-    assert.equal(synchronous.exitCode, 0);
-    assert.match(synchronous.outputTail ?? "", /sync-marker/);
-
     // session_shutdown is repeatable and kills every active process with shutdown semantics.
     const active = payload(await run("e2e-shutdown", { command: "sleep 30", mode: "background", notifyOnCompletion: false }));
     const activeStatus = payload(await tools.get("async_status")!.execute("e2e-pre-shutdown", { includeHistory: true })) as unknown as Array<{ taskId: string; pid?: number }>;
@@ -143,7 +144,7 @@ test("Step I wiring integrates real tasks, notifications, watch, sync, and shutd
     if (shutdown) await shutdown();
     rmSync(cwd, { recursive: true, force: true });
   }
-});
+}));
 
 test("TUI init registers status, rail widget, and panel commands", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-async-i-tui-"));

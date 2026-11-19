@@ -378,12 +378,13 @@ test("§18.3 XML shape: allowed fields only, escaping, and no guidance tag when 
   assert.doesNotMatch(bare, /<guidance>|<summary>/);
 });
 
-test("§18.11 tool surface: six tools, each with a snippet; async_run exposes remindAfterMs with minimum 0", async () => {
+test("§18.11 tool surface: five default tools, each with a snippet; async_run exposes remindAfterMs with minimum 0", async () => {
   const f = fixture();
   const tools = new Map<string, Tool>();
   registerTools({ registerTool: (tool: Tool) => { tools.set(tool.name, tool); } } as never, f.registry);
   await f.cleanup();
-  assert.deepEqual([...tools.keys()].sort(), ["async_extend", "async_kill", "async_logs", "async_run", "async_status", "async_wait"]);
+  // D4 (0.5.0): `async_wait` is opt-in (PI_ASYNC_EXPOSE_WAIT=1); the default surface is five tools.
+  assert.deepEqual([...tools.keys()].sort(), ["async_extend", "async_kill", "async_logs", "async_run", "async_status"]);
   for (const [name, tool] of tools) {
     const snippet = tool.promptSnippet ?? "";
     assert.ok(snippet.length > 0, `${name} must carry a promptSnippet (REV-20)`);
@@ -400,14 +401,15 @@ test("§18.11 tool surface: six tools, each with a snippet; async_run exposes re
   assert.equal(extendFields.taskTimeoutMs?.minimum, 0);
 });
 
-test("§18.11 docs: CONTRACT §17 counts six tools, matching the tool list", () => {
+test("§18.11 docs: CONTRACT §17 states the 5 + 1 tool surface (D4 / REV-29)", () => {
   const contract = readFileSync(new URL("../docs/CONTRACT.md", import.meta.url), "utf8");
   const start = contract.indexOf("## 17.");
   const end = contract.indexOf("## 18.");
   assert.ok(start > 0 && end > start, "CONTRACT must keep §17 and §18");
   const section = contract.slice(start, end);
-  assert.doesNotMatch(section, /5 个工具/, "§17 must not still claim five tools");
-  assert.match(section, /6 个工具/, "§17 must state six tools");
+  assert.doesNotMatch(section, /6 个工具/, "REV-29: six is the exposed surface, not the default one");
+  assert.match(section, /5 个工具/, "§17 must state the default five tools");
+  assert.match(section, /PI_ASYNC_EXPOSE_WAIT/, "§17 must say how the sixth (async_wait) is exposed");
 });
 
 test("§18.3 end-to-end through init(): the extension delivers the reminder via sendMessage", async () => {

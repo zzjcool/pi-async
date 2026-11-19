@@ -35,7 +35,8 @@ test("the bundled skill has a valid name and a routing description", () => {
 
 test("the skill keeps the facts the tool descriptions no longer carry", () => {
   const text = readFileSync(SKILL_FILE, "utf8");
-  for (const needed of ["64K characters", "OR-ed", "|| true", "jq -e", "taskTimeoutMs", "blind_checks", "promote", "async_wait"]) {
+  // D3/D4 (0.5.0): "promote" left with `mode=sync`; `async_wait` stays documented as the opt-in tool.
+  for (const needed of ["64K characters", "OR-ed", "|| true", "jq -e", "taskTimeoutMs", "blind_checks", "async_wait", "PI_ASYNC_EXPOSE_WAIT"]) {
     assert.ok(text.includes(needed), `SKILL.md must explain ${needed}`);
   }
   assert.doesNotMatch(text, /\bTODO\b/, "no unfinished placeholders in a shipped playbook");
@@ -52,7 +53,7 @@ const D35_BLOCK: readonly string[] = [
   "- Anything that finishes in seconds — a read, a grep, `ls`, `git status` — belongs in `bash`: one call,",
   "  output on screen. `async_run` costs a receipt plus an `async_logs` round-trip for the same text.",
   "- The next step needs what the command prints and it will finish within a minute — `bash` returns it",
-  "  inline; `async_run` then `async_wait` is strictly slower.",
+  "  inline; `async_run` then `async_logs` is strictly slower.",
   "- Nothing else to do while it runs and it is short. Async pays only when the wait overlaps real work,",
   "  or when the command outlives the turn.",
   "- Never as an escape hatch for a command that keeps failing: a detached task hides its exit code",
@@ -63,15 +64,12 @@ const D35_BLOCK: readonly string[] = [
   "Before the first edit, scan the request for commands that are (a) likely to outlive ~60s and",
   "(b) independent of each other: build, test suite, lint, install, `docker pull`, a watcher.",
   "Start them **together in one message** (several `async_run` calls in a single tool batch), then do the",
-  "file work while they run, and collect the whole set with one `async_wait` (or let the completion",
+  "file work while they run, and collect the whole set when you need the results (or let the completion",
   "notifications wake you; a legion child must always collect before reporting a verdict).",
   "",
   "- Two independent five-minute builds started together take five minutes, not ten.",
   "- Do not serialize: start the second build/test while the first still runs when nothing depends on it.",
   "- Do not pre-launch commands you may never need — a task you never collect still costs a notification and a rail entry.",
-  "",
-  "`mode=sync` also registers a real task: it shows up in the rail and counts as running until it ends.",
-  "Use it only for a command you must finish before the next step **and** that may exceed the bash window.",
 ];
 
 /** The D-35 region of SKILL.md, trimmed of the blank separator line before `## Collect, do not poll`. */
@@ -91,7 +89,7 @@ test("the skill says when NOT to use async and plans the batch first, frozen lin
   const region = d35Region(text);
 
   // Whole-block comparison: every one of the 25 frozen lines is pinned, blanks included.
-  assert.equal(region.length, D35_BLOCK.length, "the D-35 block must keep its 25 frozen lines");
+  assert.equal(region.length, D35_BLOCK.length, "the D-35 block must keep its 22 frozen lines");
   assert.deepEqual(region, D35_BLOCK, "the D-35 block must equal the contract verbatim, line for line");
 
   // Placement: after `## Choose the mode`, before `## Collect, do not poll`.

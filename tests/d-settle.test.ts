@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SettleGuard } from "../src/guard/settle-guard.ts";
-import { makeSnapshot } from "./helpers/index.ts";
+import { makeSnapshot, withExposedWait } from "./helpers/index.ts";
 
 type Handler = (...args: unknown[]) => unknown;
 type Draft = { type?: string; customType?: string; content?: string; display?: boolean };
@@ -100,7 +100,9 @@ test("settle guard appends custom_message reminders, then one unresolved entry w
       assert.equal(draft?.customType, "async-task-settle-reminder");
       assert.equal(draft?.display, false, "reminders never render in the transcript");
       assert.match(String(draft?.content), /pending-1/, "the reminder names the task ids");
-      assert.match(String(draft?.content), /async_wait/);
+      // D4 (0.5.0): default sessions do not register async_wait, so the reminder names the readers.
+      assert.match(String(draft?.content), /async_status or async_logs/);
+      assert.doesNotMatch(String(draft?.content), /async_wait/);
     }
 
     const fourth = beforeSettle();
@@ -158,7 +160,8 @@ test("agent_settled sends exactly one followUp unresolved message per generation
     settled();
     assert.equal(calls.length, 1, "an aborted run with live async work nudges the model once");
     assert.equal(calls[0]?.message.customType, "async-task-unresolved");
-    assert.match(String(calls[0]?.message.content), /async_wait/);
+    assert.match(String(calls[0]?.message.content), /async_status or async_logs/);
+    assert.doesNotMatch(String(calls[0]?.message.content), /async_wait/, "D4: unregistered tool is never suggested");
     assert.deepEqual(calls[0]?.options, { deliverAs: "followUp" }, "options carry deliverAs only — no triggerTurn");
 
     settled();
@@ -227,7 +230,8 @@ test("the advisory only promises a wake-up for tasks that really wake (§17 修�
     const mixedDraft = (first.fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined)?.entries?.at(-1);
     assert.match(String(mixedDraft?.content), /wakes-1/);
     assert.match(String(mixedDraft?.content), /1 of them will wake you/);
-    assert.match(String(mixedDraft?.content), /async_wait/);
+    assert.match(String(mixedDraft?.content), /collect the other 1 with async_logs if you need them now/);
+    assert.doesNotMatch(String(mixedDraft?.content), /async_wait/, "D4: default sessions have no async_wait");
     assert.doesNotMatch(String(mixedDraft?.content), /their completion notifications will wake you/);
 
     // Nothing will wake the session at all (no notification, or no turn).
@@ -237,7 +241,7 @@ test("the advisory only promises a wake-up for tasks that really wake (§17 修�
       const quiet = (none.fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined)?.entries?.at(-1);
       assert.equal(
         String(quiet?.content),
-        "1 async task(s) still running: quiet-1. None of them will start a new turn; collect them with async_wait if you need one now.",
+        "1 async task(s) still running: quiet-1. None of them will start a new turn; collect them with async_logs if you need one now.",
       );
     }
   });
@@ -259,7 +263,9 @@ test("main sessions get one advisory draft without continue, re-armed per run (D
     assert.equal(advisory?.customType, "async-task-settle-advisory");
     assert.equal(advisory?.display, false);
     assert.match(String(advisory?.content), /live-1/, "the advisory names the task ids");
-    assert.match(String(advisory?.content), /async_wait/);
+    // D4 (0.5.0): the all-wake branch drops the async_wait half-sentence when the tool is not exposed.
+    assert.match(String(advisory?.content), /their completion notifications will wake you\.$/);
+    assert.doesNotMatch(String(advisory?.content), /async_wait/);
     assert.equal("continue" in (first ?? {}), false, "an advisory must never force another provider request");
 
     assert.equal(fireOne("agent_before_settle", { entries: [] }), undefined, "at most one advisory per generation");
@@ -314,5 +320,29 @@ test("a stale ui getter never throws out of register, a handler or dispose", () 
     assert.ok(unsubscribed.length > 0, "the stale generation detaches its hooks");
     assert.doesNotThrow(() => guard.dispose());
     assert.doesNotThrow(() => fireOne("agent_settled", { aborted: true }));
+  });
+});
+
+/**
+ * D4/D6 (0.5.0): the wording is exposure-driven, not a global rewrite — with `PI_ASYNC_EXPOSE_WAIT=1`
+ * the guard still points at `async_wait` exactly as before.
+ */
+test("an exposed session keeps the async_wait collect wording (D4)", () => {
+  withExposedWait(() => {
+    legion(() => {
+      const { pi, fireOne } = makePi();
+      new SettleGuard(pi as never, makeRegistry() as never).register();
+      const reminder = (fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined)?.entries?.at(-1);
+      assert.equal(reminder?.customType, "async-task-settle-reminder");
+      assert.match(String(reminder?.content), /Call async_wait or async_status before reporting a verdict\./);
+    });
+
+    withNodeId(undefined, () => {
+      const { pi, fireOne } = makePi();
+      new SettleGuard(pi as never, makeRegistry() as never).register();
+      const advisory = (fireOne("agent_before_settle", { entries: [] }) as BeforeSettleResult | undefined)?.entries?.at(-1);
+      assert.equal(advisory?.customType, "async-task-settle-advisory");
+      assert.match(String(advisory?.content), /Otherwise collect them with async_wait\./);
+    });
   });
 });

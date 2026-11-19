@@ -1,6 +1,6 @@
 export const TASK_STATUSES = ["pending", "running", "completed", "failed", "killed"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
-export type TaskMode = "background" | "sync" | "delayed";
+export type TaskMode = "background" | "delayed";
 export type KillKind = "user" | "timeout" | "output_cap" | "shutdown" | "watch_failure";
 export type FailureKind = "lost" | "blind_exhausted" | "watch_timeout";
 
@@ -49,8 +49,6 @@ export interface RunOptions {
   name?: string;
   mode?: TaskMode;
   delayMs?: number;
-  timeoutMs?: number;
-  onTimeout?: "promote" | "abort";
   taskTimeoutMs?: number;
   notifyOnCompletion?: boolean;
   triggerOnCompletion?: boolean;
@@ -68,12 +66,6 @@ export interface RunReceipt {
   status: TaskStatus;
   mode: TaskMode;
   outputHint: string;
-}
-
-export interface SyncResult extends RunReceipt {
-  exitCode?: number;
-  outputTail: string;
-  promoted: boolean;
 }
 
 export type WaitResultItem = { taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind };

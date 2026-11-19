@@ -52,17 +52,24 @@ test("truncateUtf8Bytes does not inject U+FFFD on CJK tails (#17)", () => {
   assert.ok(out.endsWith("中"));
 });
 
-test("syncResult outputTail stays UTF-8 clean and ≤8 KiB (#17)", async () => {
-  const dir = tmpDir("pi-async-w2-sync-");
+// --- D3 carried-over bound: the tail the removed syncResult used to keep ≤8 KiB is still bounded on
+// the live path that carries it now (`registry.wait` → `async_wait`). Without this, the only remaining
+// pin on `waitResult`'s 8192 window was the sync test that D3 deleted.
+test("wait results keep a UTF-8-clean, ≤8 KiB outputTail (#17, carried over from the removed syncResult)", async () => {
+  const dir = tmpDir("pi-async-w2-waittail-");
   const registry = new TaskRegistry({ dataDir: dir });
   try {
-    const result = await registry.runSync(
-      { command: "python3 -c \"print('中'*3000, end='')\"", mode: "sync", name: "cjk" },
-      10_000,
-      "abort",
-    );
-    assert.equal([...result.outputTail].filter((c) => c === "\uFFFD").length, 0);
-    assert.ok(Buffer.byteLength(result.outputTail, "utf8") <= 8192);
+    // 400 lines × 60 CJK characters: far past 8 KiB, and every cut lands mid-sequence if unbounded.
+    const task = registry.submit({
+      command: `node -e 'for (let i = 0; i < 400; i++) process.stdout.write("中".repeat(60) + "\\n")'`,
+      cwd: dir,
+    });
+    const outcome = await registry.wait([task.taskId], 30_000);
+    assert.ok("results" in outcome, "the task must finish inside the wait window");
+    const row = outcome.results[0]!;
+    assert.equal(row.status, "completed");
+    assert.ok(Buffer.byteLength(row.outputTail, "utf8") <= 8192, "outputTail respects the 8 KiB read window");
+    assert.equal([...row.outputTail].filter((character) => character === "\uFFFD").length, 0, "no split UTF-8 sequences");
   } finally {
     await registry.shutdown();
     rmSync(dir, { recursive: true, force: true });
@@ -294,15 +301,19 @@ test("async_kill on D4 task returns alreadyTerminal + killKind without flipping 
 });
 
 // --- #42 mode-irrelevant params ---
-test("async_run rejects timeoutMs on background and delayMs on sync (#42)", async () => {
+test("async_run no longer takes the sync knobs and still rejects delayMs outside delayed (#42 / D3)", async () => {
   const dir = tmpDir("pi-async-w2-mode-");
   const registry = new TaskRegistry({ dataDir: dir });
-  const tools = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }>();
-  registerTools({ registerTool: (t: { name: string; execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }) => tools.set(t.name, t) } as never, registry);
+  type Tool = { parameters: { properties: Record<string, unknown> }; execute: (id: string, params: Record<string, unknown>) => Promise<unknown> };
+  const tools = new Map<string, Tool>();
+  registerTools({ registerTool: (t: { name: string } & Tool) => tools.set(t.name, t) } as never, registry);
   try {
     const run = tools.get("async_run")!;
-    await assert.rejects(run.execute("c", { command: "true", mode: "background", timeoutMs: 1000 }), /timeoutMs is only valid/);
-    await assert.rejects(run.execute("c", { command: "true", mode: "sync", timeoutMs: 1000, delayMs: 5 }), /delayMs is only valid for delayed mode \(pass mode: "delayed"/);
+    // D3 (0.5.0): timeoutMs/onTimeout left the schema, so `additionalProperties: false` makes the host
+    // reject them before execute runs — nothing is silently ignored at the tool layer anymore.
+    assert.equal(run.parameters.properties.timeoutMs, undefined, "timeoutMs is not an async_run parameter");
+    assert.equal(run.parameters.properties.onTimeout, undefined, "onTimeout is not an async_run parameter");
+    await assert.rejects(run.execute("c", { command: "true", mode: "background", delayMs: 5 }), /delayMs is only valid for delayed mode \(pass mode: "delayed"/);
   } finally {
     await registry.shutdown();
     rmSync(dir, { recursive: true, force: true });

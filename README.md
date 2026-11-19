@@ -26,31 +26,39 @@ pi -e ./extensions/index.ts
 
 ## Tools and commands
 
-The extension registers six tools:
+The extension registers five tools by default (plus one opt-in tool):
 
 | Tool | Purpose |
 |---|---|
-| `async_run` | Start a background, delayed, or synchronous shell command. |
-| `async_wait` | Wait for task completion or return a `notReady` result on timeout. |
+| `async_run` | Start a background or delayed shell command. |
 | `async_logs` | Read bounded, ANSI-stripped captured output (`merged` / `stdout` / `stderr`). |
 | `async_status` | List tasks and their current state. |
 | `async_extend` | Renew a running task: move its reminder and/or hard-timeout deadline. Never kills. |
 | `async_kill` | Terminate a task and its process group. |
+| `async_wait` *(opt-in)* | Wait for task completion or return a `notReady` result on timeout. Registered only when the host sets `PI_ASYNC_EXPOSE_WAIT=1`. |
 
-`async_wait`, `async_logs`, `async_extend`, and `async_kill` accept a task **name** as well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown ids/names are an error instead of a silent success.
+`async_logs`, `async_extend`, `async_kill` (and `async_wait` where it is exposed) accept a task **name** as
+well as a task id. Ambiguous names are rejected with the candidate ids listed; unknown ids/names are an
+error instead of a silent success. `async_status` is the read-only exception: its `name` argument is a
+case-insensitive substring filter over the list (see [Notifications](#notifications)).
+
+`async_wait` is not registered by default: a completion notification wakes the session, so the blocking
+collect step is opt-in. If a stale registration is still called while the switch is off, it answers
+`available: false` with the reason and the enabling variable instead of throwing.
 
 ### How the model finds these tools
 
-All six tools carry a one-line `promptSnippet`, so the host lists every one of them in the system prompt's
-tools section — `async_run` is not the only entry point the model can see.
+Every registered tool carries a one-line `promptSnippet`, so the host lists all of them in the system
+prompt's tools section — `async_run` is not the only entry point the model can see.
 
 `async_run` additionally ships four `promptGuidelines` in the system prompt: when to reach for it instead
 of `bash`, that ending a turn with running tasks is expected (the completion notification wakes the
 session), that `name` + `async_logs` beat re-running a command, and that independent long commands should
-be launched together in one batch and collected with a single `async_wait`.
+be launched together in one batch and collected in a single pass. While `async_wait` is not exposed, a
+fifth guideline says so and points at `async_logs` instead.
 
 The procedural detail — when **not** to use async at all, how to plan a batch of independent long
-commands up front, check-writing discipline, watch semantics, promote vs. abort, legion collection —
+commands up front, check-writing discipline, watch semantics, legion collection —
 ships as an Agent Skill (`skills/async-tasks/SKILL.md`, advertised through `resources_discover`), so it
 costs one routing line until the task actually needs it.
 
@@ -70,7 +78,7 @@ The general rule lives in the system prompt once; a receipt only adds the **exce
 
 Tool notes:
 
-- `async_run`: `mode` is `background` (default), `delayed` (requires `delayMs`) or `sync` (requires `timeoutMs`). `timeoutMs` is sync-only, `delayMs` is delayed-only, `onTimeout` is sync-only — passing them to the wrong mode is rejected. `onTimeout: "promote"` (default) hands an expired wait to background; `"abort"` stops waiting only, the command keeps running and still notifies. A sync run that **finishes** without exit 0 returns `isError: true` with the full payload (`status` / `exitCode` / `outputTail` / `promoted`) intact. `promoted: true` means the sync wait expired and the task was handed to background (`status: "running"`) — a promoted or aborted wait is **not** a tool error.
+- `async_run`: `mode` is `background` (default) or `delayed` (requires `delayMs`; `delayMs` is rejected on any other mode). There is no blocking run: the call returns a receipt (`taskId` / `name` / `status` / `mode` / `outputHint`), the command keeps running, and the result is read later with `async_logs` or delivered by the completion notification.
 - `async_status`: defaults to active (running/pending) tasks. `includeHistory: true` lists up to `limit` (1–50, default 50) tasks sorted newest first; an explicit `status` also sorts newest first. `status` and `name` (case-insensitive substring) filter the list. `delayedEnv` values are masked as `"***"`. Snapshots expose `notified`, `outputConsumed`, `notifyAttempts`, `cwd`, `timeoutAt`, and `watchDeadline`. A delayed task that fails to start (missing `cwd`, rejected `env` key, spawn error) is finalized as `failed` (exit 1) and records the cause in `metadata.startError`.
 - `async_logs`: `stream` selects the merged capture or a single stream; `maxBytes` is capped at 50 KiB. A missing output file returns `missing: true` instead of throwing; paths outside the data directory are refused.
 - `async_kill`: returns `killKind`, `alreadyTerminal`, `processAlive` and, when the kill could not be confirmed, `warning`.
@@ -88,7 +96,7 @@ Tool notes:
 | `Esc` | Close rail-clicked details; return from list-opened details to the list. |
 | `q` | Close the panel. |
 
-The rail's first row summarizes running, pending, elapsed, completed, and failed/killed task counts; pending and failed/killed counts are shown only when nonzero. The rail is not filtered by mode: a `mode=sync` run is a real registered task too, so it appears there and counts as running until it ends. **Mouse support (wheel, click) exists only in fullscreen / alt-screen TUI mode** — pi only enables mouse reporting there; in regular mode use `/async` and the keyboard. The panel and rail are only enabled in the main Pi TUI session; RPC, print, and child contexts retain the tool surface without TUI entrypoints.
+The rail's first row summarizes running, pending, elapsed, completed, and failed/killed task counts; pending and failed/killed counts are shown only when nonzero. The rail is not filtered by mode: background and delayed runs both appear there and count as running until they end. **Mouse support (wheel, click) exists only in fullscreen / alt-screen TUI mode** — pi only enables mouse reporting there; in regular mode use `/async` and the keyboard. The panel and rail are only enabled in the main Pi TUI session; RPC, print, and child contexts retain the tool surface without TUI entrypoints.
 
 ## Configuration
 
@@ -96,13 +104,17 @@ The rail's first row summarizes running, pending, elapsed, completed, and failed
 |---|---:|---|
 | `PI_ASYNC_MAX_OUTPUT_BYTES` | `20971520` (20 MiB) | Maximum captured output per task; exceeding it terminates the task with `output_cap`. |
 | `PI_ASYNC_MAX_TASKS` | `32` | Maximum concurrent running and pending tasks. |
-| `PI_ASYNC_MAX_SYNC_TIMEOUT_MS` | `600000` (10 min) | Upper bound for `sync.timeoutMs` (schema `maximum` and runtime check). |
+| `PI_ASYNC_EXPOSE_WAIT` | `off` | Set `1` to also register `async_wait` (the blocking collect tool). Unset, the tool surface is the default five and completion notifications do the waking. |
 | `PI_ASYNC_ENV_INHERIT` | `safe` | Child env policy: `safe` strips credential-like variables and rejects dangerous explicit keys; `all` restores full inheritance (explicit dangerous-key overrides are still rejected in every policy); `none` passes only a minimal allowlist (`PATH`, `HOME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TMPDIR`, `USER`). |
 | `PI_ASYNC_SETTLE_GUARD` | `on` | Set `0` to disable the settle guard entirely (no `agent_before_settle` reminder, no `agent_settled` backstop). |
 | `PI_ASYNC_NUDGE` | `on` | Set `0` to disable the runtime context nudges (the long-command hint and the `<async-state>` line). |
 | `PI_ASYNC_HOLD` | `on` | Set `0` to disable the settle hold entirely (no `agent_before_settle` handler is registered). |
 | `PI_ASYNC_HOLD_MS` | `600000` (10 min) | Upper bound for one settle hold; `≤ 0` disables the feature (a negative value is not replaced by the default, and non-integer values fall back to the default). |
 | `PI_ASYNC_HOLD_POLL_MS` | `1000` | How often the task list is re-read while the run is being held. |
+| `PI_ASYNC_PRINT_WAIT` | `on` | Set `0` to disable the headless (`pi -p`) backstop entirely (the process may exit while tasks still run — the 0.4.x behaviour). |
+| `PI_ASYNC_PRINT_WAIT_MS` | `600000` (10 min) | Overall budget for the headless wait: wall clock from the first real wait, accumulated across turns and continuation requests (time spent in provider requests counts). |
+| `PI_ASYNC_PRINT_POLL_MS` | `500` | How often the task list is re-read while a print run waits; a value below 50 falls back to the default (it is not clamped). |
+| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | Forced provider requests the headless backstop may spend before it reports the still-running tasks and exits non-zero. `0` means "never wait-and-continue": first boundary with a running task already throttles. |
 | `PI_ASYNC_FOOTER` | `off` | Set `1` to also render a one-line task summary through the host's `setStatus` footer (only when the host exposes `setStatus`). The rail's first row is the default status surface. |
 | `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
@@ -118,7 +130,7 @@ Completion notifications are **best-effort**. `pi.sendMessage` returns `void` �
 
 - `notified` becomes true only after `sendMessage` returns; a failure or a missing host API leaves `notified: false` and increments `notifyAttempts`.
 - On `session_start`, pi-async **resends** terminal tasks that are still unnotified and unconsumed (within 24 h and under 2 attempts), so a missed wake-up is retried once per session start.
-- `async_wait` results are marked consumed (`outputConsumed`), which **suppresses** the completion notification for those tasks to avoid chatter. On a hybrid timeout only the completed side is consumed; not-ready tasks are left alone.
+- `async_wait` results (where the tool is exposed) are marked consumed (`outputConsumed`), which **suppresses** the completion notification for those tasks to avoid chatter. On a hybrid timeout only the completed side is consumed; not-ready tasks are left alone.
 - **One terminal event is told once, to exactly one consumer** (CONTRACT §7.2). `async_wait` (terminal rows), `async_status` (terminal rows it returns) and `async_logs` (a task that already finished) latch `consumedAt` on the task; a consumed task never produces a completion notification — `claimNotification` and `resendUnnotified` both skip it. Only **terminal** rows latch: reading the partial output of a running task, or listing it as `running`, leaves its notification armed.
 - While a run is live, the notification is **not queued at `finalize()`**: the send is decided at the run's next **turn boundary**, after every consumer had its chance. That is what stops the "late receipt" — in 0.4.2 a task collected with `async_wait` mid-run still produced a `async-task-notification` 85–138 s later, because pi only enqueues a streaming followUp and delivers it once the model stops. If nobody consumed the result, the notification is still delivered exactly once at that boundary; when the session is idle it is sent immediately and wakes the session as before.
 - **The delivery channel follows the run state** (0.4.4). A live run gets `deliverAs: "steer"`, which the host drains at *every* turn boundary; `followUp` is drained only when the model stops asking for tool calls, so a busy parent used to push the notification to the end of the whole run (measured: `finishedAt` 04:15:24.745 → injected 04:18:23.383, **+178.6 s**). An idle session keeps `followUp` + `triggerTurn: true`, which starts the wake-up run immediately. One terminal event is still enqueued at most once, no matter how many boundaries pass.
@@ -180,9 +192,10 @@ holds the run at the `agent_before_settle` boundary instead of settling, so the 
   notifications instead, so nothing is ever swallowed.
 - The draft names each finished task by `name` (falling back to the task id), which is exactly what
   `async_logs` accepts, and still points at `async_logs` rather than inlining a tail.
-- Only an interactive TUI session holds. `print` / `json` would delay the process exit, `rpc` aborts
-  under a client-side timeout, and legion child sessions keep their own bounded reminder channel —
-  none of them are affected.
+- Only an interactive TUI session holds. A `print` session is served by a different mechanism — the
+  headless backstop below deliberately keeps the process alive until running tasks finish — and `rpc`
+  aborts under a client-side timeout, so neither of them may also hold. Legion child sessions keep
+  their own bounded reminder channel. None of the three is affected by the hold.
 - While it waits the footer shows `waiting for N tasks <elapsed>`, refreshed every 15 s, whenever the
   host exposes `setStatus`.
 | Environment variable | Default | Description |
@@ -203,6 +216,34 @@ the host's `clearAllQueues()` to drop. A task that finishes after the Esc is not
 notification is delivered normally and still wakes the session. If you had already queued text when
 you pressed Esc, the host moves it back into the editor (`restoreQueuedMessagesToEditor`), so nothing
 you typed is lost.
+
+## Headless (`pi -p`) — the process waits for the work
+
+A print run is one prompt in, one answer out, then `process.exit`. Nothing in the host keeps that
+process alive while a background task still runs, so pi-async does it structurally (0.5.0):
+
+- When the run reaches the settle boundary in a **print** session with `running` tasks, the extension
+  keeps the boundary open until they all finish (polled, no TUI). It then commits one
+  `async-task-print-results` entry (name/status/exit only — never an output tail) and returns
+  `continue: true`, so the host issues one more provider request. The model gets a real turn to read
+  the result and **its answer is what `pi -p` prints** — not an empty stdout after an early exit.
+- The wait reuses the completion-notification ownership relay, so a task finishing inside it is
+  announced exactly once (the results entry) and `notified` is latched; nothing is lost or doubled.
+- It is bounded twice: `PI_ASYNC_PRINT_MAX_CONTINUATIONS` forced turns (default 5) and one overall
+  `PI_ASYNC_PRINT_WAIT_MS` wall-clock budget (default 10 min, accumulated from the first real wait —
+  provider time between turns counts, so a long run may report a *newly* started task immediately
+  instead of waiting for it; that is the intentional whole-process bound). Over budget the run is allowed to end, but not
+  silently: stderr gets `pi-async: still running N async task(s) after C continuation(s) and Ts: <id>
+  (<name>), …` naming every taskId, and the process exits with code 1.
+- Only `running` tasks block the exit. A `mode: delayed` task sits in `pending` by definition (its
+  `dueAt` may be an hour away), so it is scheduled work, not in-flight work — it survives on disk for
+  the next session instead of burning the budget.
+- `agent_before_settle` in print mode has no host timeout and Esc does not reach it; the two bounds
+  above are what make that safe. `PI_ASYNC_PRINT_WAIT=0` disables the whole backstop (0.4.x behaviour).
+
+The real-process proof lives in the repository: `scripts/headless-smoke.sh wait` starts a task that
+outlives the model's turn and asserts the conclusion is what stdout carries; `cap` asserts the
+non-zero exit plus the taskId line; `off` reproduces the pre-0.5.0 early exit.
 
 ## Watches
 
@@ -227,7 +268,7 @@ If the resolved data directory changes inside a live process, artifacts are copi
 
 ## Legion child sessions
 
-In a legion child session, collect task results with `async_wait` before returning a verdict. The settle guard pushes a reminder into the model context before settling (up to 3 times, `custom_message` draft, `continue: true`), and an aborted run with active tasks gets a follow-up reminder on `agent_settled`. In the main session the same boundary produces one **advisory** draft (no forced re-run) saying that stopping with background work is fine, because its completion notification will wake the session. Notifications themselves remain best-effort (see above); see [CONTRACT.md §6](docs/CONTRACT.md#6-唤醒链路与-legion-兼容冻结) for the frozen notification and collection requirements.
+In a legion child session, collect task results before returning a verdict (`async_status` plus `async_logs`; `async_wait` too when `PI_ASYNC_EXPOSE_WAIT=1` exposes it). The settle guard pushes a reminder into the model context before settling (up to 3 times, `custom_message` draft, `continue: true`), and an aborted run with active tasks gets a follow-up reminder on `agent_settled`. In the main session the same boundary produces one **advisory** draft (no forced re-run) saying that stopping with background work is fine, because its completion notification will wake the session. Notifications themselves remain best-effort (see above); see [CONTRACT.md §6](docs/CONTRACT.md#6-唤醒链路与-legion-兼容冻结) for the frozen notification and collection requirements.
 
 ## Known limitations
 
@@ -246,7 +287,10 @@ In a legion child session, collect task results with `async_wait` before returni
   progress (e.g. `/tree` navigation — `interactive-mode.js:4758` → `agent-session.js:1999`). Esc itself
   is a keystroke, so it reaches the hold first and releases it; `void abort()` stays non-blocking.
 - TUI rail and panel are available only in the main TUI session, not in RPC/print/child contexts.
-- `pi --print` notification delivery requires an available configured provider. If no provider is available, end-to-end print-mode verification remains pending a user run.
+- In a print run a task that never finishes ends the process with a non-zero exit code and one stderr
+  line naming the still-running taskIds (see [Headless](#headless-pi--p--the-process-waits-for-the-work)).
+  The host still kills those process groups at shutdown, exactly as before.
+- A `delayed` task is not waited for in print mode: it is pending, not in flight.
 
 ## Development checks
 
@@ -256,6 +300,7 @@ npm test
 npm run verify           # typecheck + test (same gate as prepublishOnly)
 npm run adoption         # adoption report from real session JSONL (last 15 sessions)
 npm pack --dry-run
+scripts/headless-smoke.sh wait   # real `pi -p` + scripted mock endpoint (also: cap, off)
 ```
 
 `npm run adoption` reads `~/.pi/agent/sessions/*/*.jsonl` (`--dir` / `--limit` / `--json` to change scope)
@@ -285,4 +330,6 @@ mounts, and why L3 must not be skipped.
 `pi --print` + background task completing **after** the agent settles: the wake happens but the woken
 run's `turn_end` boundary fails with `Extension error (<boundary>): turn_end could not resolve the persisted assistant entry ID` (pi 1.2.0 core, reproduced identically with pi-background-tasks —
 upstream issue https://github.com/earendil-works/pi/issues/11001). **RPC mode (legion subagents) and
-turn-internal waits are unaffected.**
+turn-internal waits are unaffected.** It is still present on pi 1.5.2 for runs woken by a `followUp`
+(visible on stderr with `PI_ASYNC_PRINT_WAIT=0`); the 0.5.0 headless backstop avoids that path because
+it owns the terminal event and continues in-run.

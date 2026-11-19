@@ -127,6 +127,25 @@ function makeHost(cwd: string) {
     tools,
     ui,
     progressRows,
+    /**
+     * The **hold's own** `agent_before_settle` proposal, in a one-element array (call sites keep the
+     * `const [result] = ...` shape; no proposal → `[]`).
+     *
+     * Selection is by the draft's customType, never by handler position: 0.5.0 registers the headless
+     * (print) wait first and it is inert in a tui session, and the settle guard may append its own
+     * advisory after the hold on the same boundary. Both are other people's proposals — the question
+     * every test in this file asks is what the hold owned.
+     */
+    boundary: async (...args: unknown[]): Promise<BeforeSettleResult[]> => {
+      const results = (await fire("agent_before_settle", ...args)) as Array<BeforeSettleResult | undefined>;
+      const drafts: BeforeSettleResult[] = [];
+      for (const result of results) {
+        if (!result) continue;
+        const entries = result.entries as Array<{ customType?: unknown }>;
+        if (entries.some((entry) => entry?.customType === "async-task-settle-results")) drafts.push(result);
+      }
+      return drafts;
+    },
     pressEscape: () => press?.("\x1b"),
     hasEscapeListener: () => press !== undefined,
     fire,
@@ -157,7 +176,7 @@ function makeHost(cwd: string) {
   };
 }
 
-type Env = "PI_ASYNC_HOLD_MS" | "PI_ASYNC_HOLD_POLL_MS" | "PI_LEGION_NODE_ID" | "PI_ASYNC_SETTLE_GUARD";
+type Env = "PI_ASYNC_HOLD_MS" | "PI_ASYNC_HOLD_POLL_MS" | "PI_LEGION_NODE_ID" | "PI_ASYNC_SETTLE_GUARD" | "PI_ASYNC_EXPOSE_WAIT";
 
 async function withEnv<T>(env: Partial<Record<Env, string | undefined>>, fn: () => T | Promise<T>): Promise<T> {
   const saved = new Map<Env, string | undefined>();
@@ -203,7 +222,7 @@ test("a task that finishes inside the hold is announced exactly once — by the 
       assert.equal(task.status, "running");
 
       // The turn ends while the task runs: the hold waits, the task finishes during the wait.
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
       await host.settle(result);
       // The model answers the entry; then the run has nothing left to do.
       host.endRun();
@@ -240,7 +259,7 @@ test("the folded notification is latched, so a later session_start never re-anno
       }, undefined, undefined, ctx));
       assert.equal(task.status, "running");
 
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
       await host.settle(result);
       host.endRun();
       assert.equal(host.mentions("latch-task").length, 1, "the hold announced it once");
@@ -282,7 +301,7 @@ test("a hold that times out still delivers the notification for the task that fi
       assert.equal(slow.status, "running");
 
       // Budget runs out on the slow task: the hold releases without a results entry.
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
       assert.equal(result, undefined, "a timeout settles exactly as before");
       await host.settle(result);
       host.endRun();
@@ -313,7 +332,7 @@ test("a legion child keeps its own channel: no hold, the completion notification
       }, undefined, undefined, ctx));
       assert.equal(task.status, "running");
 
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, { mode: "tui", ui: { setStatus: () => undefined } })) as BeforeSettleResult[];
       // CONTRACT §7: a legion child never holds — and the guard's reminder path is untouched here.
       assert.equal(result, undefined, "no hold in a legion child");
       await host.settle(result);
@@ -351,7 +370,7 @@ test("Esc during a hold settles it at once — and the notification is still the
       assert.equal(task.status, "running");
 
       const started = performance.now();
-      const pending = host.fire("agent_before_settle", { entries: [] }, settleCtx);
+      const pending = host.boundary({ entries: [] }, settleCtx);
       await new Promise((resolve) => setTimeout(resolve, 250));
       assert.equal(host.hasEscapeListener(), true, "the hold listens for a raw Esc");
       host.pressEscape();
@@ -410,7 +429,8 @@ async function bootHost(cwd: string) {
 
 test("a task already collected with async_wait is never announced again", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-async-consumed-wait-"));
-  await withEnv(CLEAN, async () => {
+  // D4 (0.5.0): `async_wait` is opt-in; this test registers and calls it, so it runs exposed.
+  await withEnv({ ...CLEAN, PI_ASYNC_EXPOSE_WAIT: "1" }, async () => {
     const { host, toolCtx, settleCtx }: { host: Host; toolCtx: Record<string, unknown>; settleCtx: Record<string, unknown> } = await bootHost(cwd);
     try {
       await host.fire("agent_start"); // a run is live: the notification must wait for the boundary
@@ -425,7 +445,7 @@ test("a task already collected with async_wait is never announced again", async 
       const waited = (await host.tools.get("async_wait")!.execute("wait", { taskIds: [task.taskId], timeoutMs: 5000 }, undefined, undefined, toolCtx)) as unknown as { details?: { payload?: unknown } };
       assert.ok(JSON.stringify(waited).includes('"completed"'), "wait handed the terminal state to the model");
 
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, settleCtx)) as BeforeSettleResult[];
       await host.settle(result);
       host.endRun();
 
@@ -455,7 +475,7 @@ test("a terminal row read through async_status or async_logs also counts as told
       await host.tools.get("async_status")!.execute("status", { includeHistory: true }, undefined, undefined, toolCtx);
       await host.tools.get("async_logs")!.execute("logs", { taskId: viaLogs.taskId }, undefined, undefined, toolCtx);
 
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, settleCtx)) as BeforeSettleResult[];
       await host.settle(result);
       host.endRun();
 
@@ -483,13 +503,13 @@ test("a task nobody collected is still announced once — at the settle boundary
       }, undefined, undefined, toolCtx));
       await new Promise((resolve) => setTimeout(resolve, 250));
 
-      const [first] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
+      const [first] = (await host.boundary({ entries: [] }, settleCtx)) as BeforeSettleResult[];
       assert.equal(host.queued(), 1, "the boundary decides: exactly one notification is queued");
       assert.equal(host.steerQueue.length, 1, "the settle boundary is inside a live run, so the host gets a steer");
       await host.settle(first);
 
       // A second boundary in the same run must not announce it again.
-      const [second] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
+      const [second] = (await host.boundary({ entries: [] }, settleCtx)) as BeforeSettleResult[];
       await host.settle(second);
       host.endRun();
 
@@ -581,7 +601,7 @@ test("one terminal event never produces two notifications across turn_end, settl
 
       await host.turnEnd();                       // first boundary: the one legitimate send
       await host.turnEnd();                       // the run keeps working: nothing left to decide
-      const [result] = (await host.fire("agent_before_settle", { entries: [] }, settleCtx)) as BeforeSettleResult[];
+      const [result] = (await host.boundary({ entries: [] }, settleCtx)) as BeforeSettleResult[];
       await host.settle(result);
       await host.fire("session_start", { type: "session_start" }, settleCtx); // resendUnnotified replay
       host.endRun();

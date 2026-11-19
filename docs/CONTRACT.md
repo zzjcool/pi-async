@@ -5,7 +5,7 @@
 
 ## 0. 定位与范围
 
-pi-async 是 pi 的异步任务运行时扩展：任务注册表 + 三种任务模式（background / delayed / sync）+
+pi-async 是 pi 的异步任务运行时扩展：任务注册表 + 两种任务模式（background / delayed；`sync` 已由 REV-29 删除）+
 完成唤醒 + 主会话 TUI（轨道图 + 百分比尺寸面板）。OSC 7501 busy 对齐（zzjcool/pi-legion#156）只保留
 `ui.setActivity` feature-detect shim：官方 pi 1.2–1.5 都没有该 API，因此不构成能力承诺（见 §7）。
 
@@ -37,7 +37,7 @@ pi-async/
 │   │   ├── nudges.ts       # 情境注入：bash 长命令事后教学 / <async-state> 行（REV-21）
 │   │   └── resources.ts    # resources_discover：把随包 skill 注册给宿主（REV-22）
 │   ├── tools/
-│   │   └── index.ts        # 6 个工具的注册与 schema
+│   │   └── index.ts        # 默认 5 个工具（+ 可选 async_wait）的注册与 schema（REV-29）
 │   ├── tui/
 │   │   ├── rail.ts         # 任务轨道图 widget（≤4 行，含汇总行）
 │   │   ├── panel.ts        # 百分比尺寸面板（列表+详情）
@@ -85,15 +85,12 @@ pending --(delay 到期/spawn 成功)--> running --┬-- exit 0 --> completed
 async_run({
   command: string,                    // 必填
   name?: string,                      // 展示名；缺省从 command 派生（≤48 chars）
-  mode: "background" | "sync" | "delayed",   // 默认 background
+  mode: "background" | "delayed",     // 默认 background（REV-29 删除 sync）
   // ── delayed ──
-  delayMs?: number,                   // mode=delayed 必填；pending 到期启动
-  // ── sync ──
-  timeoutMs: number,                  // mode=sync 必填（execute 运行时强制，非 schema：required 只有 ["command"]）；
-                                      // 上界 PI_ASYNC_MAX_SYNC_TIMEOUT_MS（默认 600000，schema maximum + 运行时校验）
-                                      // 到点：onTimeout="promote" → 转 background 继续；
-                                      // onTimeout="abort" → Esc 语义，等待中断任务保留
-  onTimeout?: "promote" | "abort",    // 默认 promote
+  delayMs?: number,                   // mode=delayed 必填；pending 到期启动；其他模式传它报错
+  // ── 已删除（REV-29）──
+  // timeoutMs / onTimeout：sync 专用旋钮随 mode=sync 一并删除；additionalProperties:false 因此
+  // 让宿主直接拒绝这两个字段（不再有「传给错误模式」的运行期校验分支）
   // ── 通用 ──
   taskTimeoutMs?: number,             // 任务自身寿命；缺省 = 无限；无任何模式/组合强制（watch 也不要求它）
   notifyOnCompletion?: boolean,       // 默认 true
@@ -107,19 +104,21 @@ async_run({
   `TaskSnapshot.cwd` 持久化；delayed 任务保留提交时 cwd；reload 后按持久化 cwd 恢复。缺省回退
   `process.cwd()`。
 
-**返回（receipt）**：`{ taskId, name, status, mode, outputHint }`；sync 模式返回
-`{ ...receipt, exitCode?, outputTail, promoted }`。`promoted: true` = sync 等待超时且任务已转
-background 继续跑（`status: "running"`）；`false` = 正常结束或 `abort` 超时。**sync 超时（promote/abort）
-不是工具错误**（REV-19）：`isError` 只在任务真的以非 0 状态结束时为 true。所有任务**同步启动**：spawn 成功即返回 `running`；
+**返回（receipt）**：`{ taskId, name, status, mode, outputHint }`。`async_run` 不再有阻塞返回形态
+（sync 的 `{ ...receipt, exitCode?, outputTail, promoted }` 随 REV-29 删除）；需要「现在就拿到结果」时，
+`PI_ASYNC_EXPOSE_WAIT=1` 暴露的 `async_wait`（§5）是唯一的阻塞原语，否则用 `async_logs` / 完成通知收割。
+所有任务**同步启动**：spawn 成功即返回 `running`；
 spawn 失败立即抛错，无重试等待。admission 检查为 closed / `suspend()` 之后（见 §19 的两条可操作文案）/ maxTasks / 空命令，均同步完成。
 shutdown 先 drain 再退出。
 （**REV-6 裁决**：原「≤30s admission 预检」从未实现且与同步 spawn 设计冲突，改为描述现状；见 #29。）
 
-**工具集（6 个）**：`async_run` / `async_wait` / `async_logs` / `async_status` / `async_kill` / `async_extend`（REV-23，§18）。
+**工具集（默认 5 个 + 可选 1 个，REV-29）**：`async_run` / `async_logs` / `async_status` / `async_kill` /
+`async_extend`（REV-23，§18），外加仅在 `PI_ASYNC_EXPOSE_WAIT=1` 时注册的 `async_wait`。
 命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。
 
-**可发现性面（REV-20/21/22/27）**：6 个工具各带一条 `promptSnippet`（逐字见 §17），`async_run` 另带 4 条
-`promptGuidelines`（0.4.1 起含批次规划，§21.2）；check 纪律不再拼进 description，移入随包分发的 skill（§17 REV-22）。
+**可发现性面（REV-20/21/22/27/29）**：每个已注册工具各带一条 `promptSnippet`（逐字见 §17；默认 5 条，
+暴露 `async_wait` 时 6 条），`async_run` 另带 4 条 `promptGuidelines`（0.4.1 起含批次规划，§21.2；未暴露
+`async_wait` 时追加第 5 条说明并指向 `async_logs`）；check 纪律不再拼进 description，移入随包分发的 skill（§17 REV-22）。
 运行时另有两条情境注入：`bash` 长命令返回后追加一行 `tool_result` 建议，以及每次请求前（有活跃任务时）
 一行 `<async-state>`。两者都 best-effort，`PI_ASYNC_NUDGE=0` 关闭。
 
@@ -183,6 +182,12 @@ type Condition =
 
 ## 5. async_wait（唤醒原语，冻结）
 
+**注册面（REV-29，0.5.0）**：`async_wait` **默认不注册**；只有宿主设置 `PI_ASYNC_EXPOSE_WAIT=1` 时才进
+工具面（默认 5 个，暴露后 6 个）。开关**每次调用重新读 env**（不在模块顶层缓存）。旧会话/旧注册若仍调到它，
+execute **不 throw**，返回 `toolResult({ taskId: null, available: false, error: <原因+开启方式>,
+enableWith: "PI_ASYNC_EXPOSE_WAIT=1", alternatives: ["async_status","async_logs"] }, true)`（isError=true，
+正常 resolve）；宿主对「未注册名字」的回包是 `Tool async_wait not found`。
+
 ```ts
 async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（schema enforce）；
 // taskIds 元素可为 taskId 或 name（REV-15）；重名报错并列出候选 id，未知 id/name 报错
@@ -239,8 +244,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - `agent_before_settle`（所有会话注册，REV-21）且存在未终态任务：
   - **legion child**（`PI_LEGION_NODE_ID` 存在）：
     - `reminders < maxReminders`（默认 3）→ 返回 `{ entries: [...event.entries, custom_message],
-      continue: true }`，提醒内容为「N 个异步任务未收割（taskId 列表），先 async_wait/async_status
-      处理再报 verdict」；**每 run 重新武装，累计 ≤3 次**。
+      continue: true }`，提醒内容为「N 个异步任务未收割（taskId 列表），先 async_status 或 async_logs
+      （暴露 async_wait 时含它）处理再报 verdict」（REV-29）；**每 run 重新武装，累计 ≤3 次**。
     - `custom_message` 形状（D-12，0.3.0）：`{ type: "custom_message",
       customType: "async-task-settle-reminder", content: "...", display: false }`。**不得用
       `appendEntry`**：custom entry 不进 LLM 上下文，模型看不到提醒。
@@ -251,7 +256,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     **永不带 `continue`**（主会话带着后台任务结束 turn 是合法行为，不得被强制重跑）。文案见 §17。
 - `agent_settled` 兜底（D-13，0.3.0）：对所有会话注册；`event.aborted === true` 且 registry 有活跃
   任务 → `pi.sendMessage({ customType: "async-task-unresolved", content: "<一句话 + 活跃任务 id 列表
-  + 用 async_wait/async_status 收尸>" }, { deliverAs: "followUp" })`；**不设 `triggerTurn`**，
+  + 用 async_status/async_logs（暴露 async_wait 时含它）收尸>" }, { deliverAs: "followUp" })`；**不设 `triggerTurn`**，
   每 generation 最多 1 条（`agent_start` 重置）。理由：pi 1.5 的 aborted run 会跳过
   `agent_before_settle`，Esc 中断场景需要单独覆盖。
 - 开关：`PI_ASYNC_SETTLE_GUARD=0` → 整个守卫不注册任何 handler。`dispose()` 幂等，退订所有 handler。
@@ -276,7 +281,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - 条件：存在 holdable 任务——`status === "running"` + `notifyOnCompletion !== false` +
   `triggerOnCompletion !== false`（`pending`/delayed 任务不 hold：预算内不可能终态）。
   仅在交互 TUI 会话 hold（`ctx.mode === "tui"` 或 ctx 缺失）；军团 child（`PI_LEGION_NODE_ID` 存在）、
-  `print`/`json`/`rpc` 都不 hold。
+  `print`/`json`/`rpc` 都不 hold。**print 会话由另一条结构性保底负责（§23 REV-30），不是 hold**：
+  它不需要唤醒型任务的过滤，也没有 TUI 表面。
 - 行为：在边界内轮询等待（`PI_ASYNC_HOLD_POLL_MS`，默认 1000ms），直到快照内的 holdable 任务全部
   终态或到达 `PI_ASYNC_HOLD_MS`（默认 600000ms，单调时钟计时）。
 - **出口（修订 4，0.4.3）**：0.4.2 的两条（全终态 / 预算耗尽）加上三条「让位于用户」的出口 ——
@@ -458,9 +464,9 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   返回（不叠加 overlay、也不主动 re-render）；面板刷新 = `registry.subscribe` 事件驱动 **+ 面板自有
   1Hz ticker**（§21.1），`dispose()` 退订并清 timer；详情帧保留 header + footer 键位提示
   （超预算时保留最后 N 行并插 `… (+K lines)`）。
-- **rail 不按 mode 过滤**：`mode=sync` 同样注册成真实任务，因此在前台等待期间也出现在 rail 并计入
-  running（`promoted` 后 mode 翻成 background，条目不变）；任务行只渲染 `name · state · elapsed`，
-  不显示 mode，仅用配色区分（见上方任务行格式）。这是设计而非缺陷：sync 期间确实有一个受管进程在跑。
+- **rail 不按 mode 过滤**：background 与 delayed 都注册成真实任务，delayed 的 pending 期与到期后的
+  running 期都出现在 rail（REV-29：sync 已删除，rail 配色槽位不变 —— background=0 / delayed=2）；
+  任务行只渲染 `name · state · elapsed`，不显示 mode，仅用配色区分（见上方任务行格式）。
 - **running 任务在列表直接显示最新输出行**（footer pill 模式，ANSI 剥离）——设备码场景用户无需
   agent 中转即可看到输出。
 - **早期输出 peek**：`async_logs` 对 running 任务即时可读；`async_run` 返回的 receipt 带
@@ -476,7 +482,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   - **硬顶 8 MiB（`MAX_LOG_WINDOW`）**：`maxBytes` 一律先夹到 `min(请求值, 8 MiB)` 再读，防误传超大窗口
     导致无界分配；模型侧默认窗口仍是 50 KiB。
 - ANSI/CSI/OSC 剥离：`async_logs` 返回与 TUI 显示前必须剥离（安全项，防输出注入转义序列）。
-- sync 返回 outputTail ≤ 8 KiB / 200 行（whichever first）。
+- ~~sync 返回 outputTail ≤ 8 KiB / 200 行~~（REV-29 删除：`async_run` 不再返回 outputTail；读取窗口统一走
+  `async_logs`，默认 50 KiB / 走 §9 的 8 MiB 硬顶）。
 
 ## 10. 杀伤与清理（冻结）
 
@@ -561,13 +568,17 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 |---|---|---|
 | `PI_ASYNC_MAX_OUTPUT_BYTES` | 20 MiB（`20971520`） | 写盘 cap；超限 → kill(kind=output_cap) → failed |
 | `PI_ASYNC_MAX_TASKS` | `32` | 注册表上限（running + pending），超了拒绝新任务 |
-| `PI_ASYNC_MAX_SYNC_TIMEOUT_MS` | `600000`（10 分钟） | `sync.timeoutMs` 上界（schema `maximum` + 运行时校验） |
+| `PI_ASYNC_EXPOSE_WAIT` | 关闭（未设） | `1` → 额外注册 `async_wait`（默认 5 个工具，暴露后 6 个；REV-29）。每次调用重新读 env |
 | `PI_ASYNC_ENV_INHERIT` | `safe` | 子进程 env 策略：`safe` 剥离敏感键（含 `npm_config_*` 中带 auth/token/password 的键）并拒绝危险显式键；`all` 恢复完整继承（显式危险键覆盖**在任何策略下仍被拒绝**）；`none` 只给 `PATH`/`HOME`/`SHELL`/`TERM`/`LANG`/`LC_*`/`TMPDIR`/`USER`（存在的）。未知值按 `safe` 处理 |
 | `PI_ASYNC_SETTLE_GUARD` | 开启（未设） | `0` → 守卫不注册任何 handler |
 | `PI_ASYNC_NUDGE` | 开启（未设） | `0` → 不注册 `tool_result` / `context`(+"_with_system") 情境钩子（REV-21） |
 | `PI_ASYNC_HOLD` | 开启（未设） | `0` → settle hold 关闭，一个 handler 都不注册（D-14） |
 | `PI_ASYNC_HOLD_MS` | `600_000`（10 分钟） | 单次 hold 上限（单调时钟计时）；**≤ 0 关闭**（负数不会回退到默认值） |
 | `PI_ASYNC_HOLD_POLL_MS` | `1_000` | hold 期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
+| `PI_ASYNC_PRINT_WAIT` | 开启（未设） | `0` → headless（`pi -p`）保底关闭，一个 handler 都不注册，回到 0.4.x「进程可以带着未完成任务退出」（REV-30） |
+| `PI_ASYNC_PRINT_WAIT_MS` | `600_000`（10 分钟） | print 会话等待的整体预算（单调时钟，从第一次真正等待开始，跨回合累计，不重置；**回合之间的 provider 时间也计入**）；用尽 → 打印仍在跑的任务并 `exitCode=1` |
+| `PI_ASYNC_PRINT_POLL_MS` | `500` | print 会话等待期间轮询 `registry.list` 的间隔（低于 50 回退默认） |
+| `PI_ASYNC_PRINT_MAX_CONTINUATIONS` | `5` | print 保底允许消耗的强制续跑次数（整个进程累计，宿主不提供上限，见 REV-30）；**`0` = 从第一个边界起就限流**（有 running 任务即打印并退 1） |
 | `PI_ASYNC_FOOTER` | 关闭（未设） | `1` 且宿主 `ui.setStatus` 存在时额外渲染一行 footer 汇总；rail 首行仍是默认状态面 |
 | `PI_ASYNC_RETENTION_MS` | `604_800_000`（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
@@ -615,7 +626,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | # | 决策 |
 |---|---|
 | D1 | 不做子 agent 委派（delegate/attested/Fusion），只做 shell 任务运行时 |
-| D2 | sync 模式 timeout 必填，默认 promote 而非报错（逃生口，对齐社区惯例） |
+| D2 | ~~sync 模式 timeout 必填，默认 promote 而非报错~~ **REV-29 删除**：`mode=sync` 与 `timeoutMs`/`onTimeout` 一并移除；阻塞收割改由可选的 `async_wait`（`PI_ASYNC_EXPOSE_WAIT=1`）承担 |
 | D3 | async_wait timeout 必填；返回 notReady 不杀任务 |
 | D4 | success_when 命中不杀进程（completed 是观察结论，进程归 taskTimeout/kill 管理） |
 | D5 | 通知 completed 纯信息；failed 与 `killed`+`killKind=timeout` 带 guidance；outputConsumed 闩防 chatter（REV-21 修订） |
@@ -631,10 +642,11 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 
 1. `npm run verify` 全绿（= `npm run typecheck` && `npm test`），且 `npm pack --dry-run` 包含
    `extensions/`、`src/`、`README.md`、`LICENSE`、`docs/CONTRACT.md`、`CHANGELOG.md`
-2. background 任务：启动→立即 receipt→完成通知唤醒（print/RPC 模式实测：`pi --print` 会话收到
-   `<async-task-notification>` 并继续 turn）
-3. sync：短命令阻塞返回 exitCode；长命令 timeoutMs 到点 promote 转 background，任务不死；promote/abort
-   等待超时不算工具错误（REV-19）
+2. background 任务：启动→立即 receipt→完成通知唤醒（RPC 模式实测；**print 模式改为 §23 REV-30 的
+   结构性保底**：`scripts/headless-smoke.sh wait` 断言任务完成后模型被再次唤醒且其结论进入 stdout）
+3. ~~sync：短命令阻塞返回 exitCode；长命令 timeoutMs 到点 promote 转 background~~ **REV-29 删除**：
+   验收改为「`mode=sync` 被 execute 白名单拒绝（`Unsupported async_run mode: sync`），schema 不再含
+   `timeoutMs`/`onTimeout`」（`tests/k-toolsurface.test.ts`、`tests/w2-safety.test.ts`）
 4. delayed：delayMs 后启动；pending 期 cancel；reload 后恢复
 5. watch：stdout_contains/output_matches 命中 completed（含多行上 `^READY$` 因 m 命中）；
    failure_when 命中 killed(watch_failure)；非法 regex 启动前拒绝
@@ -689,7 +701,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - **原因**：模型按 name 调用会报 `Unknown task id(s)`；`async_kill` 未知 id 静默成功；非 sync 传
   `onTimeout` 被静默忽略；sync 非 0 退出不带 `isError`；`async_status` 无过滤（P1-1）。
 - **影响面**：`registry.resolveTaskId(idOrName)`（重名报错并列候选 id）；`async_wait`/`async_logs`/
-  `async_kill` 接受 name；未知 id/name → `Unknown task or name: ...` + `isError`；非 sync 传 `onTimeout` → throw；
+  `async_kill` 接受 name；未知 id/name → `Unknown task or name: ...` + `isError`；~~非 sync 传 `onTimeout` → throw~~（REV-29 删除）；
   sync 以非 0 状态**真的结束**时 → `isError:true`（详情见 REV-19；payload 保留完整 `SyncResult`）；`async_status` 新增
   `status` / `name` / `limit`（1–50，默认 50），`includeHistory` 与显式 `status` 按
   `(finishedAt ?? createdAt)` 降序；`delayedEnv` 值打码为 `***`。
@@ -747,18 +759,20 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   background；`abort` 超时返回 `promoted:false` + `status:"running"`。
 - **回退开关**：无（只是把错误面收窄回 PLAN 口径）；调用方若要「超时即失败」的语义，改看
   `promoted` / `status` 自行判定。
+- **REV-29 删除**：整条随 `mode=sync` 一起作废（`runSync` / `SyncResult` / `promoted` 均已不存在）。
 
 ## 17. 0.3.1 可发现性修订（REV-20 … REV-22）
 
 基线 `main @ 5d77350`（0.3.0）。计划文档：`docs/PLAN-CONTEXT.md`。本节取代 0.3.0 的 D-17
 （「只有 async_run 带 snippet」）与 D5 的「仅 failed 带 guidance」。
 
-### REV-20（6 个工具全部进系统提示；0.4.0 增补 `async_extend`，见 §18）
+### REV-20（工具全部进系统提示；0.4.0 增补 `async_extend`，见 §18；REV-29 改为默认 5 个 + 可选 `async_wait`）
 
 - **原因**：宿主只把带 `promptSnippet` 的工具列进系统提示的 Available tools 段（pi 1.5.0
   `dist/core/system-prompt.js:84-85`）。0.3.0 只给 `async_run` 挂了 snippet，`async_wait` /
   `async_logs` / `async_status` / `async_kill` 在模型主视觉区缺席，且该不对称被测试冻结。
-- **影响面**：6 个工具各带一条 snippet（逐字）：
+- **影响面**：**默认 5 个工具**（`async_run` / `async_logs` / `async_status` / `async_kill` / `async_extend`）
+  各带一条 snippet（逐字）；`PI_ASYNC_EXPOSE_WAIT=1` 时第 6 个 `async_wait` 也带同一条（REV-29）：
   - `async_run`：`Run a long or gating shell command detached (build/test over a minute, server, watcher); returns a taskId, not output.`
   - `async_wait`：`Block until async tasks finish or the budget expires; results land in context. Never kills.`
   - `async_logs`：`Read the bounded, ANSI-stripped output of an async task, including while it is still running.`
@@ -766,13 +780,16 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   - `async_kill`：`Stop an async task and its whole process group.`
   - `async_extend`：`Renew a running task: move its reminder and/or hard-timeout deadline. Never kills; use async_kill to stop.`
 - `async_run.description` 收缩为两句：
-  `Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.`
-  check 纪律从 description 移除（见 REV-22）；模式/超时语义下沉到字段级 description。
+  `Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=delayed starts after delayMs.`
+  （REV-29 删除 sync 半句。）check 纪律从 description 移除（见 REV-22）；模式语义下沉到字段级 description。
 - `promptGuidelines`（逐字；0.3.0 为 3 条，0.4.1 起第 4 条见 §21.2，区分主会话与 child）：
   1. `Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.`
   2. `Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.`
   3. `Pass name so later calls address the task by name, and read output with async_logs (works while running) instead of re-running the command.`
   4. （0.4.1 / REV-27，§21.2）`Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.`
+  5. （REV-29，仅 `!waitToolExposed()` 时追加）`async_wait is not available in this session (set PI_ASYNC_EXPOSE_WAIT=1 to expose it); end the turn and the completion notification wakes you, and read output with async_logs.`
+- 前 4 条顺序/内容**逐字冻结**（`tests/d-tool-contract.test.ts` 逐字 pin）；第 5 条是暴露态的纯追加，
+  暴露时不出现。
 - **回退开关**：无（文案是产品面，不是行为开关）。
 
 ### REV-21（情境注入：bash 事后教学 / 活跃状态行 / 主会话 settle 建议 / timeout guidance）
@@ -783,7 +800,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   - `tool_result`（仅 `toolName === "bash"`）：`wall_time_seconds >= 60` 或命令匹配
     `/\btail\s+-[fF]\b|\buntil\s|\bwatch\s+\S|\bsleep\s+\d{2,}/` 时，在 content 末尾追加一行（保留
     `structuredContent`）：
-    `(took {N}s in the foreground; async_run could have run it in the background — use mode=background with watch for servers/builds, or mode=sync with timeoutMs when you need the result soon)`
+    `(took {N}s in the foreground; async_run could have run it in the background — use mode=background with watch for servers/builds; end the turn and the completion notification wakes you)`
+    （REV-29：`mode=sync` 半句删除，见 §22。）
     （无 wall time 时删掉 `took {N}s in the foreground; `）。`structuredContent.wall_time_seconds` 缺失时，
     用 `tool_execution_start` 记录的起点计算耗时（`tool_result` 在 `afterToolCall` 内触发，早于
     `tool_execution_end`，此时 `durationMs` 尚不可用）；`tool_execution_end` 负责清理残留条目。
@@ -794,24 +812,37 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     默认最多 5 项；空闲时返回 `undefined`（零 token）；任务集合或状态不变时不重复注入；`agent_start` 重新武装。
     `tail` 按**真实的每任务通知开关**选择（`notifyOnCompletion === false` 或 `triggerOnCompletion === false`
     的任务标 `no-notify`）：
-    - 全部会通知：`— end the turn and the completion notification wakes you, or call async_wait if you need one now.`
-    - 混合：`— end the turn and let notifications wake you where enabled, or call async_wait for the rest.`
-    - 全部不会通知：`— none of these will notify you; collect them with async_wait before you need the result.`
+    - 全部会通知：`— end the turn and the completion notification wakes you.`（REV-29 默认；
+      暴露 `async_wait` 时追加 `, or call async_wait if you need one now.`）
+    - 混合：`— end the turn and let notifications wake you where enabled; read the rest with async_logs.`
+      （暴露时为 `… or call async_wait for the rest.`）
+    - 全部不会通知：`— none of these will notify you; collect them with async_logs before you need the result.`
+      （暴露时为 `collect them with async_wait …`）
     理由是 0.3.0 的核心不变量：不得用全局断言陈述 per-task 事实。
+  - **REV-29 前的原始文案（回滚时逐字还原用）**：全唤醒
+    `— end the turn and the completion notification wakes you, or call async_wait if you need one now.`；
+    混合 `— end the turn and let notifications wake you where enabled, or call async_wait for the rest.`；
+    全不唤醒 `— none of these will notify you; collect them with async_wait before you need the result.`；
+    bash nudge 尾巴 `, or mode=sync with timeoutMs when you need the result soon)`。
+    REV-29 只改「默认（未暴露 `async_wait`）」这一路的措辞，暴露态仍用上面四句原样。
   - `async_run` receipt（REV-21，修正版 D-C5）：通用规则只在系统提示/`<async-state>` 里讲一次；
     receipt 只承载**例外**。`notifyOnCompletion: false` → `willNotify: false` + `outputHint`
     `Notifications are off for this task; collect it with async_wait or async_logs.`；
     `triggerOnCompletion: false` → `willWake: false` + `outputHint`
     `This task will notify but will not start a new turn; collect it with async_wait if you need the result now.`；
-    默认情况不新增字段（不重复计费）。sync 被 promote 的任务同样适用。
+    默认情况不新增字段（不重复计费）。**REV-29**：`!waitToolExposed()` 时这两条 hint 的 `async_wait` 半句
+    改为 `async_logs`（`… collect it with async_logs.` / `… collect it with async_logs if you need the result now.`）。
   - 主会话 `agent_before_settle`（见 §7）：`async-task-settle-advisory`，**全部任务都会唤醒会话**时文案为
-    `{n} async task(s) still running: {ids}. If this answer does not need them, stop here — their completion notifications will wake you. Otherwise collect them with async_wait.`
+    `{n} async task(s) still running: {ids}. If this answer does not need them, stop here — their completion notifications will wake you.`
+    （**REV-29** 默认；暴露 `async_wait` 时追加 ` Otherwise collect them with async_wait.`）
     每 generation 最多 1 条，**不带 `continue`**。
     **修订 1（0.4.3）**：「会唤醒」= `running` + `notifyOnCompletion !== false` + `triggerOnCompletion !== false`
     （与 hold 的 holdable 同一判定）。混合时改用
-    `{n} async task(s) still running: {ids}. {w} of them will wake you when they finish; collect the other {n-w} with async_wait if you need them now.`；
+    `{n} async task(s) still running: {ids}. {w} of them will wake you when they finish; collect the other {n-w} with async_logs if you need them now.`
+    （**REV-29** 默认；暴露 `async_wait` 时为 `with async_wait`）；
     一个都不会唤醒时改用
-    `{n} async task(s) still running: {ids}. None of them will start a new turn; collect them with async_wait if you need one now.`
+    `{n} async task(s) still running: {ids}. None of them will start a new turn; collect them with async_logs if you need one now.`
+    （暴露时为 `with async_wait`）
     —— 不得用整句笼统断言「通知会唤醒你」（§13 的 per-task 事实原则）。
   - timeout 通知：`killKind === "timeout"` 时 guidance 为
     `Killed at taskTimeoutMs. Rerun with a larger taskTimeoutMs, or watch for a success_when condition instead of a hard deadline.`
@@ -1151,3 +1182,155 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - `custom()` 在工厂执行后 reject 时 ticker 与订阅都被清（R2-2）。
 - 4 条 guideline 逐字冻结（`tests/d-tool-contract.test.ts`）；skill 两节存在且顺序正确
   （`tests/e-skill.test.ts`）。
+
+## 22. 0.5.0 工具面收窄 / async_wait 默认不注册 / 文案（REV-29，冻结）
+
+基线 `feat/notify-first`（0.4.7）。三条决策 D3 / D4 / D6 一并落地；**sync 不留兼容层**。
+
+### 22.1 删除 `mode=sync`（D3）
+
+- **原因**：阻塞形态与「完成通知唤醒」是两条互相打架的收割路径，模型为「马上就要结果」去坐等
+  `mode=sync`，正是 0.4.x 想消灭的模式；`timeoutMs`/`onTimeout` 两个旋钮只为它存在。真需要阻塞时，
+  可选的 `async_wait`（§22.2）是唯一原语。
+- **影响面**：
+  - `TaskMode = "background" | "delayed"`（`src/core/task.ts`）；`RunOptions.timeoutMs` /
+    `RunOptions.onTimeout` / `SyncResult` 接口删除（`RunReceipt` 保留）。
+  - `TaskRegistry.runSync()` 与私有 `syncResult()` 删除；`createAndStart(opts)` 收窄为只建 background；
+    `validateRunWatch(opts)` 不再有 sync 拒绝分支（watch 对 background/delayed 都合法）。`submit` 的
+    `opts.mode !== "background"` 白名单与文案 `submit only accepts background mode` **不变**。
+  - `async_run` schema：`mode.enum = ["background","delayed"]`；`timeoutMs` / `onTimeout` 字段、默认上界
+    常量、`resolveMaxSyncTimeoutMs()`、`PI_ASYNC_MAX_SYNC_TIMEOUT_MS` 读取全部删除。`additionalProperties:
+    false` 使宿主直接拒绝这两个参数（不再是运行期「只对 sync 有效」的校验）。
+  - `execute` 保留：mode 白名单（`Unsupported async_run mode: sync`）、`delayMs` 在 delayed 必填、
+    非 delayed 传 `delayMs` 报错。`async_run.description` 与 `mode` 字段描述见 §17。
+  - TUI 配色：`src/tui/rail.ts` 的 `typeColor()` 改为 `mode === "delayed" ? 2 : 0`，**TYPE_TOKENS 槽位
+    与既有 rail 颜色测试完全不变**。升级时从磁盘恢复的 0.4.x 快照若仍是 `mode: "sync"`（`reloadFromDisk`
+    只校验 `status`），它按 background 取色（slot 0）——纯外观、不崩、不越界；此后不会再产生这类快照。
+  - 承载该 API 的四个文件（`src/core/task.ts` / `src/core/registry.ts` / `src/tools/index.ts` /
+    `src/tui/rail.ts`）不得再出现 `runSync` / `SyncResult` / `onTimeout` / `PI_ASYNC_MAX_SYNC_TIMEOUT_MS`，
+    也不得出现词边界 `sync`（`async` 含该子串，审计必须用 `\bsync\b`）；`src/context/nudges.ts` 另按
+    词边界 `sync` 审计（它只承载过用户文案）。`src/guard/settle-guard.ts` 的 2026-10-21 事故注释里
+    合法保留 `Timeout._onTimeout`（与 sync 无关，故不进 API 名审计）；
+    `src/guard/hold.ts` 的英文注释 `Keep in sync with` 与 `src/core/notify.ts` 的 `Sync throw` 同样与
+    sync 模式无关，属可接受残留。
+- **回退开关**：无（无兼容层）。
+
+### 22.2 `async_wait` 默认不注册（D4）
+
+- **原因**：默认路径是「结束 turn，完成通知唤醒」。把阻塞原语摆在默认工具面里，模型就会用它替代通知；
+  而宿主对未注册工具的调用本身是安全的，所以缺省不注册 + 可读降级即可。
+- **影响面**：
+  - `src/tools/index.ts` 导出 `WAIT_TOOL = "async_wait"`、`waitToolExposed()`（**每次调用读
+    `process.env.PI_ASYNC_EXPOSE_WAIT === "1"`，不在模块顶层缓存**）、`WAIT_UNAVAILABLE`。
+  - `registerTools` 里 `async_wait` 的注册整体包在 `if (waitToolExposed())` 内：默认（含 headless）
+    工具面 5 个（`async_run`/`async_logs`/`async_status`/`async_kill`/`async_extend`），暴露后 6 个。
+  - 优雅降级：`async_wait.execute` 开头有调用时闸门。`!waitToolExposed()` 时**不 throw**，直接返回
+    `toolResult({ taskId: null, available: false, error: WAIT_UNAVAILABLE, enableWith: "PI_ASYNC_EXPOSE_WAIT=1",
+    alternatives: ["async_status","async_logs"] }, true)`（`isError: true`，正常 resolve）。覆盖「旧会话 /
+    旧注册仍调到它」；宿主对**未注册**名字的回包仍是 `Tool async_wait not found`（不崩）。
+  - 文案不得劝模型调用未暴露的工具：`notificationException()` 两条 hint 与 `ASYNC_RUN_PROMPT_GUIDELINES`
+    用 `waitMention(exposed, otherwise)` / 追加式第 5 条实现（§17）。
+- **回退开关**：`PI_ASYNC_EXPOSE_WAIT=1`（暴露 `async_wait`，措辞同步回到 async_wait 版本）。
+
+### 22.3 文案（D6）
+
+- `src/context/nudges.ts`：`bashNudge` 删除 `or mode=sync with timeoutMs when you need the result soon`，
+  默认文案为 `({took Ns in the foreground; }async_run could have run it in the background — use
+  mode=background with watch for servers/builds; end the turn and the completion notification wakes you)`。
+- `<async-state>` 三条 tail（全唤醒 / 混合 / 全不唤醒）在 `!waitToolExposed()` 时不出现 `async_wait`，
+  分别落到 `… wakes you.` / `… read the rest with async_logs.` / `… collect them with async_logs …`；
+  暴露时保持原措辞。**保留**「按 per-task 事实分三态」不变量与既有护栏
+  （全不通知分支不得出现 `wakes you`，全唤醒分支不得出现 `no-notify`）。
+- `src/guard/settle-guard.ts` 的 advisory / unresolved / reminder / aborted 文案同理：
+  `!waitToolExposed()` 用 `async_status` + `async_logs`，暴露时才出现 `async_wait`。
+- 任何默认路径生成的 `<async-state>` / nudge / advisory **不得**包含 `async_wait`。
+- `skills/async-tasks/SKILL.md`：删掉 sync 描述，`async_wait` 改为「默认不存在，只有宿主设置
+  `PI_ASYNC_EXPOSE_WAIT=1` 时才暴露；默认做法是结束回合等完成通知」；`## When not to use async` 与
+  `## Plan the batch first` 逐行更新（不再依赖 `async_wait`，也不再有 `mode=sync` 行）。
+
+### 22.4 验收清单（REV-29）
+
+- `tests/k-toolsurface.test.ts`（新增）：默认 5 个工具名 `deepEqual`；`PI_ASYNC_EXPOSE_WAIT=1` 时 6 个；
+  暴露态注册后关掉开关 → `async_wait.execute` resolve、`details.payload.available === false`、
+  文本含 `not available in this configuration` 与 `PI_ASYNC_EXPOSE_WAIT=1`、`isError === true`；
+  `task.ts`/`registry.ts`/`tools/index.ts`/`rail.ts` 源码无 `runSync|SyncResult|onTimeout|
+  PI_ASYNC_MAX_SYNC_TIMEOUT_MS`、无词边界 `sync`、无 `mode … sync`；`async_run` schema 的
+  `mode.enum` 与 `timeoutMs`/`onTimeout` 缺席。
+- `tests/e-nudges.test.ts`：默认真实 `registerNudges` + `context_with_system` 生成的 `<async-state>`
+  不含 `async_wait`；三态默认 tail 文案；`bashNudge` 不含词边界 `sync` / `async_wait`；暴露时全唤醒分支
+  含 `async_wait`。
+- `tests/d-settle.test.ts` / `tests/a-settle-guard.test.ts`：默认提醒/advisory 用 `async_status` +
+  `async_logs`；新增「暴露态保留 async_wait 措辞」用例。
+- 删除 `tests/b-sync-mode.test.ts`（delayed 断言迁入 `tests/b-delayed.test.ts`）；`tests/w2-safety.test.ts`
+  的 `syncResult` UTF-8 用例删除（#17 仍由同文件 `truncateUtf8Bytes` 用例覆盖）；`tests/f-reminder.test.ts`
+  的工具面断言改为默认 5 个 + §17 的 5+1 口径。
+
+## 23. 0.5.0 headless 保底：`pi -p` 不得带着未完成任务退出（REV-30，冻结）
+
+### 23.1 事故面
+
+`pi -p` 是「一个 prompt 进、一条 assistant 回答出、进程退出」。宿主没有任何东西把一个运行中的后台任务
+和进程寿命绑在一起（`print-mode.js` 的完成判据是 `session.prompt()` resolve）。0.4.x 的实测：任务需要
+3s，进程 **565 ms** 就退出，`session_shutdown` 把任务杀掉，stdout 为空、退出码 0 —— 一次没有任何信号的
+静默失败。凭模型自觉调用 `async_wait` 不能解决：默认工具面里已经没有它（REV-29），而且「进程什么时候
+退出」本来就不是模型的决定。
+
+### 23.2 裁决（结构性，不依赖模型动作）
+
+- **只在 `ctx.mode === "print"` 生效**（`src/guard/print-wait.ts`）。`tui`/`rpc`/`json`/缺失 ctx 一律
+  立即返回：print 是这个模块唯一服务的模式，缺失 ctx 不得被当成 print（否则每个模式都会白等十分钟）。
+- **等待位置**：`agent_before_settle`。宿主对该 handler 的 `await` 没有超时（`runner.js:782`），
+  所以这是 headless 进程唯一合法的「花墙钟时间」的地方。
+- **等待对象**：`status === "running"` 的任务。`pending`（delayed）不算：`dueAt` 可能在一小时外，
+  把它算进来只会每次打印运行都烧掉整个预算；它的快照留在磁盘上给下一个会话。
+  **不**按 `notifyOnCompletion` 过滤——print 模式没有别的播报通道，静默任务同样不能带着输出一起走。
+- **正常出口**：全部终态 → 提交一条 `custom_message`（`customType: "async-task-print-results"`，
+  `display: false`，内容形如 `Waited for N async task(s); all finished: a (completed, exit 0) · b (failed, exit 7).
+  Read the output with async_logs before answering.`，明细**一行、最多 8 项**（以 ` · ` 分隔，超出补 `+N more`），
+  只含 name/status/exitCode，**绝不内联 outputTail**；history 已被 prune 时明细只列仍能读到的行，缺的行数并入
+  `+N more`，一行都读不到时退化为 `… they finished (records pruned). …`）并返回 `continue: true`。
+  host 因此再发一次 provider 请求（`agent-session.js:1521-1525`，不受模式限制），
+  模型的回答成为最后一条 assistant 消息，也就是 `print-mode.js:117-138` 打印的东西。
+- **终态归属**：复用 0.4.3 的 `HoldNotificationRelay`（`open`/`claim`/`commit`/`release`，与 hold 同一个
+  实例），全终态时 `commit` 掉的 id 逐个 `markNotified`。等待期间落地的完成通知不会变成一条没人读的
+  followUp，也不会在下一个 `session_start` 被 `resendUnnotified` 重播。
+- **两道界**（缺一不可，宿主不提供上限：`PI/docs/extensions.md:748` 明确 `continue: true` 可成环）：
+  1. **续跑上限** `PI_ASYNC_PRINT_MAX_CONTINUATIONS`（默认 5，整个进程累计，`agent_start` **不**重置）；
+  2. **整体预算** `PI_ASYNC_PRINT_WAIT_MS`（默认 600000ms，单调时钟 `performance.now()`，从第一次真正
+     等待开始累计，跨回合不重置）。
+- **限流出口**：cap 或预算用尽 → `notify.release()`（扣住的通知原样交还）→ **stderr** 一行
+  `pi-async: still running N async task(s) after C continuation(s) and Ts: <taskId> (<name>), …`
+  （**必须含每个 taskId**）→ `process.exitCode = 1` → 返回 `undefined`（允许 settle）。
+  扩展里设的 `process.exitCode` 有效：`main.js:877` 只在 `runPrintMode()` 返回非零时覆盖。
+- **失败面**：registry 抛错 / dispose → 释放通知、返回 `undefined`、**不改退出码**（teardown 或坏 registry
+  不是任务失败）。任何路径都不 throw、不 `process.exit()`。
+- **开关**：`PI_ASYNC_PRINT_WAIT=0` → 一个 handler 都不注册（0.4.x 行为），用于对照实验与紧急回退。
+- **不做的事**：不改 `hold.ts`（0.4.8 的 hold 仍只在 TUI 生效）、不渲染任何 TUI、不消费输出、
+  不写 `consumedAt`；它与 hold 按 `ctx.mode` 完全互斥。
+
+### 23.3 宿主事实（实测，pi 1.5.2）
+
+| 事实 | 证据 |
+|---|---|
+| print 模式 `ctx.mode === "print"`，`hasUI === false` | `print-mode.js:55-60` → `agent-session.js:2756-2762` → `runner.js:630-633` |
+| `agent_before_settle` handler 无超时、按注册顺序串行 await | `runner.js:767-814` |
+| `{entries, continue:true}` 在 print 模式真会再发一次 provider 请求 | `agent-session.js:1521-1525`；`scripts/headless-smoke.sh wait` 实测 3 次请求 |
+| `custom_message` draft 让 `canContinue` 为真 | `agent-session.js:670-689` |
+| print 只打印**最后一条** assistant 消息的 text | `print-mode.js:117-138` |
+| `process.exitCode = 1` 在扩展里设置有效 | `main.js:877` |
+| print 模式的 `console.log`/`process.stdout.write` 落 stderr | `output-guard.js:38-59`（所以限流提示用 `console.error`） |
+| 扩展无法拦截未注册工具名 | `agent-loop.js:479-492`（`Tool <name> not found`，不触发任何钩子） |
+
+### 23.4 验收清单（REV-30）
+
+- `tests/j-print-wait.test.ts`（新增）：任务完成前 handler 不 resolve（≥100ms，结果 `continue: true` +
+  `async-task-print-results`）；relay 扣住的通知不被发送且 `markNotified` 落盘；cap 用尽 → `undefined`
+  + stderr 含 taskId + `process.exitCode === 1`；整体预算用尽 → 同上且 `release` 被调用；
+  `tui`/`rpc`/缺失 ctx 立即返回且不读 registry；`PI_ASYNC_PRINT_WAIT=0` → 0 个 handler；
+  entries 不含 outputTail；预算跨回合累计；hook 恰好 3 个且 dispose 幂等。
+- `scripts/headless-smoke.sh`（真实 `pi -p` + `test/docker/tools/mock-llm.py` 脚本化 endpoint）：
+  - `wait`：任务 3s、进程 wall ≥ 3s、请求 ≥ 3、**stdout 含 `CONCLUSION-AFTER-TASK`**、退出码 0；
+  - `cap`：第一个任务完成花掉 1 次续跑，第二个永不完成 → 退出码非 0、stderr 含
+    `after 1 continuation(s)` 与仍在跑的 taskId；
+  - `off`：`PI_ASYNC_PRINT_WAIT=0` 复现 0.4.x（wall < 任务时长、stdout 无结论）= 变异证据。
+- 全量 `npm test` 与 `npm run typecheck` 全绿。

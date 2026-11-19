@@ -1,7 +1,7 @@
 {
   "name": "pi-async",
-  "version": "0.4.8",
-  "description": "Pi extension for async shell tasks: background/delayed/sync modes, output-matching watches, event-driven waiting, settle guard for legion children, and a TUI task rail — completion notifications wake your session.",
+  "version": "0.5.0",
+  "description": "Pi extension for async shell tasks: background/delayed runs, output-matching watches, a settle hold for interactive sessions and a structural headless backstop for pi -p, plus a TUI task rail — completion notifications wake your session.",
   "type": "module",
   "license": "MIT",
   "author": "zzjcool",

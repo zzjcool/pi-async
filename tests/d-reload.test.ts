@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { init } from "../extensions/index.ts";
 import type { TaskSnapshot } from "../src/core/task.ts";
+import { withExposedWaitAsync } from "./helpers/index.ts";
 
 /**
  * 0.3.0 reload semantics (PLAN §2.8 + D-16):
@@ -292,7 +293,8 @@ test("a second init() retires the previous generation without killing its tasks"
   }
 });
 
-test("registerMessageRenderer renders a one-line completion card and falls back to the content", async () => {
+// D4 (0.5.0): `async_wait` is opt-in and the gate is read per call, so the collect step below runs exposed.
+test("registerMessageRenderer renders a one-line completion card and falls back to the content", () => withExposedWaitAsync(async () => {
   const session = freshSession("pi-async-d-renderer-");
   const pids: number[] = [];
   try {
@@ -329,7 +331,7 @@ test("registerMessageRenderer renders a one-line completion card and falls back 
     pids.forEach(hardKill);
     rmSync(session.sessionDir, { recursive: true, force: true });
   }
-});
+}));
 
 test("session_start resends an unnotified terminal task exactly once (D-02 wiring)", async () => {
   const session = freshSession("pi-async-d-resend-");

@@ -39,18 +39,57 @@ function toolResult(payload: unknown, isError = false): { content: Array<{ type:
 }
 
 /**
+ * `async_wait` is **not** registered by default (D4, 0.5.0): the wait primitive is opt-in for hosts
+ * that want a blocking collect step (`PI_ASYNC_EXPOSE_WAIT=1`). The default tool surface is five.
+ */
+export const WAIT_TOOL = "async_wait";
+
+/**
+ * Whether this session exposes `async_wait`. Read on **every** call — never cached at module load —
+ * so a reload (or a test toggling the env between registration and use) is honoured immediately.
+ */
+export function waitToolExposed(): boolean {
+  return process.env.PI_ASYNC_EXPOSE_WAIT === "1";
+}
+
+/**
+ * Degraded `async_wait` result (D4): a registration from an older session (or a host that kept a
+ * first-wins registration) can still be invoked after the env stopped exposing the tool. That call
+ * must not throw and must not silently look like a real timeout — it reports why and how to enable.
+ */
+export const WAIT_UNAVAILABLE = "async_wait is not available in this configuration (it is not registered by default; set PI_ASYNC_EXPOSE_WAIT=1 and reload the session to expose it). Use async_status and async_logs instead.";
+
+/** Copy that mentions `async_wait` only when this session really exposes it (D4/D6). */
+const waitMention = (exposed: string, otherwise: string): string => (waitToolExposed() ? exposed : otherwise);
+
+/**
  * Per-call notification exception (PLAN-CONTEXT §D-C5, revised).
  *
  * The general rule ("a completion notification wakes you") lives in the system prompt and in the
  * `<async-state>` line; repeating it in every receipt would bill the same sentence on every call.
  * Only the exception is per-call truth, so only the exception is reported here.
+ *
+ * D4 (0.5.0): the hint may not advertise `async_wait` when the session does not expose it; the
+ * fallback points at the always-registered readers instead.
  */
 function notificationException(params: Record<string, unknown>): { willNotify?: false; willWake?: false; hint: string } | undefined {
   if (params.notifyOnCompletion === false) {
-    return { willNotify: false, hint: "Notifications are off for this task; collect it with async_wait or async_logs." };
+    return {
+      willNotify: false,
+      hint: waitMention(
+        "Notifications are off for this task; collect it with async_wait or async_logs.",
+        "Notifications are off for this task; collect it with async_logs.",
+      ),
+    };
   }
   if (params.triggerOnCompletion === false) {
-    return { willWake: false, hint: "This task will notify but will not start a new turn; collect it with async_wait if you need the result now." };
+    return {
+      willWake: false,
+      hint: waitMention(
+        "This task will notify but will not start a new turn; collect it with async_wait if you need the result now.",
+        "This task will notify but will not start a new turn; collect it with async_logs if you need the result now.",
+      ),
+    };
   }
   return undefined;
 }
@@ -73,14 +112,14 @@ function consumeTerminal(registry: TaskRegistry, snapshots: Array<{ taskId: stri
   }
 }
 
-const DEFAULT_MAX_SYNC_TIMEOUT_MS = 600_000;
 const MAX_STATUS_LIMIT = 50;
 const DEFAULT_STATUS_LIMIT = 50;
 
 /**
  * One-line snippets shown in the default system prompt's "Available tools" section (D-C1).
  *
- * The host only lists tools that carry a `promptSnippet`, so all six must have one — each is
+ * The host only lists tools that carry a `promptSnippet`, so every registered tool must have one —
+ * five by default, six when `PI_ASYNC_EXPOSE_WAIT=1` also registers `async_wait` (D4) — each is
  * single-line and <=140 chars because the host squeezes it into a bullet line.
  */
 const PROMPT_SNIPPETS = {
@@ -92,7 +131,10 @@ const PROMPT_SNIPPETS = {
   async_extend: "Renew a running task: move its reminder and/or hard-timeout deadline. Never kills; use async_kill to stop.",
 } as const;
 
-/** Guidelines appended to the default system prompt while async_run is active (D-C3, plus D-34 in 0.4.1). */
+/**
+ * The four always-on guidelines (D-C3 + D-34), verbatim and in order. The fifth one is appended only
+ * while `async_wait` is not exposed (D4): the prompt must never sell a tool this session lacks.
+ */
 const ASYNC_RUN_PROMPT_GUIDELINES = [
   "Reach for async_run before bash when a command may outlive ~60s or never exit (builds, test suites, dev servers, watchers, network waits); quick file operations stay in bash.",
   "Do not sit in async_wait only to end a turn: if you do not need the result yet, end the turn and the completion notification wakes you. In a legion child, collect with async_wait before returning a verdict.",
@@ -100,17 +142,19 @@ const ASYNC_RUN_PROMPT_GUIDELINES = [
   "Plan the batch first: launch independent long commands together (several async_run calls in one message) and collect them with a single async_wait later.",
 ];
 
-/** `PI_ASYNC_MAX_SYNC_TIMEOUT_MS`, defaulting to 10 minutes when unset/invalid. */
-function resolveMaxSyncTimeoutMs(): number {
-  const parsed = Number(process.env.PI_ASYNC_MAX_SYNC_TIMEOUT_MS);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_SYNC_TIMEOUT_MS;
+/** Appended as the fifth guideline when `async_wait` is not registered (D4). */
+const WAIT_UNAVAILABLE_GUIDELINE = "async_wait is not available in this session (set PI_ASYNC_EXPOSE_WAIT=1 to expose it); end the turn and the completion notification wakes you, and read output with async_logs.";
+
+/** The guideline list the host sees: four frozen lines, plus the no-wait note when it applies. */
+function asyncRunGuidelines(): string[] {
+  return waitToolExposed() ? [...ASYNC_RUN_PROMPT_GUIDELINES] : [...ASYNC_RUN_PROMPT_GUIDELINES, WAIT_UNAVAILABLE_GUIDELINE];
 }
 
 const schema = (properties: Record<string, unknown>, required: string[] = [], allOf: unknown[] = []) => ({ type: "object", properties, required, additionalProperties: false, ...(allOf.length ? { allOf } : {}) });
 const stringField = { type: "string" };
 const timeoutField = { type: "number", minimum: 0 };
 /** `async_run` fields that carry their own description instead of the bare `stringField` (D-C2). */const commandField = { type: "string", description: "Shell command to execute (/bin/sh -c) in the session cwd." };
-const nameField = { type: "string", description: "Short handle for later async_wait/async_logs/async_kill calls (max 48 chars)." };
+const nameField = { type: "string", description: "Short handle for later async_logs/async_kill calls (max 48 chars)." };
 const conditionSchema = {
   oneOf: [
     { type: "object", properties: { type: { const: "exit_code" }, equals: { type: "number", description: "Exit code that matches; evaluated only once the process has exited." } }, required: ["type", "equals"], additionalProperties: false },
@@ -170,7 +214,8 @@ function elapsedMsOf(task: TaskSnapshot, now = Date.now()): number {
 }
 
 /**
- * Register the frozen six-tool surface.
+ * Register the async tool surface: five tools by default, six when `PI_ASYNC_EXPOSE_WAIT=1` adds
+ * `async_wait` (D4, 0.5.0).
  *
  * `ensureConfigured` lets the extension wire a lazy, once-only
  * `registry.configure({dataDir, cwd})` before the first tool call — tools may
@@ -191,7 +236,6 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
   // SAFETY: ExtensionAPI exposes registerTool at runtime; this local structural view keeps schemas dependency-free.
   const api = pi as unknown as { registerTool?: (tool: ToolDef) => void };
   if (!api.registerTool) throw new Error("Pi host does not expose registerTool");
-  const maxSyncTimeoutMs = resolveMaxSyncTimeoutMs();
   const configure = (ctx?: ToolContext): void => ensureConfigured?.(ctx);
   /**
    * Resolve the registry **at call time**, not at registration time.
@@ -207,35 +251,31 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
 
   api.registerTool({
     name: "async_run", label: "Run async command",
-    description: "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=sync waits up to timeoutMs then promotes; mode=delayed starts after delayMs.",
+    description: "Run a shell command as a managed async task. mode=background (default) returns a taskId immediately; mode=delayed starts after delayMs.",
     promptSnippet: PROMPT_SNIPPETS.async_run,
-    promptGuidelines: ASYNC_RUN_PROMPT_GUIDELINES,
+    promptGuidelines: asyncRunGuidelines(),
     // Mode-conditional required fields + mode-scoped rejects enforced in execute (#45/#42),
     // not allOf/then (host validator emits opaque "must match then schema").
+    // D3 (0.5.0): the blocking mode is gone — with `additionalProperties: false`, a host still passing
+    // either retired knob is rejected by the schema instead of being silently ignored.
     parameters: schema({
       command: commandField, name: nameField,
-      mode: { type: "string", enum: ["background", "sync", "delayed"], default: "background", description: "background (default) returns a taskId now; sync waits up to timeoutMs; delayed starts after delayMs." },
-      timeoutMs: { type: "number", minimum: 0, maximum: maxSyncTimeoutMs, description: `sync only: how long to wait before promoting to background (max ${maxSyncTimeoutMs} ms, from PI_ASYNC_MAX_SYNC_TIMEOUT_MS).` },
+      mode: { type: "string", enum: ["background", "delayed"], default: "background", description: "background (default) returns a taskId now; delayed starts after delayMs." },
       delayMs: { type: "number", minimum: 0, description: "delayed only: milliseconds to wait before starting." },
       taskTimeoutMs: { type: "number", minimum: 0, description: "Kill the task after this many ms, in any mode." },
       remindAfterMs: { type: "number", minimum: 0, description: "Remind me once the task has run this many ms (backs off 2x, at most 3 times; never kills). 0 disables; default is 20 minutes, or off when watch is set." },
-      onTimeout: { type: "string", enum: ["promote", "abort"], default: "promote", description: "sync only: promote (default) returns while the task keeps running; abort stops waiting only — the task keeps running and still notifies." },
       notifyOnCompletion: { type: "boolean", description: "Send a completion notification (default true)." },
       triggerOnCompletion: { type: "boolean", description: "Start a new turn when the task finishes (default true)." },
       env: { type: "object", additionalProperties: { type: "string" }, description: "Extra environment variables for the child process (safe policy applied)." },
       watch: watchSchema,
     }, ["command"]),
-    execute: async (_id, params, signal, _onUpdate, ctx) => {
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
       configure(ctx);
       const registry = resolveRegistry();
       const mode = String(params.mode ?? "background");
-      if (mode !== "background" && mode !== "sync" && mode !== "delayed") throw new Error(`Unsupported async_run mode: ${mode}`);
+      if (mode !== "background" && mode !== "delayed") throw new Error(`Unsupported async_run mode: ${mode}`);
       const command = String(params.command ?? "");
-      if (mode === "sync" && params.timeoutMs === undefined) throw new Error("timeoutMs is required for sync mode");
       if (mode === "delayed" && params.delayMs === undefined) throw new Error("delayMs is required for delayed mode (milliseconds, e.g. 60000 for one minute)");
-      if (params.watch !== undefined && mode === "sync") throw new Error("watch is only supported for background and delayed modes");
-      if (mode !== "sync" && params.timeoutMs !== undefined) throw new Error("timeoutMs is only valid for sync mode (use taskTimeoutMs to bound background/delayed tasks)");
-      if (mode !== "sync" && params.onTimeout !== undefined) throw new Error("onTimeout is only valid for sync mode");
       if (mode !== "delayed" && params.delayMs !== undefined) throw new Error('delayMs is only valid for delayed mode (pass mode: "delayed" to schedule it, or omit delayMs)');
       const options = {
         command,
@@ -246,28 +286,8 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
         ...(typeof params.notifyOnCompletion === "boolean" ? { notifyOnCompletion: params.notifyOnCompletion } : {}),
         ...(typeof params.triggerOnCompletion === "boolean" ? { triggerOnCompletion: params.triggerOnCompletion } : {}),
         ...(params.env && typeof params.env === "object" ? { env: params.env as Record<string, string> } : {}),
-        ...(mode !== "sync" && params.watch && typeof params.watch === "object" ? { watch: params.watch as WatchSpec } : {}),
+        ...(params.watch && typeof params.watch === "object" ? { watch: params.watch as WatchSpec } : {}),
       };
-      if (mode === "sync") {
-        const timeoutMs = Number(params.timeoutMs);
-        if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("timeoutMs must be a non-negative finite number");
-        if (timeoutMs > maxSyncTimeoutMs) {
-          throw new Error(`timeoutMs must be at most ${maxSyncTimeoutMs} ms for sync mode (raise PI_ASYNC_MAX_SYNC_TIMEOUT_MS to allow longer waits; promote the task to background instead)`);
-        }
-        const result = await registry.runSync({ ...options, mode: "sync" }, timeoutMs, params.onTimeout === "abort" ? "abort" : "promote", signal);
-        // D-19 (narrowing D-18 to PLAN §2.7's exact wording): only a *finished* sync run with a
-        // non-zero exit is a tool error. promote/abort timeouts leave the task running
-        // (status "running") — that is not a non-zero exit and must not read as a failure;
-        // the payload still carries the full SyncResult (status/promoted/exitCode/outputTail).
-        const ended = result.status === "completed" || result.status === "failed" || result.status === "killed";
-        const isError = ended && (result.status !== "completed" || (result.exitCode !== undefined && result.exitCode !== 0));
-        // A promoted task now lives in the background, so the same per-call exception applies.
-        const note = result.promoted ? notificationException(params) : undefined;
-        const payload = note
-          ? { ...result, ...(note.willNotify === false ? { willNotify: false as const } : {}), ...(note.willWake === false ? { willWake: false as const } : {}), outputHint: note.hint }
-          : result;
-        return toolResult(payload, isError);
-      }
       const task = mode === "delayed"
         ? registry.scheduleDelayed(options, Number(params.delayMs))
         : registry.submit({ ...options, mode: "background" });
@@ -283,12 +303,26 @@ export function registerTools(pi: PiCtx, registrySource: TaskRegistry | (() => T
       });
     },
   });
-  api.registerTool({
-    name: "async_wait", label: "Wait for async tasks",
+  // D4 (0.5.0): `async_wait` is opt-in — the default surface (including headless) is five tools.
+  // A stale registration from an older session still resolves, but its execute reports why and how
+  // to enable it instead of blocking (see WAIT_UNAVAILABLE).
+  if (waitToolExposed()) api.registerTool({
+    name: WAIT_TOOL, label: "Wait for async tasks",
     description: "Wait for tasks (taskId or name) to finish or return notReady; waiting does not kill tasks.",
     promptSnippet: PROMPT_SNIPPETS.async_wait,
     parameters: schema({ taskIds: { type: "array", items: stringField }, timeoutMs: timeoutField }, ["taskIds", "timeoutMs"]),
     execute: async (_id, params, signal, _onUpdate, ctx) => {
+      // Call-time gate (env read per call, never cached): a registration can outlive the env that
+      // exposed it. Degrade with a readable reason instead of throwing or blocking forever.
+      if (!waitToolExposed()) {
+        return toolResult({
+          taskId: null,
+          available: false,
+          error: WAIT_UNAVAILABLE,
+          enableWith: "PI_ASYNC_EXPOSE_WAIT=1",
+          alternatives: ["async_status", "async_logs"],
+        }, true);
+      }
       configure(ctx);
       const registry = resolveRegistry();
       if (params.timeoutMs === undefined) throw new Error("timeoutMs is required");

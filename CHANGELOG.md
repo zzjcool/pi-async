@@ -2,6 +2,62 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.5.0 — 未发布（agent 不再需要知道「等待」这件事）
+
+四条一起改的是同一个问题：等任务是运行时的事，不是模型的事。能阻塞的模式删了，会唤醒的那条路少了一个
+岔口，模型不再被劝去调一个默认不存在的工具，headless 进程也不会再带着未完成的任务退出。
+
+基于 0.4.8（`feat/hold-in-rail`，已合入 main）的代码线；本条目只描述相对 0.4.8 的差异。
+
+### Removed（D3）
+
+- **`async_run` 的 `mode=sync` 彻底删除，无兼容层**：`timeoutMs` / `onTimeout` 不再是 `async_run` 的
+  参数（schema 里没有这两个字段，`additionalProperties: false` 让宿主直接拒绝），
+  `PI_ASYNC_MAX_SYNC_TIMEOUT_MS` 不再被读取。传 `mode: "sync"` 会得到
+  `Unsupported async_run mode: sync`；`mode` 只剩 `background`（默认）与 `delayed`（需 `delayMs`）。
+  需要「现在就拿到结果」时用可选的 `async_wait`（见下）或 `async_logs`。
+- 据此，TUI 的 mode 配色槽位固定为 background=0 / delayed=2（行为与配色都不变），rail 上不再有
+  「sync 期间也在跑」这一类任务。
+
+### Changed（D4）
+
+- **`async_wait` 默认不注册**：默认工具面是 5 个（`async_run` / `async_logs` / `async_status` /
+  `async_kill` / `async_extend`）。宿主设置 `PI_ASYNC_EXPOSE_WAIT=1` 才额外注册 `async_wait`（6 个）。
+  开关每次调用重新读，不需要改代码即可在 reload 后生效。
+- 旧会话/旧注册若仍调到 `async_wait`，**不再抛错**：返回 `{ taskId: null, available: false, error,
+  enableWith: "PI_ASYNC_EXPOSE_WAIT=1", alternatives: ["async_status","async_logs"] }`（`isError: true`，
+  正常 resolve），说明原因与开启方式。
+- 默认工具面上任何模型可见文本都不再有 `async_wait`：`async_run.name` 的字段描述（`Short handle for
+  later async_logs/async_kill calls`）、第 5 条 guideline、receipt 的两条例外 hint、
+  `<async-state>` 的三条 tail、settle guard 的 advisory / reminder / unresolved / aborted 文案，
+  默认一律指向 `async_status` + `async_logs`；只有 `PI_ASYNC_EXPOSE_WAIT=1` 时才保留 `async_wait` 措辞。
+  默认路径生成的文本里不会出现 `async_wait`。
+
+### Changed（D6）
+
+- `bash` 长命令事后提示删掉 `or mode=sync with timeoutMs when you need the result soon`，改为
+  `… use mode=background with watch for servers/builds; end the turn and the completion notification
+  wakes you`。
+- `<async-state>` 的全唤醒分支删掉 `, or call async_wait if you need one now`，默认为
+  `— end the turn and the completion notification wakes you.`；混合/全不唤醒分支同样改用 `async_logs`。
+  三态（全唤醒 / 混合 / 全不唤醒）的 per-task 事实不变量不变。
+- `skills/async-tasks/SKILL.md` 删掉 sync 章节，`async_wait` 描述为「默认不存在，宿主设
+  `PI_ASYNC_EXPOSE_WAIT=1` 才暴露；默认做法是结束回合等完成通知」。
+
+### Added（D5）
+
+- **headless（`pi -p`）结构性保底**：print 会话在 `agent_before_settle` 边界等到所有 `running` 任务终态，
+  提交一条 `async-task-print-results`（只含 name/status/exit，不含 output tail）并返回 `continue: true`，
+  宿主因此再发一次 provider 请求——**模型的结论成为最终输出**，而不是 0.4.x 的「565 ms 退出 + 空 stdout + 任务被杀」。
+  等待复用完成通知归属中继：等待期间落地的通知由 results entry 独占播报并落 `notified`。
+- 两道界：`PI_ASYNC_PRINT_MAX_CONTINUATIONS`（默认 5，`0` = 首个边界即限流）与 `PI_ASYNC_PRINT_WAIT_MS`
+  （默认 10 分钟，从第一次真正等待起按墙钟累计，回合之间的 provider 时间计在内——这是刻意的整进程上限，
+  代价是长运行后半段新起的任务会被立即限流而不是等待）。
+  超限 **stderr** 打印 `still running N async task(s) after C continuation(s) and Ts: <taskId> …` 并以
+  `exitCode = 1` 退出（不静默）；`PI_ASYNC_PRINT_WAIT=0` 关闭整条保底（0.4.x 行为，用于对照/紧急回退）。
+- 只等 `running`；`delayed`/`pending` 是「已排期的工作」，不阻塞退出（否则每次打印运行都会烧掉整个预算）。
+- `scripts/headless-smoke.sh`（真 `pi -p` + 脚本化 mock endpoint）：`wait` / `cap` / `off` 三态可复跑。
+
 ## 0.4.8 — 2026-11-18（等待行并进 rail：输入框上方不再有独立一行）
 
 hold 期间输入框上方原来会多出一行——与 rail 首行说同一件事。用户裁决：

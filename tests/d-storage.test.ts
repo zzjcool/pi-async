@@ -353,7 +353,8 @@ test("a suspended registry rejects new admissions", async () => {
     await f.registry.suspend();
     assert.throws(() => f.registry.submit({ command: "true" }), /Async task admission is closed/);
     assert.throws(() => f.registry.scheduleDelayed({ command: "true" }, 10), /Async task admission is closed/);
-    await assert.rejects(f.registry.runSync({ command: "true" }, 1000, "promote"), /Async task admission is closed/);
+    // 0.5.0 (D3): the sync probe is gone with `runSync`; every remaining admission path is closed.
+    assert.throws(() => f.registry.submit({ command: "echo second" }), /Async task admission is closed/);
   } finally {
     await f.cleanup();
   }
