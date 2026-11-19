@@ -2,7 +2,8 @@
 
 - **原 issue**：[#81](https://github.com/zzjcool/pi-async/issues/81)，建于 2026-11-02（0.3.0 之后），27 个 checkbox，从未更新
 - **分诊基线**：`origin/main` `a212cbe`（Merge PR #99 = v0.5.0，2026-11-18）
-- **结论**：27 条 → ✅ 10 已完成 / 🔜 12 仍需要 / ❌ 5 放弃；新建 3 个子 issue
+- **结论**：27 条 → ✅ 10 已完成 / 🔜 12 仍需要 / ❌ 5 放弃；新建 3 个子 issue（#100 / #101 / #102，均为 #81 的 sub-issue）
+- **本报告 PR**：[#103](https://github.com/zzjcool/pi-async/pull/103)
 - **不改产品代码**：本报告只有一个新增文档文件
 
 ## 为什么重写
