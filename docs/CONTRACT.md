@@ -602,7 +602,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
     先由 `reapOrphans()` 标 `failed` + `failureKind: "lost"`，再按终态参与 prune。
   - `async_logs` 返回的 `fullPath` **有效至被 prune**（过期后文件可能已删；缺文件时 `logs()` 返回
     `{text:"", truncated:false, fullPath, missing:true}`，不抛错）。
-  - 跨 session 目录的整目录回收不在本条范围（仍只读留档）；孤儿 `running` 同样由 `reapOrphans()` 处理。
+  - **跨 dataDir 回收与全局字节配额（#102 / REV-32，两者默认关闭）**：`PI_ASYNC_SWEEP_SIBLINGS=1` 时，
+    `configure()`（低频、带节流）会回收 `dirname(dataDir)` 下**其他** session 目录；`PI_ASYNC_TOTAL_BYTES` > 0 时
+    按**字节**记账并淘汰终态产物。未开启时本条其余行为一字不变（不 stat、不 readdir）。详见 §25。
+  - 孤儿 `running` 同样由 `reapOrphans()` 处理。
 
 ## 11. 配置与环境变量
 
@@ -624,6 +627,11 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | `PI_ASYNC_FOOTER` | 关闭（未设） | `1` 且宿主 `ui.setStatus` 存在时额外渲染一行 footer 汇总；rail 首行仍是默认状态面 |
 | `PI_ASYNC_RETENTION_MS` | `604_800_000`（7 天） | 终态任务产物保留时长；与 COUNT 取并集 |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | 每个 dataDir 最多保留的「最新」终态任务数；与 MS 取并集 |
+| `PI_ASYNC_SWEEP_SIBLINGS` | `0`（关闭） | #102 / REV-32：`1` → `configure()` 回收 `dirname(dataDir)` 下的其他 session 目录（三闸，见 §25） |
+| `PI_ASYNC_SWEEP_SIBLING_AGE_MS` | `1_209_600_000`（14 天） | #102 / REV-32：sibling 目录的空闲时长下限（取 `max(该值, PI_ASYNC_RETENTION_MS + 1)`，即**永远**严格大于 retention 窗口） |
+| `PI_ASYNC_SWEEP_INTERVAL_MS` | `60_000` | #102 / REV-32：`configure()` 触发存储巡检的节流间隔；`0` = 每次 configure 都跑 |
+| `PI_ASYNC_TOTAL_BYTES` | `0`（关闭） | #102 / REV-32：**全局**字节配额（单位：字节，统计 `.json`/`.output`/`.stdout`/`.stderr`），跨整个 sweep root；`0` = 不限 |
+| `PI_ASYNC_QUOTA_HARD` | `0`（关闭） | #102 / REV-32：`1` → 配额超限时**也**淘汰仍在 retention 窗口内的终态产物（逐条先日志再删）；默认只淘汰 retention 本来就该丢的，超了就报「配额已满」 |
 | `PI_ASYNC_RAIL_LINGER_MS` | `30_000` | 终态任务在 rail 上滞留时长 |
 | `PI_ASYNC_LIVENESS_INTERVAL_MS` | `5000` | 运行期存活巡检间隔（REV-28c）；**`0` 关闭巡检**；负数/非法值回退默认（`min:0`）；连续两次观测到进程组消失才结算，且已观测到 `exit` 的任务一律跳过 |
 | `PI_ASYNC_SPAWN_EXIT_GRACE_MS` | `5000` | `'exit'` 退出兜底宽限（REV-28d）；**`0` 关闭兜底**，回到「只听 `'close'`」（此时巡检是唯一结算者，连续两次观测到进程组消失后按 `failed`/`lost` 结算）；负数/非法值回退默认（`min:0`） |
@@ -1447,3 +1455,153 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - 既有 D-30 / R2-1 / R2-3 / D-32 / D-33 / d-tui-refresh「短终端折叠 + footer」断言不改不放宽。
 - 全量 `npm test` 441 条全绿（0.5.0 基线 435 条，只增不减）；`npm run typecheck` 全绿。
 - 变异：逐个撤掉 D1/D2/D3 修复 → 对应断言必须红（证据见 `docs/reports/tui-detail-viewport.md`）。
+
+## 25. 存储生命周期：跨 dataDir 回收 + 全局字节配额（REV-32，冻结）
+
+基线 `origin/main` `91a4d88`（0.5.0 已发，#105 已合入）；来源 issue #102（父 #81 的 8.1 + 8.2）。
+本修订**只新增两个默认关闭的存储开关**；不改 `prune()` 的既有语义（§10 的并集策略一字不动），
+不动 `reapOrphans()` / 存活巡检（REV-28c）的任何裁决，不改工具面（§12 冻结，见 §25.5）。
+
+### 25.1 原因
+
+- 目录布局是 `<session dir>/pi-async/<sessionId>`（`extensions/index.ts:43-50`）；每次 `pi -p` 都是新
+  sessionId → 新目录，而 `configure()` 的 retention/`prune()` 只作用于**当前** dataDir，旧目录**永不再被
+  打开**。实测 `~/.pi/sessions/*/pi-async/*` 累积 117 个 session 目录 / 4.0 MiB，其中 54 个 mtime > 7 天、
+  86 个是只有 `mkdirSync` 的空目录 → 产物只增不减。
+- `PI_ASYNC_TOTAL_BYTES` 此前在源码里零引用（只在草稿文档里出现过），没有任何字节上限。
+
+### 25.2 术语与单位（先定义，后判据）
+
+- **sweep root**：`dirname(resolve(dataDir))`。真实布局里就是 `<session dir>/pi-async/`；无 sessionManager
+  时是 `~/.pi/async/`。**只处理 root 的直接子项，root 自身永远不是目标**（单个父目录下实测最多 33 个并发
+  session 子目录，删父目录等于抹掉所有会话）。
+- **产物族**：`.json`（元数据快照）+ `.output`（合并输出）+ `.stdout` / `.stderr`（分流 sidecar）。
+  字节记账**只数这四个后缀**的普通文件（`lstat` 的 `size` 之和）；`*.tmp`（`migrateDataDir` 的
+  copy→rename 残留）、子目录、符号链接不计入、也不会被配额淘汰单点删除。
+- **配额单位 = 字节**。`PI_ASYNC_TOTAL_BYTES` 是整数、`0` = 关闭（负值/非法值回退 `0`，见 `envNumber`）。
+  报表与日志用二进制单位（KiB/MiB/GiB）渲染，便于人读；**判据只比字节**。
+- **同界含于配额**：`used <= quota` 视为在预算内，只有 `used > quota` 才淘汰（边界见 §25.8 的「恰好等于」用例）。
+- **owner marker**：`<dataDir>/.pi-async-owner`，`{pid, at}`，由 `ensureDataDir()` 在目录首次就绪时原子写入
+  （temp+rename，0600），`migrateDataDir()` 成功后删除旧目录的 marker。它**不是产物**（不匹配四个后缀，
+  因此不计字节、不被当快照解析、不被迁移），`surveyDataDir()` 把它列为**允许内容**（不会让目录变 `foreign`）。
+  它的唯一作用是回答「这个目录还有人用吗」。
+- **dataDir 的认定（正证据，不是「没有异物」）**：一个目录算 dataDir 当且仅当 **它是当前 dataDir**、
+  **或**含至少一个可解析快照、**或**没有任何异物。`.`/`..`/软链/大小写不敏感的别名都用**目录身份**
+  （`dev`+`ino`，回退 `realpath`）判定，而不是比较字符串 —— 否则闸 1 会被别名绕过，
+  清理会删掉本 registry 正在使用的目录。
+
+### 25.3 S1：跨 dataDir 回收（三闸，任何一闸不成立就不删）
+
+`PI_ASYNC_SWEEP_SIBLINGS=1` 时，对 root 下每个**其他**目录逐一判定；**三闸同时成立**才整目录 `rm -rf`：
+
+1. **不是当前 dataDir**（`resolve` 后比较，防 `..`/软链）——当前目录哪怕早已没人动、全是终态产物也不删。
+2. **不含「非终态且 pid 仍活着」的快照**（`running`/`pending` + `pidAlive`）。判活走既有 `pidAlive()`
+   （`/proc` 优先，macOS 退化到 `kill(-pid, 0)`），**不复用** `reapOrphans()` 的结算逻辑、**不 kill 任何进程**。
+3. **空闲时长 ≥ `max(PI_ASYNC_SWEEP_SIBLING_AGE_MS, PI_ASYNC_RETENTION_MS + 1)`**。默认年龄闸 = 14 天
+   （2 × 默认 retention 7 天）；**钳位使得年龄闸永远严格大于 retention 窗口**，因此本闸不会早于
+   「产物本来也该过期」的时刻生效。
+   「空闲时长」= `max(目录 mtime, 目录内最新产物文件 mtime)`——活着的会话写快照走 temp+rename，
+   会顶起目录 mtime，所以这个代理量比只看目录 mtime 更保守。
+
+**判无知的默认答案是「不删」**（`不许静默删数据`）：以下情况一律跳过并记入 `skipped` 原因：
+
+| 情况 | reason |
+|---|---|
+| 当前 dataDir（含软链/大小写/`..` 别名，按目录身份判定） | `current` |
+| 目录里有 dataDir 永远不会写的东西（子目录、软链、非产物文件） | `foreign_content` |
+| 有 `.json` 解析不出快照（损坏/半写/不认识） | `unreadable_snapshot` |
+| 非终态快照指向活 pid | `live_task` |
+| owner marker 的 pid 仍活着 | `owner_alive` |
+| owner marker 存在但读不出 pid | `unreadable_owner` |
+| 未过年龄闸 | `recently_active` |
+| 超过本轮扫描上限（`MAX_SCAN_DIRS = 256`，按名字排序后截断） | `scan_limit` |
+| `rm` 抛错 | `delete_failed` |
+| `dirname(dataDir)` 是文件系统根（`/`） | 直接拒绝整轮，日志明示 |
+
+`foreign_content` 是防「root 猜错」的最后一道闸：dataDir 里有 `<uuid>.<suffix>` 与 `*.tmp` 之外的东西，
+就说明 `dirname(dataDir)` 不是 pi-async 的布局（例如有人把 dataDir 指到 `~/proj/data`），此时删 sibling
+等于删别人的项目 —— 一律不删。**不能只按「目录里没有产物文件」判定可删**：空目录确实是回收对象，但那
+由年龄闸决定；`*.tmp` 残留同样既不让目录变得「可删」、也不让它变得「不可删」。
+
+### 25.4 S2：全局字节配额（先算账，再按确定性顺序删）
+
+`PI_ASYNC_TOTAL_BYTES > 0` 时，每轮：
+
+1. **算账**：root 下所有 dataDir（含当前）的产物字节求和（含被保护的部分，所以「满了」是诚实的）。
+2. **候选**：只挑**终态**任务的产物集（一个任务的四个后缀作为一个整体），外加**没有快照指向的孤儿产物**
+   （`tier 0`）。**非终态永远不是候选**；**目录里有活着的非终态任务时，整个目录不贡献候选**（保守优先于配额）。
+   **读不出快照的目录（`.json` 解析失败、未知 status、或触到 `MAX_SNAPSHOTS_PER_DIR` 上限）整目录不产生候选**
+   —— 「不知道」绝不能被读成「没人要」：一个解析不出快照的产物，正是删掉就再也没人看得见的产物。
+   这类目录记入 `report.unreadableDirs`，其字节仍计入 `used`，因此配额会诚实地报 `overQuota`。
+3. **分层**（`tier` 越小越先删）：
+   - `0` 孤儿产物（没有任何快照能观察它）；
+   - `1` **policy-expired**：`finishedAt ?? createdAt` 落在 retention 窗口外，**且**不在最新
+     `PI_ASYNC_RETENTION_COUNT` 个之内 —— 与 `prune()` 的并集策略逐字同义，所以默认配额**永远不会删掉
+     retention 仍承诺保留的东西**；
+   - `2` 仍在 retention 窗口内（**只有 `PI_ASYNC_QUOTA_HARD=1` 才会成为候选**）。
+4. **删序（确定、全序、与插入/readdir 顺序无关）**：`tier` 升序 → `ageAnchor` 升序 → `taskId`（孤儿用文件路径）
+   字典序升序 → `dataDir` 字典序升序。最后一键是必需的：`migrateDataDir()` 的 best-effort 清理可能把同一个
+   taskId 留在两个目录里，没有它这两条候选会「相等」，顺序就退化成输入顺序。
+   `prune()` 与 `expiredTaskIds()` 共用同一个 age 键**和**同一个 id 兜底，两者对「同 age 的陌生人」判断一致；
+   tier 1 与 `prune()` 的并集策略逐字同义，所以默认配额永远不会删掉 retention 仍承诺保留的结果。
+5. **停手条件**：累计到 `used <= quota` 立即停（不是「全删」）。
+6. **超限行为**：
+   - 软模式（默认）：非 tier 2 的删完仍超 → **停手**，保留其余产物，报表 `overQuota: true`，并写一条
+     明确日志（含 used/quota 与「抬高 `PI_ASYNC_TOTAL_BYTES` 或设 `PI_ASYNC_QUOTA_HARD=1`」的指引）。
+     **绝不为了凑配额去删活任务、删非终态、删 retention 还承诺的结果。**
+   - 硬模式（`PI_ASYNC_QUOTA_HARD=1`）：继续按同一顺序淘汰 tier 2，**每一条删除之前先写一条日志**
+     （任务 id、目录、原因、字节数），并在返回的 `evicted` 里逐条列出。
+7. 当前 dataDir 的任务被淘汰时走既有 `removeArtifacts()`：文件、内存快照、timer、`notifyClaims` 一起消失
+   （不留幽灵任务）；sibling 目录只删盘上文件，目录本身保留。
+
+### 25.5 可观测性（为什么不是 `async_status`）
+
+- 每一次删除**先写日志再删**：`console.warn("pi-async: storage: …")`，逐条含**目标、原因、字节数**，
+  末尾一条汇总（freed / 剩余 / root）。
+- `sweepStorage(now?)` 返回 `StorageReport`（`removedDirs` / `skipped[]` / `evicted[]` / `usedBytesBefore` /
+  `usedBytesAfter` / `overQuota` / `freedBytes` / `lines`），`registry.lastStorageCleanup()` 取最近一轮。
+  `lines` 与日志逐条相同 —— 测试与 embedder 都能断言「删了多少、为什么删」。
+- **`async_status` 的返回形状不变**（仍是快照数组）：改 payload 字段/语义属 §12 的破坏性工具面变更，
+  本条不做，也不新增工具。**不使用 activity**：§7 已裁定 activity 是 write-only、不能读回、
+  「任何消费者不得把 activity 的有无当作工作证据」，所以它不能当清理证据。
+
+### 25.6 调用点、节流与不可逆性
+
+- 调用点在 `configure()` 末尾（低频、幂等、带 `PI_ASYNC_SWEEP_INTERVAL_MS` 节流，默认 60s；`0` = 每次）。
+  **不放构造器**（D-04 工厂无副作用）、**不放 `TaskRegistry` 的每任务 hot path**；整轮受
+  `MAX_SCAN_DIRS = 256` / `MAX_SNAPSHOTS_PER_DIR = 512` 约束（先按名字排序再截断，截断本身也是确定的）。
+  最坏情况是一轮 256 × 512 次同步读（`~/.pi` 落在 NFS/iCloud 上时最明显）：一轮是同步的、且在
+  `configure()` 的调用路径上，所以节流间隔就是它的上界频率。要更省就抬高
+  `PI_ASYNC_SWEEP_INTERVAL_MS` 或把开关关掉（默认就是关的）。
+- 一轮出错只 `console.error`，`configure()` 不 throw（D-05）。
+- **不可逆**：删掉的产物与目录无法恢复（没有回收站、没有归档副本）。**回退开关只有一个方向**：
+  `PI_ASYNC_SWEEP_SIBLINGS` / `PI_ASYNC_TOTAL_BYTES` 回到默认 `0` 即停止后续清理（已删的不会回来），
+  此时行为与 0.5.x 完全一致。
+
+### 25.7 已知边界（不在本条范围）
+
+- 不杀跨进程的活 pid 孤儿；只跳过。
+- 不删父目录、不删当前 dataDir、不删未过年龄闸的 sibling。
+- 不清理 `*.tmp` 残留（只有整目录回收会连带带走）。
+- 一个目录里有活着的非终态任务时，该目录的**终态**产物也不会被配额淘汰（保守；下一轮该目录空闲后再参与）。
+- **S1 的年龄闸只按年龄，不叠加 `PI_ASYNC_RETENTION_COUNT`**（有意的不对称）：`prune()` 的 count 窗口是
+  「每个 dataDir 内最新 N 个终态任务」——它假设这个 dataDir 还会被打开。S1 回收的恰恰是**已废弃**的
+  session 目录（新 sessionId 每次都是新目录，旧目录永不再被 `configure()`），对它们套用 count 窗口等于
+  永不回收。判断「已废弃」靠的不是猜测：owner marker 的 pid 已死 + 空闲超过年龄闸。
+
+### 25.8 验收清单
+
+- `tests/a-storage-sweep.test.ts`：三闸（当前 dataDir 不删 / 无活 pid 快照/无活 owner 才删 / 未过期不删）
+  与反向用例（三闸都满足时目录被删）；父目录不被删；`*.tmp` 残留不被误判；`foreign_content` /
+  `unreadable_snapshot` / `unreadable_owner` 不删；年龄闸钳位不弱于 retention；**软链别名下当前 dataDir
+  仍不被删**；**活 session 的空转 dataDir 被 owner marker 保护**（owner 死后可回收）；文件系统根被拒绝。
+- 配额：恰好等于配额不删（边界）、多一字节才删；软模式只淘汰 policy-expired 且超限时 `overQuota: true`
+  并保留；硬模式淘汰仍保留的产物且逐条日志；活任务永不被淘汰；**读不出快照/触到快照上限不产生候选**；
+  **当前 dataDir 里有一个 `.DS_Store` 不会让配额自行失效**。
+- 删序确定性：`orderEvictions` 用 20 条同 tier 同 age 的候选断言全序（与输入顺序无关）；
+  **跨目录同 taskId 时 `dataDir` 兜底**；`orderSiblings` 用 `lastActivityMs` + name 兜底断言。
+- 默认关闭：两个开关都不设时 `configure()` 不删任何东西、`sweepStorage()` 是零 I/O 空操作。
+- 测试**不指向真实 `$HOME`**：全部在 `mkdtemp` 的假 session 树下构造。
+- 全量 `npm test` 只增不减（新增 32 例全绿；本机 macOS 上另有 15 个**既有**失败与本次无关，其中 `kill EPERM`
+  那条 flake 在未改动的 `origin/main` 上同样复现），`npm run typecheck` 全绿；变异证据见
+  `docs/reports/storage-lifecycle.md`。
