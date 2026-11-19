@@ -24,6 +24,11 @@ For development, load the extension directly:
 pi -e ./extensions/index.ts
 ```
 
+pi-async is **POSIX-only**: every task runs through `/bin/sh -c` in its own process group, and liveness
+checks read `/proc` where the kernel provides it. Linux and macOS are the supported platforms — Linux is
+what CI exercises; macOS uses the same POSIX paths, with the `/proc` probe degrading to `kill(-pid, 0)`.
+**Windows is not supported or tested.**
+
 ## Tools and commands
 
 The extension registers five tools by default (plus one opt-in tool):
@@ -45,6 +50,12 @@ case-insensitive substring filter over the list (see [Notifications](#notificati
 `async_wait` is not registered by default: a completion notification wakes the session, so the blocking
 collect step is opt-in. If a stale registration is still called while the switch is off, it answers
 `available: false` with the reason and the enabling variable instead of throwing.
+
+A wait belongs to the **current extension generation**. `/reload` retires it: the registry drops its
+waiters, so an in-flight `async_wait` finishes at its own `timeoutMs` with `notReady` — not a failure,
+and it never kills the task. Waiters are not shared across processes; a task's result still lives in
+`<taskId>.json` and its output file, so `async_status` / `async_logs` can read it after the reload.
+(Contract: [`docs/CONTRACT.md` §5](docs/CONTRACT.md#5-async_wait唤醒原语冻结).)
 
 ### How the model finds these tools
 
@@ -93,7 +104,7 @@ Tool notes:
 | `Enter` | Open selected task details: the name/status lines and the key hints stay fixed, and everything between them scrolls — command, metadata and the whole output tail. When the height cannot hold the command/metadata block *and* 8 output rows, the block collapses into a `… (+K lines)` marker that scrolling reads back. The output section is labelled `output (live):` while the task still runs. |
 | `h` | Toggle history in the task list. |
 | `x` (or `K`) | Kill a running task (press again to confirm). |
-| `R` | Rerun the selected task command in that task's original `cwd`. |
+| `R` | Rerun the selected task command in that task's original `cwd`. It does **not** reproduce the original environment, `watch`, or timeout: only `command` / `name` / `mode` / `cwd` carry over, and the child gets the current `PI_ASYNC_ENV_INHERIT` environment. |
 | `c` | **Show** the captured output file path as a toast. Nothing is copied: pi exposes no clipboard API, so there is no copy action. |
 | `Esc` | Close rail-clicked details; return from list-opened details to the list. |
 | `q` | Close the panel. |
@@ -274,6 +285,9 @@ In a legion child session, collect task results before returning a verdict (`asy
 
 ## Known limitations
 
+- **POSIX only.** The runner hard-codes `/bin/sh -c`, detached process groups (negative-pid signals) and,
+  where available, `/proc` for liveness. Linux and macOS are supported; **Windows is not supported or
+  tested** (the Linux side of WSL is a Linux environment). CI has no Windows or macOS runner.
 - Crash-durability is not guaranteed: metadata is atomically replaced, but captured output is not fsynced. After a crash, orphaned running tasks are marked `failed`/`lost` on the next start, and pending delayed tasks are restored with their remaining delay by whichever session next loads the same data directory (process identity does not matter). Recovery inside the same process is complete for `/reload` (`cwd`, `taskTimeoutMs` deadline, and watch deadline are rebuilt from disk).
 - Cross-turn wake-up in legion children depends on the host delivering follow-up messages (upstream pi-legion issue [#156](https://github.com/zzjcool/pi-legion/issues/156)); the extension does not patch Pi or legion.
 - The settle hold keeps the OSC 7501 status in `working` and renders its live wait as the rail's first

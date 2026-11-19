@@ -114,7 +114,8 @@ shutdown 先 drain 再退出。
 
 **工具集（默认 5 个 + 可选 1 个，REV-29）**：`async_run` / `async_logs` / `async_status` / `async_kill` /
 `async_extend`（REV-23，§18），外加仅在 `PI_ASYNC_EXPOSE_WAIT=1` 时注册的 `async_wait`。
-命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。
+命令面：`/async`（开面板）、`/async-clear`（清历史徽章）。工具面的增/删/改名/默认注册面变更规则见 §12
+（必须新增 REV；第 6 席已被可选的 `async_wait` 占用）。
 
 **可发现性面（REV-20/21/22/27/29）**：每个已注册工具各带一条 `promptSnippet`（逐字见 §17；默认 5 条，
 暴露 `async_wait` 时 6 条），`async_run` 另带 4 条 `promptGuidelines`（0.4.1 起含批次规划，§21.2；未暴露
@@ -203,6 +204,25 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 - **REV-7 裁决（#43）**：原契约只写「全终态 → results」与「超时 → notReady」两极，导致混合超时
   路径丢弃已完成结果、且无法对已完成侧置 `outputConsumed`（通知抑制失效）。正式登记超集三态：
   判据仍是「有 notReady ⇒ 超时分支」；`results` 可选并存。实现见 #56，本 REV 只改契约。
+- **代际边界（#100，判据）**：waiter 属于**发起它的那个 registry 实例**（`waiters = new Set<Waiter>()`，
+  `src/core/registry.ts:60,131`）；任务 finalize 只唤醒本实例注册的 waiter（`:1258,:1263`）。每次
+  `async_wait` 调用先 `configure(ctx)` 再由 `resolveRegistry()` 解析当前活代（`src/tools/index.ts:326-327`）。
+  仓库没有跨代 epoch/token —— 代边界就是实例边界。
+  1. `/reload` 即丢：`suspend()` 调 `this.waiters.clear()`，原文「Pending waiters belong to the retired
+     generation; never wake them with stale results.」（`src/core/registry.ts:966-967`）。
+  2. 在飞的 wait 不是失败、也不 kill 任务：`suspend()` 只停 timer/watch + 持久化（`:951-952` 注释；
+     `:955-968` 无 kill；`tests/d-reload.test.ts:150`）。被 clear 的 waiter 仍靠自身 `timeoutMs` 定时器
+     到点（`cleanup()` 才 `clearTimeout`），进入 timeout 分支后按该实例内存快照返回
+     `{ notReady: [{ taskId, status: "running"|"pending", elapsedMs }] }`（`:708-717`；`elapsedMs` =
+     任务创建至今）；工具层 `isError=false`（`src/tools/index.ts:334`）。宿主主动 abort 该调用时走
+     `Wait aborted` reject（`:718`），pi-async 自己不 abort。
+  3. 跨进程无共享 waiter：waiter 不落盘，全仓无 IPC/socket/`fs.watch`；结果事实在
+     `<dataDir>/<taskId>.json` 与输出文件（`src/core/registry.ts:1294-1295`），新代 `reloadFromDisk()`
+     （`:1124`）之后用 `async_status` / `async_logs` 取回。**判据：wait 只命中该实例内存里的任务；
+     要跨代/跨进程收割，用状态工具，不要等 waiter。**
+  - 例外（不改上述判据）：退役实例被自己的 `configure()` 复活（REV-28a）且磁盘真相在孤儿 waiter 到期
+    前已把任务改成终态时，该 wait 返回 `{ results, notReady: [] }` —— timeout 分支读的是 `this.tasks`
+    的当前内容（`:711-716`）。
 
 ## 6. 唤醒链路与 legion 兼容（冻结）
 
@@ -261,18 +281,33 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   `agent_before_settle`，Esc 中断场景需要单独覆盖。
 - 开关：`PI_ASYNC_SETTLE_GUARD=0` → 整个守卫不注册任何 handler。`dispose()` 幂等，退订所有 handler。
 - **无心跳**：不建 `setInterval`、不写 `async-task-heartbeat` entry、不读 `PI_ASYNC_HEARTBEAT_MS`。
-- OSC busy 上报 **仅 feature-detect，不构成能力承诺**（官方 pi 1.2/1.4/1.5 均无 `ui.setActivity`，
-  三处调用在生产上是 no-op；保留 shim 只为上游将来加 API 时自动生效，README/CHANGELOG 不得把它
-  写成已实现能力）：
-  - `ui.setActivity("pi-async", { message: "N async tasks" })`，全清时 `undefined`
-  - 每任务 `id=plugin/pi-async/<task-id>`，raise/clear 与任务状态同步
-  - **REV-8 裁决（#26）**：实现必须带 `plugin/` 前缀（对齐 legion
-    `docs/contracts/osc-busy-plugin.md` 的 `plugin/<name>/…`）；聚合源仍为 `pi-async`（§7 冻结）。
-    此前实现漏前缀会导致宿主按 `plugin/` 路由时 per-task activity 静默无效。
-  - **禁止 printf OSC**；尊重 `PI_PROGRAM_STATUS`
-  - 上报时机：任务启动、终态、以及 `agent_before_settle`（闭合 retire 竞态窗口的关键，见 #156 补充评论）
+- **OSC busy 上报只是 host-API shim，不是已实现能力**（官方 pi 1.2–1.5 均无 `ui.setActivity`；四处
+  `typeof ui?.setActivity !== "function"` 特性检测在生产上是 no-op：`src/core/bus.ts:15,26,34` 与
+  `src/guard/settle-guard.ts:222`）。保留它只为上游将来加 API 时自动生效；README/CHANGELOG 不得把它
+  写成已实现能力。
+  - **它能表达什么**：一次 write-only 的 `(id, { message: string } | undefined)` 调用
+    （`src/core/bus.ts:14,25,33`）。两个 id：聚合 `"pi-async"`（`bus.ts:4,17`）与每任务
+    `plugin/pi-async/<task-id>`（`bus.ts:6-9`）。清除 = 传 `undefined`（没有 idle/working 枚举，
+    也没有结构化字段）。
+  - **它不能表达什么**：不能读回（`src/` / `extensions/` 无 getActivity，activity 不进模型上下文）、
+    不能表达每任务进度/耗时/优先级、**不能证明「真的在干活」或「没有工具在飞」**。legion 跨机场景
+    今天没有转发通道（见下一条 RPC 段：依赖上游 #156 的 `extension_activity`），该侧 activity 字段
+    恒缺/恒错；**任何消费者不得把 activity 的有无当作工作证据**。外部唯一诚实的 busy 信号是 settle
+    hold 不结束 run（§7.1 / README「Settle hold」，OSC 7501 保持 `working`）。
+  - **shim 形状（上游落地后才生效的形状约束，不是能力承诺）**：
+    - 聚合文案 `{ message: "N async tasks" }`（`bus.ts:17`，恒复数）；每任务 raise/clear 与任务状态
+      同步（`extensions/index.ts:411-413`）。
+    - 每任务 id 必须带 `plugin/` 前缀 —— **REV-8 裁决（#26）**：对齐 legion
+      `docs/contracts/osc-busy-plugin.md` 的 `plugin/<name>/…`；聚合源仍为 `pi-async`（§7 冻结）。
+      此前实现漏前缀会导致宿主按 `plugin/` 路由时 per-task activity 静默无效。
+    - **禁止 printf OSC**；尊重 `PI_PROGRAM_STATUS`
+    - 上报时机：任务启动、终态、以及 `agent_before_settle`（闭合 retire 竞态窗口的关键，见 #156 补充评论）
+  - **已知实现分叉（不在本次文档变更内改实现）**：`src/guard/settle-guard.ts:217-230` 有一份不 import
+    `src/core/bus.ts` 的私有 `reportActivity()`（第 4 处 shim；带 try/catch + stale-ctx `dispose()`，
+    文案会单数化为 `1 async task`，与 bus 的 `1 async tasks` 不同）。同一聚合 id 因此有两个写入者；
+    收敛实现另开 issue（见 `docs/reports/contract-cleanup.md`）。
 - RPC（legion child）内：setActivity 依赖 legion `extension_activity` 转发（#156 落地后生效），
-  未落地时静默降级，不影响工具面。
+  未落地时静默降级，不影响工具面；**因此 RPC/跨机侧没有可用的 activity 证据**。
 
 ### 7.1 Settle hold（默认开，D-14）
 
@@ -460,6 +495,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   与 footer 键位提示固定，中间全部内容（三条分隔线、command、metadata、output 标签、全部输出行）
   一起滚动，跟随滚动、上滚暂停；见 §21.1 / §24）；
   键位 `x`（或 `K`）kill（二次确认）/`R` rerun/`c` **显示** output 路径（不是复制）/`q` 关闭；
+  **`R` rerun 的复刻边界（#100）**：cwd = 原任务 cwd（REV-13）；env **不复刻** —— 快照不存 env
+  （`TaskSnapshot` 无该字段），rerun 只传 `command` / `name` / `mode` / `cwd`（`src/tui/panel.ts:532-537`），
+  子进程拿**当前** `process.env` + 当前 `PI_ASYNC_ENV_INHERIT` 策略（`src/core/spawn.ts:78`）；
+  `watch` / `taskTimeoutMs` / `notifyOnCompletion` / `triggerOnCompletion` 同样不复制。
   **详情内 `↑`/`↓`/`j`/`k` 只滚视口、不改选中任务，换任务用 `[`（上一个）/`]`（下一个）**（REV-31）；
   列表内 `↑`/`↓`/`j`/`k` 仍是选择，`k` 不是 kill（REV-18）。Esc 层级：rail 点击直入详情后 Esc 关闭；
   列表内进入详情后 Esc 回落列表。面板为单例：已打开时再次 `/async` 只 `ui.notify("Async panel is already open")` 后
@@ -490,7 +529,7 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 
 ## 10. 杀伤与清理（冻结）
 
-- detached 进程组 spawn（POSIX）；kill：SIGTERM → 3s grace → 组 SIGKILL → 有界探测；
+- detached 进程组 spawn（POSIX only，平台边界见 §12）；kill：SIGTERM → 3s grace → 组 SIGKILL → 有界探测；
   无法证明死亡 → 响亮报错「Descendant processes may have leaked」。
 - `session_shutdown(reason)`（REV-17）：`reload` / `resume` → `registry.suspend()`（停 timer/watch、
   持久化快照，**不 kill 进程**，交给下一代 `configure()` 收养；无后继代时由同一实例的下一次
@@ -621,6 +660,18 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   `npm run verify` → 校验 tag 与 package.json 版本一致（仅 tag 触发时）→ `npm publish --provenance`
   （**Trusted Publishing / OIDC**：`id-token: write`，**无 `NODE_AUTH_TOKEN` / `NPM_TOKEN`**）→
   `gh release create --generate-notes`（`GITHUB_TOKEN`）。
+- **平台 = POSIX only（#100）**：依赖 `/bin/sh -c` + `detached` 进程组（`src/core/spawn.ts:80`）、负 pid
+  进程组信号（`spawn.ts:226,230`）与 `/proc/<pid>/stat` 判活（`spawn.ts:198-201`、`registry.ts:1374-1377`；
+  缺 `/proc` 时退化到 `kill(-pid, 0)`，僵尸组不再区分）。支持 Linux 与 macOS（后者无 `/proc`，走退化
+  路径），**Windows 未支持/未验证**；CI 只跑 Ubuntu（`.github/workflows/ci.yml:17,53,91`）。不加
+  `package.json` 的 `os` 字段：那会把「不承诺」变成 npm 拒装，属行为变更，需 REV。
+- **工具面是冻结契约（#100）**：增/删/改名/改默认注册面必须新增 REV 段（格式同 §16：原因 / 影响面 /
+  回退开关）+ 验收清单 + CHANGELOG 段 + 迁移说明，并同步 `tests/k-toolsurface.test.ts` 与 §17 的
+  snippet 清单。第 6 席已被 `async_wait`（仅 `PI_ASYNC_EXPOSE_WAIT=1` 暴露）占用：新增 list/attach
+  工具实际是第 7 个，或顶掉 `async_wait`，不是「用空位」。破坏性判据（任一命中即按破坏性处理，必须给
+  迁移说明）：删除或改名工具；修改已有参数的类型/必填性/默认值；修改返回 payload 字段或 `isError`
+  语义；改变默认注册面（把可选工具转默认、收紧或更换 env 开关、改默认工具数量）。纯新增且默认不注册
+  的工具仍是工具面变更（需 REV），但可标注「非破坏」并只给开启方式。
 - vendor/reference 不编译不 import，只作参考。
 - MIT License；legion viz 整块复用处保留 attribution 注释。
 
@@ -980,7 +1031,8 @@ async_extend({ taskId, remindAfterMs?, taskTimeoutMs? })
 - `outputConsumed` / `notifyOnCompletion:false` / 终态 → 跳过且不重布防。
 - `async_extend` 移动 `remindAt`、重置计数；终态返回 `alreadyTerminal`；两参数都不传报错。
 - reload 后按剩余预算重布防。
-- 工具清单断言与 `docs/CONTRACT.md` §3 的「工具集（6 个）」表述同步。
+- 工具清单断言与 `docs/CONTRACT.md` §3 的「默认 5 个 + 可选 1 个」表述同步（REV-29：暴露
+  `async_wait` 时 6 个，默认 5 个）。
 
 ### 18.12 实现补充（REV-23a，冻结）
 
