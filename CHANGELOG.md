@@ -2,6 +2,42 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## [Unreleased] — 0.5.2 (minor)
+
+存储生命周期（#102）：新增两个**默认关闭**的开关，解决「旧 session 目录只增不减」与「没有字节上限」。
+不发版、不打 tag、`package.json` 版本不动（由 release 提交统一抬）。契约修订见 `docs/CONTRACT.md` §25（REV-32）。
+
+### Added
+
+- **跨 dataDir 回收（`PI_ASYNC_SWEEP_SIBLINGS=1`）**：`configure()`（默认 60s 节流）会回收
+  `dirname(dataDir)` 下**其他** session 目录，但必须**三闸同时成立**：不是当前 dataDir、目录内没有
+  指向活 pid 的非终态快照、空闲时长超过 `PI_ASYNC_SWEEP_SIBLING_AGE_MS`（默认 14 天，且永远严格大于
+  `PI_ASYNC_RETENTION_MS`）。父目录永远不是目标；`foreign_content` / 损坏快照 / 软链 / 超出扫描上限
+  一律跳过并记录原因 —— 判无知时的默认答案是「不删」。
+- **全局字节配额（`PI_ASYNC_TOTAL_BYTES=<字节>`）**：跨整个 sweep root 统计 `.json`/`.output`/`.stdout`/
+  `.stderr` 的字节数；`used > quota` 才淘汰，恰好等于配额视为在预算内。淘汰顺序是确定的全序
+  （孤儿产物 → retention 本就该丢的终态 → 只有 `PI_ASYNC_QUOTA_HARD=1` 才动的「仍保留」终态；
+  同层内按 `finishedAt ?? createdAt` 升序、`taskId` 字典序兜底）。非终态任务、以及当前有活任务的目录，
+  永远不是候选。
+- **可观测**：每次删除**先写日志再删**（`pi-async: storage: …`，含目标、原因、字节数），一轮结束有汇总行；
+  `registry.sweepStorage()` 返回 `StorageReport`，`registry.lastStorageCleanup()` 取最近一轮。
+  `async_status` 的返回形状不变（§12 工具面冻结），activity 不作为证据（§7）。
+
+### Fixed
+
+- **回收不再是「只读留档」**：`docs/CONTRACT.md` §10 此前明文把跨 session 目录回收划出范围，导致 117 个
+  session 目录 / 4.0 MiB（其中 54 个 mtime > 7 天、86 个空目录）永不被回收；现在有干净的开关与三闸。
+- **`PI_ASYNC_TOTAL_BYTES` 不再是死配置**：此前源码零引用，现在真正生效（默认 `0` = 不限）。
+- 配额超限时**不静默删数据**：默认停手并报 `overQuota: true` + 日志说明，而不是删掉用户可能还要的结果。
+- **dataDir 里新增一个 `.pi-async-owner` 文件**（`{pid, at}`，0600）：它让清理能区分「已废弃」与
+  「活着但只剩终态任务」，否则同一个 repo 下并行的第二个 `pi` 会丢掉整份数据。它不是产物、不计字节、
+  不迁移、不参与 retention。
+- 判「是不是 dataDir」用**正证据**（当前 dataDir / 有可解析快照 / 无异物），而不是「没有异物」：
+  当前 dataDir 里出现一个 `.DS_Store` 不会再让配额悄悄失效。
+- 目录身份按 `dev`/`ino`（回退 `realpath`）判定：`dataDir` 经软链/大小写别名指向同一目录时不会被当成 sibling 删掉。
+- 读不出快照（损坏、未知 status、触到快照扫描上限）的目录**整目录不产生淘汰候选**：`overQuota` 诚实地报满，
+  而不是把看不见的产物当「孤儿」删掉。
+
 ## [Unreleased] — 0.5.1 (patch)
 
 只改任务详情视图（`src/tui/panel.ts`）：选择与滚动分开，被折叠的行变成可读回，极窄终端不再只剩 footer。

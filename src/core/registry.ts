@@ -1,7 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, copyFileSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { closeSync, copyFileSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { DEFAULT_EXIT_GRACE_MS, killTree, spawnDetached, streamPaths } from "./spawn.ts";
+import {
+  MAX_SCAN_DIRS,
+  OWNER_MARKER_NAME,
+  STORAGE_ARTIFACT_SUFFIXES,
+  compareIds,
+  formatBytes,
+  formatDuration,
+  orderSiblings,
+  planEvictions,
+  sameDir,
+  siblingVerdict,
+  surveyDataDir,
+  type DirSurvey,
+  type EvictionCandidate,
+  type StorageReport,
+} from "./storage.ts";
 import { stripLogControls } from "./output.ts";
 import { assertSafeEnvKeys, envNumber } from "./env.ts";
 import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type TaskSnapshot, type TaskStatus, type WatchSpec, type WaitOutcome } from "./task.ts";
@@ -28,6 +44,16 @@ export interface RegistryConfig {
   livenessIntervalMs?: number;
   /** REV-28d (0.4.2): spawn exit-fallback grace window; `<= 0` disables the fallback. */
   spawnExitGraceMs?: number;
+  /** #102 / REV-32: reclaim idle sibling data dirs under `dirname(dataDir)`. Default off. */
+  sweepSiblings?: boolean;
+  /** #102 / REV-32: age gate for a sibling dir; clamped to stay strictly above `retentionMs`. */
+  sweepSiblingAgeMs?: number;
+  /** #102 / REV-32: global artifact byte quota across the sweep root; `<= 0` disables it. */
+  totalBytes?: number;
+  /** #102 / REV-32: also evict terminal artifacts the retention window still keeps. Default off. */
+  quotaHard?: boolean;
+  /** #102 / REV-32: throttle for the `configure()`-driven pass; `<= 0` runs it on every configure. */
+  sweepIntervalMs?: number;
 }
 export interface ListOptions { includeHistory?: boolean; status?: TaskStatus | "active"; name?: string; limit?: number; }
 export type LogStream = "merged" | "stdout" | "stderr";
@@ -97,8 +123,12 @@ const MAX_LOG_WINDOW = 8 * 1024 * 1024;
  * containment — two different bounds for two different reasons.
  */
 const WATCH_READ_BYTES = MAX_LOG_WINDOW;
-/** Artifacts owned by one task; migrated wholesale between data dirs. */
-const ARTIFACT_SUFFIXES = [".json", ".output", ".stdout", ".stderr"] as const;
+/** Artifacts owned by one task; migrated wholesale between data dirs (single source of truth). */
+const ARTIFACT_SUFFIXES = STORAGE_ARTIFACT_SUFFIXES;
+/** #102 / REV-32: default sibling age gate — twice the default retention window. */
+const DEFAULT_SWEEP_SIBLING_AGE_MS = 2 * DEFAULT_RETENTION_MS;
+/** #102 / REV-32: `configure()` runs on every tool call; one storage pass per minute is plenty. */
+const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 
 /** Read `length` bytes at `start`, tolerating short reads from a partially written file. */
 function readExactly(handle: number, start: number, length: number): Buffer {
@@ -139,6 +169,14 @@ export class TaskRegistry {
   private readonly retentionCount: number;
   private readonly livenessIntervalMs: number;
   private readonly spawnExitGraceMs: number;
+  /** #102 / REV-32: storage lifecycle switches (both default off; documented in CONTRACT §11). */
+  private readonly sweepSiblings: boolean;
+  private readonly sweepSiblingAgeMs: number;
+  private readonly totalBytes: number;
+  private readonly quotaHard: boolean;
+  private readonly sweepIntervalMs: number;
+  private lastSweepAt = 0;
+  private lastSweepReport?: StorageReport;
   private config: RegistryConfig;
   private closed = false;
   /** Set by `suspend()`: this generation is retired and must not settle adopted work (REV-17). */
@@ -162,6 +200,15 @@ export class TaskRegistry {
     this.retentionCount = config.retentionCount ?? envNumber("PI_ASYNC_RETENTION_COUNT", DEFAULT_RETENTION_COUNT, { integer: true, min: 0 });
     this.livenessIntervalMs = config.livenessIntervalMs ?? envNumber("PI_ASYNC_LIVENESS_INTERVAL_MS", DEFAULT_LIVENESS_INTERVAL_MS, { integer: true, min: 0 });
     this.spawnExitGraceMs = config.spawnExitGraceMs ?? envNumber("PI_ASYNC_SPAWN_EXIT_GRACE_MS", DEFAULT_EXIT_GRACE_MS, { integer: true, min: 0 });
+    // #102 / REV-32. Every switch is off by default: an untouched install keeps the 0.5.x
+    // per-dataDir prune and nothing else (see CONTRACT §10 and the acceptance list of #102).
+    this.sweepSiblings = config.sweepSiblings ?? envNumber("PI_ASYNC_SWEEP_SIBLINGS", 0, { integer: true, min: 0 }) > 0;
+    const configuredSiblingAge = config.sweepSiblingAgeMs ?? envNumber("PI_ASYNC_SWEEP_SIBLING_AGE_MS", DEFAULT_SWEEP_SIBLING_AGE_MS, { integer: true, min: 0 });
+    // Gate 3 is "older than N days **and** N > retention": the retention window is the floor.
+    this.sweepSiblingAgeMs = Math.max(configuredSiblingAge, this.retentionMs + 1);
+    this.totalBytes = config.totalBytes ?? envNumber("PI_ASYNC_TOTAL_BYTES", 0, { integer: true, min: 0 });
+    this.quotaHard = config.quotaHard ?? envNumber("PI_ASYNC_QUOTA_HARD", 0, { integer: true, min: 0 }) > 0;
+    this.sweepIntervalMs = config.sweepIntervalMs ?? envNumber("PI_ASYNC_SWEEP_INTERVAL_MS", DEFAULT_SWEEP_INTERVAL_MS, { integer: true, min: 0 });
   }
 
   setEvents(events: RegistryEvents): void { this.events = events; }
@@ -228,6 +275,9 @@ export class TaskRegistry {
       this.settleDroppedSnapshots(dropped);
     }
     this.refreshLiveness();
+    // #102 / REV-32: the low-frequency storage pass lives here — `configure()` is idempotent and
+    // throttled, while the constructor stays side-effect free (D-04) and no per-task path pays for it.
+    this.maybeSweepStorage();
   }
 
   /**
@@ -1188,7 +1238,9 @@ export class TaskRegistry {
   prune(now = Date.now()): { pruned: number } {
     const terminal = this.list({ includeHistory: true })
       .filter((task) => isTerminal(task.status))
-      .sort((a, b) => (b.finishedAt ?? b.createdAt) - (a.finishedAt ?? a.createdAt));
+      // REV-32: same age key *and* the same id tie-break as `expiredTaskIds()`, so the quota's
+      // soft tier and this prune can never disagree about which equal-aged task is the outsider.
+      .sort((a, b) => (b.finishedAt ?? b.createdAt) - (a.finishedAt ?? a.createdAt) || compareIds(a.taskId, b.taskId));
     let pruned = 0;
     for (let i = 0; i < terminal.length; i++) {
       const task = terminal[i]!;
@@ -1202,13 +1254,206 @@ export class TaskRegistry {
     return { pruned };
   }
 
-  private removeArtifacts(task: TaskSnapshot): void {
+  /**
+   * #102 / REV-32 — one storage lifecycle pass (CONTRACT §10).
+   *
+   * Two independent halves, both **off by default**:
+   *
+   * 1. **Cross-dataDir reclamation** (`PI_ASYNC_SWEEP_SIBLINGS=1`): a sibling directory of this
+   *    data dir (i.e. another session's `pi-async/<sessionId>`) is removed wholesale only when all
+   *    three gates hold — it is not this data dir, no non-terminal snapshot inside it points at an
+   *    alive pid, and it has been idle for longer than `PI_ASYNC_SWEEP_SIBLING_AGE_MS` (clamped to
+   *    stay strictly above `PI_ASYNC_RETENTION_MS`). Doubt always skips: foreign content, an
+   *    unparsable snapshot and anything that is not a plain directory are never deleted.
+   * 2. **Global byte quota** (`PI_ASYNC_TOTAL_BYTES`, unit = bytes of task artifacts across the
+   *    whole sweep root): evict terminal-task artifact sets in a deterministic order (tier, then
+   *    oldest `finishedAt ?? createdAt`, then taskId). Non-terminal tasks and the data dirs holding
+   *    a live task are never candidates. A soft pass only evicts what the retention union would drop
+   *    anyway; if that is not enough the pass stops and reports `overQuota` instead of eating results
+   *    the retention window still promises (`PI_ASYNC_QUOTA_HARD=1` opts into evicting those too).
+   *
+   * Every removal is logged **before** the unlink and summarised in the returned report — a pass
+   * that deletes data is never silent, and the contract forbids using task activity as evidence.
+   */
+  sweepStorage(now = Date.now()): StorageReport {
+    const dataDir = resolve(this.config.dataDir);
+    const root = dirname(dataDir);
+    const report: StorageReport = {
+      at: now, root, dataDir, quotaBytes: this.totalBytes,
+      usedBytesBefore: 0, usedBytesAfter: 0, overQuota: false,
+      removedDirs: [], skipped: [], evicted: [], protectedDirs: [], unreadableDirs: [], freedBytes: 0, lines: [],
+    };
+    // Both switches off is the shipped default: not one stat call, so 0.5.x behaviour is untouched.
+    if (!this.sweepSiblings && this.totalBytes <= 0) return report;
+    const log = (line: string): void => { report.lines.push(line); console.warn(`pi-async: ${line}`); };
+
+    // A sweep root is a *session container*. The filesystem root is never one: refusing it here keeps
+    // a mis-pointed dataDir (`/`) from turning the quota into a filesystem-wide walk.
+    if (dirname(root) === root) {
+      log(`storage: refusing to sweep the filesystem root (${root}); set a session-scoped data dir`);
+      this.lastSweepReport = report;
+      return report;
+    }
+
+    // One survey of the sweep root feeds both phases and keeps the byte accounting exact.
+    const surveys: DirSurvey[] = [];
+    let names: string[] = [];
+    try { names = readdirSync(root).sort(); } catch { /* the root may not exist yet */ }
+    for (const name of names) {
+      const path = join(root, name);
+      if (surveys.length >= MAX_SCAN_DIRS) { report.skipped.push({ path, reason: "scan_limit" }); continue; }
+      const survey = surveyDataDir(path);
+      if (survey === undefined) { report.skipped.push({ path, reason: "not_a_directory" }); continue; }
+      surveys.push(survey);
+    }
+    // A data dir is recognised by positive evidence: it is *this* data dir, or it holds at least one
+    // parseable snapshot, or nothing in it contradicts the layout. A junk-tainted directory that is
+    // still clearly a data dir keeps its artifact bytes in the accounting — dropping the current
+    // data dir on one stray `.DS_Store` would make an exceeded quota report itself as satisfied.
+    const isDataDir = (survey: DirSurvey): boolean =>
+      sameDir(survey.path, dataDir) || !survey.foreign || survey.snapshots.length > 0;
+    for (const survey of surveys) {
+      if (isDataDir(survey) || survey.bytes === 0) continue;
+      report.skipped.push({ path: survey.path, reason: "not_a_data_dir", detail: `${formatBytes(survey.bytes)} ignored by the quota` });
+    }
+    report.usedBytesBefore = surveys.reduce((total, survey) => total + (isDataDir(survey) ? survey.bytes : 0), 0);
+
+    // Phase 1 — cross-dataDir reclamation behind the three gates.
+    let survivors = surveys;
+    if (this.sweepSiblings) {
+      const keep: DirSurvey[] = [];
+      for (const survey of orderSiblings(surveys)) {
+        const verdict = siblingVerdict(survey, {
+          currentDataDir: dataDir, now, minAgeMs: this.sweepSiblingAgeMs,
+          pidAlive: (pid) => this.pidAlive(pid),
+        });
+        if (!verdict.deletable) {
+          report.skipped.push({ path: survey.path, reason: verdict.reason ?? "recently_active", ...(verdict.detail === undefined ? {} : { detail: verdict.detail }) });
+          keep.push(survey);
+          continue;
+        }
+        // Logged before the unlink: deleting a directory is never silent.
+        log(`storage: removing sibling data dir ${survey.path} (idle ${formatDuration(now - survey.lastActivityMs)}, no live task, ${formatBytes(survey.bytes)})`);
+        try {
+          rmSync(survey.path, { recursive: true, force: true });
+          report.removedDirs.push(survey.path);
+          report.freedBytes += survey.bytes;
+        } catch (error) {
+          // Could not prove the removal: keep it in the accounting rather than lying about it.
+          report.skipped.push({ path: survey.path, reason: "delete_failed", detail: String(error) });
+          keep.push(survey);
+        }
+      }
+      survivors = keep;
+    }
+
+    // Phase 2 — global byte quota over the surviving data dirs. A `foreign_content` directory is not
+    // a pi-async data dir, so its bytes are not part of the artifact budget (and it yields no
+    // candidates): a wrong `dirname(dataDir)` can neither inflate the quota nor lose data to it.
+    if (this.totalBytes > 0) {
+      const dataDirs = survivors.filter((survey) => isDataDir(survey));
+      const used = dataDirs.reduce((total, survey) => total + survey.bytes, 0);
+      const plan = planEvictions(dataDirs, {
+        now, usedBytes: used, quotaBytes: this.totalBytes,
+        retentionMs: this.retentionMs, retentionCount: this.retentionCount,
+        hard: this.quotaHard, currentDataDir: dataDir, pidAlive: (pid) => this.pidAlive(pid),
+      });
+      let evictedBytes = 0;
+      for (const candidate of plan.selected) {
+        const reason = candidate.tier === 0 ? "orphan" : candidate.tier === 1 ? "expired" : "unexpired";
+        const what = candidate.kind === "task" ? `task ${candidate.taskId}` : "unreferenced artifact";
+        log(`storage: evicting ${what} from ${candidate.dataDir} (${reason}, ${formatBytes(candidate.bytes)})`);
+        const freed = this.evictCandidate(candidate, dataDir);
+        evictedBytes += freed.bytes;
+        report.evicted.push({
+          dataDir: candidate.dataDir,
+          ...(candidate.taskId === undefined ? {} : { taskId: candidate.taskId }),
+          files: freed.files, bytes: freed.bytes, reason,
+        });
+      }
+      report.freedBytes += evictedBytes;
+      report.protectedDirs = plan.protectedDirs;
+      report.unreadableDirs = plan.unreadableDirs;
+      report.overQuota = used - evictedBytes > this.totalBytes;
+      if (report.overQuota) {
+        log(`storage: quota still exceeded after ${plan.selected.length} eviction(s): ${formatBytes(used - evictedBytes)} used > ${formatBytes(this.totalBytes)} quota — kept the remaining artifacts (raise PI_ASYNC_TOTAL_BYTES, or set PI_ASYNC_QUOTA_HARD=1 to also drop results the retention window still keeps)`);
+      }
+    }
+
+    report.usedBytesAfter = report.usedBytesBefore - report.freedBytes;
+    if (report.removedDirs.length > 0 || report.evicted.length > 0) {
+      log(`storage: pass freed ${formatBytes(report.freedBytes)} (${report.removedDirs.length} dir(s), ${report.evicted.length} artifact set(s)); ${formatBytes(report.usedBytesAfter)} left under ${root}`);
+    }
+    this.lastSweepReport = report;
+    return report;
+  }
+
+  /**
+   * Delete one planned candidate and return the bytes actually freed.
+   *
+   * Current-dataDir task sets go through `removeArtifacts()` so the in-memory snapshot, timers and
+   * notification claim disappear together with the files (a half-evicted task would be a ghost).
+   */
+  private evictCandidate(candidate: EvictionCandidate, currentDataDir: string): { bytes: number; files: number } {
+    if (candidate.kind === "task" && sameDir(candidate.dataDir, currentDataDir)) {
+      const snapshot = candidate.taskId === undefined ? undefined : this.tasks.get(candidate.taskId);
+      if (snapshot !== undefined) return this.removeArtifacts(snapshot);
+    }
+    const dir = resolve(candidate.dataDir);
+    let bytes = 0;
+    let files = 0;
+    for (const file of candidate.files) {
+      const target = resolve(file);
+      // Boundary: only plain files that live directly in the surveyed directory are ever unlinked
+      // (a symlink is never followed, so a crafted entry cannot reach outside its data dir).
+      if (target !== dir && !target.startsWith(dir + sep)) continue;
+      try {
+        const stat = lstatSync(target);
+        if (!stat.isFile()) continue;
+        rmSync(target, { force: true });
+        bytes += stat.size;
+        files++;
+      } catch { /* already gone / not a plain file: nothing freed */ }
+    }
+    return { bytes, files };
+  }
+
+  /**
+   * `configure()` entry point: throttled and non-throwing (D-05 — it runs inside a session-start
+   * handler, where a throw becomes extension noise). Runs at most once per
+   * `PI_ASYNC_SWEEP_INTERVAL_MS`; `<= 0` means every configure.
+   */
+  private maybeSweepStorage(now = Date.now()): void {
+    if (!this.sweepSiblings && this.totalBytes <= 0) return;
+    if (this.sweepIntervalMs > 0 && this.lastSweepAt !== 0 && now - this.lastSweepAt < this.sweepIntervalMs) return;
+    this.lastSweepAt = now;
+    try { this.sweepStorage(now); }
+    catch (error) { console.error("pi-async: storage sweep failed", error); }
+  }
+
+  /**
+   * Last storage pass this instance ran (REV-32): the observable record of what was deleted and
+   * why. The `async_status` payload stays frozen (CONTRACT §12), so this is a library surface plus
+   * the log lines the pass emitted — never task activity, which is a write-only shim.
+   */
+  lastStorageCleanup(): StorageReport | undefined { return this.lastSweepReport; }
+
+  private removeArtifacts(task: TaskSnapshot): { bytes: number; files: number } {
     const outputFile = String(task.metadata.outputFile ?? join(this.config.dataDir, `${task.taskId}.output`));
     const { stdout, stderr } = streamPaths(outputFile);
     // D-11: never delete outside the data dir (skip silently so prune cannot crash).
+    let bytes = 0;
+    let files = 0;
     for (const file of [outputFile, stdout, stderr, join(this.config.dataDir, `${task.taskId}.json`)]) {
       if (!this.isInsideDataDir(file)) continue;
-      try { rmSync(file, { force: true }); } catch { /* force already ignores ENOENT; swallow other rare races */ }
+      // REV-32: count only what was really unlinked (a vanished or non-plain file frees nothing).
+      try {
+        const stat = lstatSync(file);
+        if (!stat.isFile()) continue;
+        rmSync(file, { force: true });
+        bytes += stat.size;
+        files++;
+      } catch { /* already gone / not a plain file: nothing freed */ }
     }
     const live = this.live.get(task.taskId);
     if (live?.timer) clearTimeout(live.timer);
@@ -1220,6 +1465,7 @@ export class TaskRegistry {
     this.watchLoops.delete(task.taskId);
     this.tasks.delete(task.taskId);
     this.notifyClaims.delete(task.taskId);
+    return { bytes, files };
   }
 
   private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind } {
@@ -1283,7 +1529,24 @@ export class TaskRegistry {
   private ensureDataDir(): void {
     if (this.dataDirReady) return;
     mkdirSync(this.config.dataDir, { recursive: true });
+    this.writeOwnerMarker();
     this.dataDirReady = true;
+  }
+  /**
+   * REV-32: claim this data dir for this process. Without it a sweep cannot tell "abandoned" from
+   * "alive but idle with only terminal tasks" — one sweep root is shared by every session of a
+   * directory, so the second kind would lose its data. Atomic like a snapshot, 0600, and never
+   * throwing: a marker that cannot be written must not break `persist()`.
+   */
+  private writeOwnerMarker(): void {
+    const file = join(this.config.dataDir, OWNER_MARKER_NAME);
+    const temp = `${file}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temp, JSON.stringify({ pid: process.pid, at: Date.now(), marker: "pi-async-owner" }), { mode: 0o600 });
+      renameSync(temp, file);
+    } catch (error) {
+      console.error(`pi-async: cannot write the data dir owner marker ${file}`, error);
+    }
   }
   /** `configure()` is contractually non-throwing (D-05); a bad data dir surfaces on persist. */
   private ensureDataDirQuietly(): void {
@@ -1342,6 +1605,8 @@ export class TaskRegistry {
       try { this.persist(task); } catch (error) { console.error(`pi-async: could not rewrite task ${task.taskId} after data dir migration`, error); }
     }
     for (const name of names) { try { rmSync(join(oldDir, name), { force: true }); } catch { /* best-effort cleanup */ } }
+    // The claim moves with the session: a stale marker in the old dir would keep it alive forever.
+    try { rmSync(join(oldDir, OWNER_MARKER_NAME), { force: true }); } catch { /* best-effort cleanup */ }
     return true;
   }
 

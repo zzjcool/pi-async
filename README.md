@@ -131,6 +131,11 @@ The rail's first row summarizes running, pending, elapsed, completed, and failed
 | `PI_ASYNC_FOOTER` | `off` | Set `1` to also render a one-line task summary through the host's `setStatus` footer (only when the host exposes `setStatus`). The rail's first row is the default status surface. |
 | `PI_ASYNC_RETENTION_MS` | `604800000` (7 days) | How long terminal-task artifacts are retained; union with `RETENTION_COUNT`. |
 | `PI_ASYNC_RETENTION_COUNT` | `100` | Max newest terminal tasks kept per dataDir; union with `RETENTION_MS`. |
+| `PI_ASYNC_SWEEP_SIBLINGS` | `off` | Set `1` to reclaim idle sibling session directories under the parent of the data directory (three gates; see [Data directory](#data-directory)). |
+| `PI_ASYNC_SWEEP_SIBLING_AGE_MS` | `1209600000` (14 days) | Idle time a sibling directory needs before it may be reclaimed; clamped to stay strictly above `PI_ASYNC_RETENTION_MS`. |
+| `PI_ASYNC_SWEEP_INTERVAL_MS` | `60000` | Throttle for the `configure()`-driven storage pass; `0` runs it on every configure. |
+| `PI_ASYNC_TOTAL_BYTES` | `0` (off) | Global quota in **bytes** for `.json`/`.output`/`.stdout`/`.stderr` across all data directories under the parent; `0` means unlimited. |
+| `PI_ASYNC_QUOTA_HARD` | `off` | Set `1` to also evict results the retention window still keeps when the quota cannot be met otherwise (each eviction is logged first). |
 | `PI_ASYNC_RAIL_LINGER_MS` | `30000` | How long completed/failed/killed tasks stay on the rail before disappearing. |
 
 Under the default `safe` policy, inherited variables matching `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL*`, plus `AWS_SECRET_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`, `AWS_SESSION_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, and `NPM_TOKEN` are removed. `npm_config_*` keys whose name contains `auth`, `token`, or `password` (for example `npm_config__authToken`, which npm reads as a credential) are removed as well, so npm credentials exported by the parent shell do not leak into tasks; ordinary npm settings such as `npm_config_registry` still pass through. Passing a dangerous key explicitly through `env` (`PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `PYTHONPATH`, `GIT_SSH_COMMAND`) throws instead of being silently ignored — **under every policy, including `all`**; the safety rule cannot be switched off. Ordinary keys may still be overridden.
@@ -273,11 +278,20 @@ Captured artifacts live per session:
 - With a session manager: `<session dir>/pi-async/<sessionId>/`
 - Without one: `~/.pi/async/<pid>/`
 
-Each task writes `<taskId>.json` (atomically replaced metadata) plus `<taskId>.output` and its `.stdout` / `.stderr` sidecars. Files are created with mode `0600`.
+Each task writes `<taskId>.json` (atomically replaced metadata) plus `<taskId>.output` and its `.stdout` / `.stderr` sidecars. Files are created with mode `0600`. The data directory also carries a `.pi-async-owner` marker (`{pid, at}`, mode `0600`): it is how the opt-in cleanup below tells an abandoned session directory from one whose process is alive but idle. The marker is not a task artifact — it is never counted against the byte quota, never parsed as a snapshot, and not migrated.
 
 Do **not** point the data directory at a git-tracked path: captured output can contain credentials, tokens, or other secrets a command printed. Terminal-task artifacts are pruned by `PI_ASYNC_RETENTION_MS` ∪ `PI_ASYNC_RETENTION_COUNT`; non-terminal tasks are never pruned **directly** — orphan detection (`configure()` → `reapOrphans()`) first marks `running` tasks whose pid is gone as `failed` (`failureKind: "lost"`) at startup, and marks pending delayed tasks as `lost` when their due time is older than **`PI_ASYNC_RETENTION_MS`** (the count setting does not apply to them). Pending delayed tasks still inside that window are restored with their remaining delay.
 
 If the resolved data directory changes inside a live process, artifacts are copied to the new location; if migration fails, pi-async logs the error and keeps the old directory so no task is lost.
+
+### Reclaiming old session directories and capping disk use (#102)
+
+Both switches below are **off by default**; with them unset nothing new runs (no `stat`, no `readdir`). They are irreversible when they fire: deleted artifacts are gone, and turning the switch off only stops *further* cleanup.
+
+- `PI_ASYNC_SWEEP_SIBLINGS=1` — on `configure()` (throttled by `PI_ASYNC_SWEEP_INTERVAL_MS`, default 60 s) pi-async also looks at the **sibling** session directories under the parent of the data directory (`<session dir>/pi-async/`). A sibling is removed only when all three gates hold: it is not the live data directory (identity, not spelling — a symlink or a case-insensitive alias still counts as "current"), nobody is using it (no `running`/`pending` snapshot pointing at a live process, and no live owner marker), and it has been idle for `PI_ASYNC_SWEEP_SIBLING_AGE_MS` (default 14 days, never less than the retention window). Anything doubtful is kept: a directory holding files a data dir never writes, a snapshot that does not parse, an owner marker that cannot be read, or a symlink, is skipped with a reason in the report. The parent itself is never a target.
+- `PI_ASYNC_TOTAL_BYTES=<bytes>` — a **global** byte quota over every data directory under that same parent, counting `.json`, `.output`, `.stdout` and `.stderr` (transient `*.tmp` residue is not counted). Exactly at the quota is fine; only `used > quota` triggers eviction, and the order is deterministic: unreferenced artifacts first, then terminal tasks the retention window would drop anyway (oldest `finishedAt ?? createdAt` first, task id as tie-break). `running`/`pending` artifacts are never evicted, and neither is anything inside a directory that currently owns a live task.
+
+If the quota still cannot be met after those evictions the pass **stops and keeps your data**: it logs the shortfall and the report says `overQuota: true`. Set `PI_ASYNC_QUOTA_HARD=1` to also drop results the retention window still keeps (each deletion is logged before it happens). `registry.lastStorageCleanup()` returns the report of the last pass, and every removal is logged as one `pi-async: storage: …` line naming the target, the reason and the bytes.
 
 ## Legion child sessions
 
