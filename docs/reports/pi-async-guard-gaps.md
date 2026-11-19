@@ -134,8 +134,8 @@ npm test            # tests 480 / pass 451 / fail 16 / skipped 13
 
 - 新增 6 条测试（a-bus +1、a-settle-guard +2、f-reminder +3），**没有删除/跳过任何既有测试**。
 - **失败集合逐条相同**（16 条，均为本机 macOS 的既存环境失败；CI 是 Ubuntu）：
-  `/var/folders` vs `/private/var` realpath 导致 `assertInsideDataDir` 拒绝 6 条；`kill EPERM` 1 条；
-  hold/rail 时序 8 条；`tests/g-revive-after-suspend.test.ts` 文件级 1 条（tmp 文件 ENOENT 竞态）。
+  `/var/folders` vs `/private/var` realpath 导致 `assertInsideDataDir` 拒绝 **5** 条；`kill EPERM` 1 条；
+  hold/rail 时序 **9** 条；`tests/g-revive-after-suspend.test.ts` 文件级 1 条（tmp 文件 ENOENT 竞态）。
 - 13 条 skip 全部是既有的 `# SKIP needs /proc process-group probing (CI is ubuntu)`，未新增 skip，
   无 `SKIPPED:` 行。
 - 失败数 16 → 16、skip 13 → 13、pass +6 = 新增测试数；**无回归**。
