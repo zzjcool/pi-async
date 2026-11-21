@@ -237,6 +237,24 @@ test("a synchronously throwing kill is caught too", async () => {
   panel.component.dispose();
 });
 
+test("#101: a kill error from the previous task does not follow a detail task switch", async () => {
+  const tasks = [
+    makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
+    makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
+  ];
+  const panel = setup({ tasks, killMode: "reject", initialTaskId: "a" });
+  panel.component.handleInput("x");
+  panel.component.handleInput("x");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(panel.component.render(100).join("\n"), /error:.*kill denied/, "precondition: alpha's kill failed");
+
+  panel.component.handleInput("]");
+  const after = panel.component.render(100).join("\n");
+  assert.match(after, /\[b\]/, "the detail view switched to beta");
+  assert.doesNotMatch(after, /kill denied/, "beta must not inherit alpha's error row");
+  panel.component.dispose();
+});
+
 test("c only notifies the output path and never calls copyToClipboard", () => {
   const panel = setup();
   panel.component.handleInput("\r");
