@@ -44,6 +44,25 @@
 - `skills/async-tasks/SKILL.md` 删掉 sync 章节，`async_wait` 描述为「默认不存在，宿主设
   `PI_ASYNC_EXPOSE_WAIT=1` 才暴露；默认做法是结束回合等完成通知」。
 
+### Changed（TUI 详情视口，#101）
+
+- **详情是视口，不是拼装**：`command` / `metadata` / output 合成一个可滚动的 body，标题 + status 固定在
+  顶部、键位提示固定在最后一行；`scroll` 改作用于整份 body（0 = 贴尾）。24 行终端从「8 行输出 + 一个
+  `… (+K lines)` 折叠标记」变成 14 行窗口，且 `PgUp` 能一路滚到原先被折叠的 command/metadata 行。
+  `output (live):` 标签随 output 块一起滚（滚到它才看见；固定行里的 `status: running` 仍是实时的权威指示）。
+- **`… (+K lines)` 语义改为滚动位置标记**：只在离开尾部上滚后出现（替换窗口首行，不额外占行），
+  数值 = 标记上方未显示的行数；贴尾时、以及滚到文档顶部（上方 0 行）时都不出现。
+- **`PgUp`/`PgDn` 一页 = 当前窗口行数**（24 行终端 14 行、40 行 27 行），不再是旧的 8–13 行输出窗口。
+- **选择与滚动拆开**：详情里 `↑`/`↓`/`j`/`k` 只滚 body、不改选中任务（之前会跳到上一个/下一个任务）；
+  切换任务用新增的 `[` / `]`（详情内，到两端时不动，也不会把已上滚的视图拉回尾部）；列表模式的
+  `↑`/`↓`/`j`/`k` 仍然是选择。
+- **退化视口保留 header**：极窄终端不再只剩 footer——最后一行是键位提示，紧贴其上是 body 窗口，
+  窗口之上依次是 status、title（只够一行时仅 title）。
+- **kill 确认与错误行钉在 footer 上方**（上滚时也可见），否则「确认一下」会变成看不见的陷阱。
+- 详情 footer 的键位提示加 `[ ] task`、`x kill/cancel` 收缩为 `x kill`（pending 的取消语义由确认行说明）。
+- **不含** `#101` 的 D4（Kitty 键盘编码：`matchesKey`/`[13;2u`/modified arrows）——方向键与 `[`/`]`
+  仍按现有字节比较匹配；D4 另开一轮。
+
 ### Added（D5）
 
 - **headless（`pi -p`）结构性保底**：print 会话在 `agent_before_settle` 边界等到所有 `running` 任务终态，

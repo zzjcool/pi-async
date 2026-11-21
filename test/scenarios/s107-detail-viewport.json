@@ -1,0 +1,26 @@
+{
+  "turns": [
+    {
+      "text": "Starting two viewport demo tasks.",
+      "tools": [
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "viewport-demo",
+            "mode": "background",
+            "command": "set -e\nprep() {\n  echo \"preparing step $1\"\n}\nfor step in one two three four five six seven eight nine ten eleven twelve thirteen fourteen; do\n  prep \"$step\"\ndone\necho '--- log start ---'\nfor i in $(seq 1 200); do\n  echo \"log line $i of a deliberately long run\"\ndone\necho '--- log done ---'\n"
+          }
+        },
+        {
+          "name": "async_run",
+          "arguments": {
+            "name": "viewport-two",
+            "mode": "background",
+            "command": "set -e\nsay() {\n  echo \"second task step $1\"\n}\nfor step in red green blue yellow cyan magenta black white; do\n  say \"$step\"\ndone\necho '--- second log start ---'\nfor i in $(seq 1 200); do\n  echo \"second log line $i of a deliberately long run\"\ndone\necho '--- second log done ---'\n"
+          }
+        }
+      ]
+    },
+    { "text": "Both tasks are running." }
+  ]
+}

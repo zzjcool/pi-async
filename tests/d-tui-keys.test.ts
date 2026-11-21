@@ -16,6 +16,16 @@ const OUTPUT_FILE = join(FIXTURE_DIR, "task-1.log");
 test.after(() => rmSync(FIXTURE_DIR, { recursive: true, force: true }));
 
 /**
+ * The viewport tests below assume a 24-row terminal: the panel reads `process.stdout.rows`,
+ * which is the real height on a TTY and 24 under a pipe. Pin it for this file so a tall
+ * terminal cannot make the whole body fit and silently disable scrolling.
+ */
+test.before(() => {
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+});
+
+/**
  * Fake registry + fake ui for the 0.3.0 kill/copy key contract (§2.9).
  * The ui deliberately exposes `copyToClipboard`: `c` must never reach it.
  */
@@ -132,18 +142,140 @@ test("list k only moves up and never kills", async () => {
   panel.component.dispose();
 });
 
-test("detail k scrolls up instead of killing", async () => {
+test("detail k scrolls the body and never changes the selected task (#101 D1)", async () => {
   const tasks = [
     makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
     makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
   ];
-  const panel = setup({ tasks });
+  const logsText = `${Array.from({ length: 40 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}`).join("\n")}\n`;
+  const panel = setup({ tasks, logsText });
   panel.component.handleInput("j");
   panel.component.handleInput("\r");
-  assert.match(panel.component.render(100).join("\n"), /\[b\]/);
+  const first = panel.component.render(100).join("\n");
+  assert.match(first, /\[b\]/);
+  assert.match(first, /row 40/, "the detail opens on the output tail");
+  assert.match(first, /\[ \] task/, "the footer advertises the detail-mode task switch");
+
   panel.component.handleInput("k");
+  const scrolled = panel.component.render(100).join("\n");
+  assert.match(scrolled, /\[b\]/, "k in detail must not move to the previous task");
+  assert.equal(scrolled.includes("row 40"), false, "k in detail scrolls the body up");
+  assert.match(scrolled, /… \(\+\d+ lines\)/, "scrolling up marks the rows above the window");
+  assert.equal(panel.killed.length, 0, "k is never a kill key");
+
+  // list mode is the only place arrows change the selection, so the return trip shows beta.
+  panel.component.handleInput("\u001b");
+  assert.match(panel.component.render(100).join("\n"), /▶ beta/);
+  await Promise.resolve();
+  assert.deepEqual(panel.killed, []);
+  panel.component.dispose();
+});
+
+test("list arrows select tasks, detail arrows only scroll (#101 D1)", () => {
+  const tasks = [
+    makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
+    makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
+  ];
+  const logsText = `${Array.from({ length: 40 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}`).join("\n")}\n`;
+  const panel = setup({ tasks, logsText });
+  panel.component.handleInput("\u001b[B");
+  assert.match(panel.component.render(100).join("\n"), /▶ beta/, "list ↓ moves the selection");
+  panel.component.handleInput("\u001b[A");
+  assert.match(panel.component.render(100).join("\n"), /▶ alpha/, "list ↑ moves the selection back");
+  panel.component.handleInput("\u001b[B");
+  panel.component.handleInput("\r");
+  const detail = panel.component.render(100).join("\n");
+  assert.match(detail, /\[b\]/, "detail opens on the selected task");
+  assert.match(detail, /row 40/, "on that task's tail");
+
+  panel.component.handleInput("\u001b[A");
+  const up = panel.component.render(100).join("\n");
+  assert.match(up, /\[b\]/, "detail ↑ keeps beta (the old code jumped to alpha here)");
+  assert.equal(up.includes("row 40"), false, "detail ↑ scrolls the window up");
+  panel.component.handleInput("\u001b[B");
+  const down = panel.component.render(100).join("\n");
+  assert.match(down, /\[b\]/, "detail ↓ keeps the task too");
+  assert.match(down, /row 40/, "detail ↓ scrolls back to the tail");
   assert.equal(panel.killed.length, 0);
-  assert.match(panel.component.render(100).join("\n"), /\[a\]/, "k in detail moves to the previous task");
+  panel.component.dispose();
+});
+
+test("detail [ / ] at either end neither switches nor yanks the view to the tail (#101 D1)", () => {
+  const tasks = [
+    makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
+    makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
+  ];
+  const logsText = `${Array.from({ length: 40 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}`).join("\n")}\n`;
+  const panel = setup({ tasks, logsText });
+  panel.component.handleInput("\r");
+  panel.component.handleInput("k");
+  assert.equal(panel.component.render(100).join("\n").includes("row 40"), false, "precondition: scrolled up");
+  panel.component.handleInput("[");
+  const atFirst = panel.component.render(100).join("\n");
+  assert.match(atFirst, /\[a\]/, "[ on the first task does not move");
+  assert.equal(atFirst.includes("row 40"), false, "and does not reset the scroll position either");
+  panel.component.handleInput("]");
+  assert.match(panel.component.render(100).join("\n"), /\[b\]/, "] moves to the next task");
+  panel.component.handleInput("]");
+  const atLast = panel.component.render(100).join("\n");
+  assert.match(atLast, /\[b\]/, "] on the last task does not move");
+  assert.match(atLast, /row 40/, "the new task is still shown at its tail");
+  panel.component.dispose();
+});
+
+test("the kill confirmation stays visible while the detail is scrolled (#101)", () => {
+  const logsText = `${Array.from({ length: 40 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}`).join("\n")}\n`;
+  const panel = setup({ logsText });
+  panel.component.handleInput("\r");
+  panel.component.handleInput("k");
+  panel.component.handleInput("k");
+  panel.component.handleInput("x");
+  const armed = panel.component.render(100).join("\n");
+  assert.match(armed, /… \(\+\d+ lines\)/, "precondition: the body is scrolled up");
+  assert.match(armed, /press x again to confirm/, "an invisible confirmation would be a trap");
+  assert.match(armed.split("\n").at(-2)!, /x kill/, "the footer is still the last body line");
+  panel.component.dispose();
+});
+
+test("a kill error from the previous task does not follow a detail task switch (#101)", async () => {
+  const tasks = [
+    makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
+    makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
+  ];
+  const panel = setup({ tasks, killMode: "reject" });
+  panel.component.handleInput("\r");
+  panel.component.handleInput("x");
+  panel.component.handleInput("x");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(panel.component.render(100).join("\n"), /error:.*kill denied/);
+  panel.component.handleInput("]");
+  const after = panel.component.render(100).join("\n");
+  assert.match(after, /\[b\]/, "the switch happened");
+  assert.doesNotMatch(after, /kill denied/, "beta must not inherit alpha's error row");
+  panel.component.dispose();
+});
+
+test("detail [ / ] step to the neighbouring task and reopen on its tail (#101 D1)", () => {
+  const tasks = [
+    makeSnapshot({ taskId: "a", name: "alpha", metadata: { outputFile: join(FIXTURE_DIR, "a.log") } }),
+    makeSnapshot({ taskId: "b", name: "beta", metadata: { outputFile: join(FIXTURE_DIR, "b.log") } }),
+  ];
+  const logsText = `${Array.from({ length: 40 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}`).join("\n")}\n`;
+  const panel = setup({ tasks, logsText });
+  panel.component.handleInput("\r");
+  assert.match(panel.component.render(100).join("\n"), /\[a\]/);
+  panel.component.handleInput("k");
+  assert.equal(panel.component.render(100).join("\n").includes("row 40"), false, "precondition: scrolled up");
+
+  panel.component.handleInput("]");
+  const next = panel.component.render(100).join("\n");
+  assert.match(next, /\[b\]/, "] moves to the next task without leaving the detail view");
+  assert.match(next, /row 40/, "the next task opens at its own tail");
+
+  panel.component.handleInput("[");
+  assert.match(panel.component.render(100).join("\n"), /\[a\]/, "[ moves back to the previous task");
+  panel.component.handleInput("\u001b");
+  assert.match(panel.component.render(100).join("\n"), /▶ alpha/, "the list selection followed the detail switch");
   panel.component.dispose();
 });
 

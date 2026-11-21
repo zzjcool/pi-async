@@ -7,10 +7,11 @@ import type { TaskSnapshot } from "../src/core/task.ts";
 
 /**
  * 0.4.1 W1: the detail overlay is the place where a running task's stdout is read live.
- *   D-30 output window = remaining body height (no more fixed 12 rows)
+ *   D-30 the window is the remaining body height (no more fixed 12 rows)
  *   D-31 1Hz self-refresh while the registry publishes nothing
  *   D-32 an arriving output chunk must not push a scrolled-up view away
  *   D-33 the output label marks a live task
+ *   #101 the body is one scrollable viewport: header/footer fixed, everything else scrolls
  */
 
 function withTerminalSize(rows: number, columns: number, run: () => void): void {
@@ -124,19 +125,19 @@ test("D-30: a 40-row terminal renders a whole output window, not the old fixed 1
   });
 });
 
-test("D-30: PageUp/PageDown step by the current output window, not a fixed 12 lines", () => {
+test("D-30: PageUp/PageDown step by the current window, not a fixed 12 lines", () => {
   const logsText = `${rows(100).join("\n")}\n`;
   withTerminalSize(40, 100, () => {
     const panel = createPanel({ task: { taskId: "step-1", status: "running" }, logsText });
-    panel.plain(80); // 20-row window at 40 terminal rows
+    panel.plain(80); // 40 rows => a 30-line body: title+status fixed, a 27-row window
     panel.component.handleInput("\u001b[5~");
     const paged = panel.plain(80).join("\n");
-    // 100 lines, window 20, one page up → rows 061..080.
-    assert.match(paged, /row 061/, `one PageUp must move a whole window, got:\n${paged}`);
-    assert.doesNotMatch(paged, /row 100/, "PageUp leaves the tail");
+    // 100 output lines behind 6 chrome rows + the label; one 27-row page lands on row 048.
+    assert.match(paged, /row 048/, `one PageUp must move a whole window, got:\n${paged}`);
+    assert.doesNotMatch(paged, /row 047/, "exactly one window was consumed");
+    assert.match(paged, /… \(\+54 lines\)/, "the marker counts the rows above the window");
     panel.component.handleInput("\u001b[6~");
-    const back = panel.plain(80).join("\n");
-    assert.match(back, /row 100/, "PageDown returns to the tail");
+    assert.match(panel.plain(80).join("\n"), /row 100/, "PageDown returns to the tail");
     panel.component.dispose();
   });
 });
@@ -162,7 +163,7 @@ test("D-32: output arriving while scrolled up keeps the visible lines in place",
     panel.logs.text = `${[...first, "row 101", "row 102", "row 103", "row 104", "row 105"].join("\n")}\n`;
     const after = panel.plain(80).join("\n");
     assert.match(after, /row 061/, "the line the user was reading is still on screen");
-    assert.doesNotMatch(after, /row 081/, "the window did not slide down with the new output (the old behaviour showed rows 066..085)");
+    assert.doesNotMatch(after, /row 081/, "the window did not slide down with the new output");
     assert.doesNotMatch(after, /row 105/, "the new output stayed below the window");
 
     // Follow mode still pins to the tail: two pages down and the newest line shows.
@@ -231,9 +232,9 @@ test("R2-3: 24 rows with a real task's three metadata keys still render a full o
     assert.match(lines.at(-1)!, /^╰─+╯$/, "the bottom border survives the overflow");
     for (const line of lines) assert.equal(Array.from(line).length, 80, `padded to the requested width: ${JSON.stringify(line)}`);
 
-    // chrome (13) is taller than the body budget (17 - 13 = 4), so the window keeps its floor
-    // and withBodyBudget collapses the overflow into the `… (+K lines)` marker.
-    assert.match(lines.join("\n"), /… \(\+\d+ lines\)/, "the overflow is marked, not silently dropped");
+    // #101 D2: the body is a viewport, so chrome no longer competes with output for rows and
+    // the tail window needs no marker — but the window must still be worth looking at.
+    assert.doesNotMatch(lines.join("\n"), /… \(\+\d+ lines\)/, "following the tail shows a clean window");
     const outputRows = lines.filter((line) => /^│\s+row \d{3}\s+│$/.test(line)).length;
     assert.ok(
       outputRows >= 8,
@@ -241,6 +242,104 @@ test("R2-3: 24 rows with a real task's three metadata keys still render a full o
     );
     assert.match(lines.join("\n"), /row 050/, "the newest line is among them");
     assert.match(lines.at(-2)!, /x kill/, "the footer is still the last body line");
+    assert.match(lines[1]!, /small-1/, "the title stays above the window");
+    assert.match(lines[2]!, /status:/, "the status line stays above the window");
+
+    // #101 D2: scrolling up is how the collapsed command/metadata become reachable.
+    panel.component.handleInput("k");
+    const scrolled = panel.plain(80);
+    assert.match(scrolled.join("\n"), /… \(\+46 lines\)/, "the marker counts the rows above the window");
+    assert.match(scrolled[3]!, /… \(\+46 lines\)/, "it replaces the window's first row");
+    assert.doesNotMatch(scrolled.join("\n"), /row 050/, "the newest line left the window");
+    assert.match(scrolled[1]!, /small-1/, "the header does not scroll");
+    assert.match(scrolled.at(-2)!, /x kill/, "the footer does not scroll either");
+    panel.component.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #101 — the detail viewport: scroll owns the body, selection owns the task
+// ---------------------------------------------------------------------------
+
+test("D2 (#101): PageUp reaches the command block the old marker collapsed", () => {
+  const command = Array.from({ length: 30 }, (_, i) => `echo step-${i + 1}`).join("\n");
+  withTerminalSize(24, 100, () => {
+    const panel = createPanel({
+      task: { taskId: "longcmd-1", status: "completed", command, finishedAt: Date.now(), metadata: REAL_TASK_METADATA },
+      logsText: `${rows(40).join("\n")}\n`,
+    });
+    const tail = panel.plain(80).join("\n");
+    assert.match(tail, /row 040/, "the detail opens on the output tail");
+    assert.doesNotMatch(tail, /command:/, "the command block starts above the window");
+
+    let pages = 0;
+    while (pages < 20 && !panel.plain(80).join("\n").includes("command:")) {
+      panel.component.handleInput("\u001b[5~");
+      pages += 1;
+    }
+    const top = panel.plain(80);
+    const body = top.join("\n");
+    assert.ok(pages < 20, `the command block must be reachable; gave up after ${pages} pages:\n${body}`);
+    assert.match(body, /command:/, "the command label is readable");
+    assert.match(body, /echo step-1/, "the first command line is readable");
+    assert.match(top[1]!, /longcmd-1/, "the title stays fixed at the top of the frame");
+    assert.match(top[2]!, /status:/, "the status line stays fixed too");
+
+    // Scrolling down from the top walks through the command tail into the metadata block.
+    let down = 0;
+    while (down < 20 && !panel.plain(80).join("\n").includes("metadata:")) {
+      panel.component.handleInput("\u001b[6~");
+      down += 1;
+    }
+    const middle = panel.plain(80).join("\n");
+    assert.ok(down < 20, `metadata must be reachable; gave up after ${down} pages:\n${middle}`);
+    assert.match(middle, /outputFile:/, "the metadata rows render");
+
+    for (let i = 0; i < 30; i += 1) panel.component.handleInput("\u001b[6~");
+    assert.match(panel.plain(80).join("\n"), /row 040/, "PageDown returns to the tail");
+    panel.component.dispose();
+  });
+});
+
+test("D3 (#101): a degenerate viewport keeps the header above the footer", () => {
+  // 6 terminal rows => a 4-line frame => 2 body lines. The footer keeps the last one, so the
+  // title is what survives; the body window is gone before the header is (D3).
+  withTerminalSize(6, 100, () => {
+    const panel = createPanel({ task: { taskId: "tiny-1", name: "tiny", status: "running" }, logsText: "out\n" });
+    const lines = panel.plain(80);
+    assert.equal(lines.length, 4, `frame height is bounded, got:\n${lines.join("\n")}`);
+    assert.match(lines[1]!, /tiny/, "the title outranks the body");
+    assert.match(lines[2]!, /x kill/, "the footer keeps the last body line");
+    // A scroll key has no window to move: it must not invent a marker row and push the footer
+    // out of the frame (the review of #101 caught exactly that).
+    panel.component.handleInput("k");
+    const scrolled = panel.plain(80);
+    assert.equal(scrolled.length, 4, `the footer must survive a scroll key, got:\n${scrolled.join("\n")}`);
+    assert.match(scrolled[1]!, /tiny/, "title still there");
+    assert.match(scrolled[2]!, /x kill/, "the key hints are still the last body line");
+    panel.component.dispose();
+  });
+  // One more row restores the status line and a (two-row) window; neither pushes the header out.
+  withTerminalSize(7, 100, () => {
+    const panel = createPanel({ task: { taskId: "tiny-2", name: "tiny", status: "running" }, logsText: "out\n" });
+    const lines = panel.plain(80);
+    assert.equal(lines.length, 5, `7 rows => a 5-line frame, got:\n${lines.join("\n")}`);
+    assert.match(lines[1]!, /tiny/);
+    assert.match(lines[2]!, /status: running/, "budget 3 still fits both header rows");
+    panel.component.handleInput("k");
+    const scrolled = panel.plain(80);
+    assert.equal(scrolled.length, 5, "a scroll key must not grow the body past the budget");
+    assert.match(scrolled.at(-2)!, /x kill/, "the footer survives");
+    panel.component.dispose();
+  });
+  // And one more row gives the window its first real content row.
+  withTerminalSize(9, 100, () => {
+    const panel = createPanel({ task: { taskId: "tiny-2", name: "tiny", status: "running" }, logsText: "out\n" });
+    const lines = panel.plain(80);
+    assert.match(lines[1]!, /tiny/, "title row");
+    assert.match(lines[2]!, /status: running/, "status row");
+    assert.match(lines.join("\n"), /out/, "the remaining rows go to the window");
+    assert.match(lines.at(-2)!, /x kill/, "the footer is still last");
     panel.component.dispose();
   });
 });

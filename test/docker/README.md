@@ -63,7 +63,7 @@ L1/L2 全都照样绿。只有让模型**实际调用一次**工具（`async_run
 问题可原样复跑复现。harness 结尾断言 mock 至少收到过请求，否则 exit 1（模型没被调到的
 「干净」产物毫无意义）。
 
-**72 个可独立运行的场景**（json + keys 配对）在 `test/scenarios/`，见 `test/scenarios/INDEX.md`。
+**73 个可独立运行的场景**（json + keys 配对）在 `test/scenarios/`，见 `test/scenarios/INDEX.md`。
 另有 30 个不配对的归档在 `test/scenarios/.attic/`（原因见该目录 README）。
 
 产物落 `/qa/artifacts/<name>/`（不入库，见根目录 `.gitignore`）。

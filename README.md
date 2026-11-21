@@ -87,12 +87,14 @@ Tool notes:
 |---|---|
 | `/async` | Open the task panel. The panel is a singleton: running it again while open only shows an `Async panel is already open` notice and does not stack another overlay — the open panel refreshes itself from registry events plus a 1 Hz ticker, so a running task's output is live while you watch it. |
 | `/async-clear` | Clear completed-task history badges. |
-| `↑` / `↓` / `j` / `k` | Select tasks; in task details, scroll output (new output does not move a view you scrolled up). |
-| `Enter` | Open selected task details: the detail body gives the command's stdout the height that command and metadata do not take, at least 8 rows (on a short terminal the command and metadata collapse into `… (+K lines)` instead), labelled `output (live):` while the task still runs. |
+| `↑` / `↓` / `j` / `k` | In the task list, select a task. In task details, scroll the body one line instead — the selection stays where it was and new output does not move a view you scrolled up. |
+| `PgUp` / `PgDn` | In task details, scroll the body by one whole window. |
+| `[` / `]` | In task details, move to the previous / next task (the view jumps to that task's output tail; at either end it stays put). |
+| `Enter` | Open selected task details. The body is one scrollable viewport over `command` / `metadata` / output: the title (then the status, when the frame has room) stays at the top, the key hints at the bottom, and everything between them scrolls — nothing is collapsed away, so `PgUp` reaches command lines a short terminal used to hide behind `… (+K lines)`. While the task still runs the output section is labelled `output (live):`. |
 | `h` | Toggle history in the task list. |
-| `x` (or `K`) | Kill a running task (press again to confirm). |
-| `R` | Rerun the selected task command in that task's original `cwd`. |
-| `c` | **Show** the captured output file path as a toast. Nothing is copied: pi exposes no clipboard API, so there is no copy action. |
+| `x` (or `K`) | In task details, kill a running task (press again to confirm; a pending task is cancelled the same way). |
+| `R` | In task details, rerun that task command in its original `cwd`. |
+| `c` | In task details, **show** the captured output file path as a toast. Nothing is copied: pi exposes no clipboard API, so there is no copy action. |
 | `Esc` | Close rail-clicked details; return from list-opened details to the list. |
 | `q` | Close the panel. |
 

@@ -35,7 +35,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 
 /**
  * Columns assumed when the host exposes no `process.stdout.columns` (a piped stdout, a test): the
- * same 120-cell default the panel falls back to (`src/tui/panel.ts:424`).
+ * same 120-cell default the panel falls back to (`src/tui/panel.ts:421`).
  */
 const DEFAULT_COLUMNS = 120;
 
@@ -58,7 +58,7 @@ function taskLabel(task: TaskSnapshot, now: number): string {
  * Usable terminal width for a `setWidget(content: string[])` row.
  *
  * That form gets no width callback (only the factory form does), so the row sizes itself from
- * `process.stdout.columns` — the same convention `src/tui/panel.ts:424` uses. One column is left
+ * `process.stdout.columns` — the same convention `src/tui/panel.ts:421` uses. One column is left
  * free on purpose: a line that exactly fills the terminal is what makes some hosts wrap it, and a
  * wrapping row is the jitter this budget exists to prevent.
  */

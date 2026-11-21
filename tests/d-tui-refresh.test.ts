@@ -168,14 +168,15 @@ test("dispose() also releases the singleton", () => {
   panel.component.dispose();
 });
 
-test("detail keeps the footer visible and marks omitted lines on a short terminal", () => {
+test("detail keeps the header and footer on a short terminal and marks the rows above the window", () => {
   withTerminalSize(12, 100, () => {
     const panel = setup({ initialTaskId: "task-1" });
     const lines = panel.component.render(80) as string[];
     const body = lines.join("\n");
-    // 12 rows * 0.8 => height 9 => 7 body lines, well below the full detail body.
+    // 12 rows * 0.8 => height 9 => 7 body lines: title + status + a 4-row window + footer.
     assert.equal(lines.length, 9, `detail frame height must stay height-bounded, got:\n${body}`);
-    assert.match(body, /… \(\+\d+ lines\)/, "omitted lines must be marked, not silently dropped");
+    assert.match(lines[1]!, /task-1/, "the fixed header stays above the window");
+    assert.match(lines[2]!, /status:/, "the status line too");
     assert.match(body, /x kill/, "the key hints must survive the body budget");
     assert.doesNotMatch(body, /k kill/, "the old k-kill hint is gone");
     assert.match(body, /c show output path/);
@@ -184,6 +185,11 @@ test("detail keeps the footer visible and marks omitted lines on a short termina
     for (const line of lines) {
       assert.equal(Array.from(line).length, 80, `padded to the requested width: ${JSON.stringify(line)}`);
     }
+    // #101: rows above the window are reachable, and scrolling up says how many there are.
+    panel.component.handleInput("\u001b[A");
+    const scrolled = panel.component.render(80) as string[];
+    assert.match(scrolled.join("\n"), /… \(\+\d+ lines\)/, "scrolling up marks the rows above the window");
+    assert.match(scrolled[1]!, /task-1/, "the header does not scroll with the body");
     panel.component.dispose();
   });
 });
@@ -238,11 +244,12 @@ test("detail tails a long output and scrolling survives the body budget", () => 
     const panel = setup({ subscribe: false, initialTaskId: "task-1", logsText: lines });
     const first = (panel.component.render(80) as string[]).join("\n");
     assert.match(first, /line 40/, "the newest output line is visible");
-    assert.match(first, /… \(\+\d+ lines\)/);
-    panel.component.handleInput("\u001b[A"); // scroll the output window up one line
+    assert.doesNotMatch(first, /… \(\+\d+ lines\)/, "the tail window needs no marker (#101)");
+    panel.component.handleInput("\u001b[A"); // scroll the body window up one line
     const second = (panel.component.render(80) as string[]).join("\n");
     assert.notEqual(second, first, "scrolling must not be clamped away by the body budget");
     assert.equal(second.includes("line 40"), false, "scrolling up leaves the newest line behind");
+    assert.match(second, /… \(\+\d+ lines\)/, "scrolling up marks the rows above the window");
     assert.match(second, /x kill/, "the hint footer survives scrolling");
     panel.component.dispose();
   });

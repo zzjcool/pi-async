@@ -47,16 +47,12 @@ const UI_TAIL_BYTES = 128 * 1024;
 const LIST_TAIL_BYTES = 16 * 1024;
 const PANEL_ROWS = 12;
 /**
- * D-30: PageUp/PageDown move one whole output window. The detail body sets this to the
- * live `outputRows` on every render; PANEL_ROWS is only the initial value.
+ * D-30: PageUp/PageDown move one whole window. The detail viewport sets this to the
+ * live window height on every render; PANEL_ROWS is only the initial value.
  */
 let pageStep = PANEL_ROWS;
-/** R2-3: floor for the output window — a taller chrome must not leave less than this many rows. */
-const MIN_OUTPUT_ROWS = 8;
 /** D-31: the panel repaints itself while a task runs (same 1Hz pattern as rail.ts). */
 const PANEL_REFRESH_MS = 1000;
-/** Identity lines kept above the `… (+K lines)` marker when the detail body overflows. */
-const DETAIL_HEADER_LINES = 2;
 /** 0.3.0 §2.9: kill moved off `k` (which now scrolls up) onto `x`/`X`/`K`. */
 const KILL_KEYS = new Set(["x", "X", "K"]);
 const visible = visibleText;
@@ -115,6 +111,17 @@ export function metadataSection(metadata: Record<string, unknown>, theme: Theme 
   return [label, ...rows];
 }
 
+// D-33: live = the task is still producing output. The 5th argument is optional, so the
+// original 4-argument call sites keep their exact label.
+function outputLabel(truncated: boolean, theme: Theme | null | undefined, live = false): string {
+  const marks = [live ? "live" : undefined, truncated ? "tail truncated" : undefined].filter(Boolean);
+  return paint(theme, "dim", `output${marks.length > 0 ? ` (${marks.join(", ")})` : ""}:`);
+}
+
+function outputRow(line: string, theme: Theme | null | undefined, budget: number): string {
+  return paint(theme, "dim", truncateToWidth(visible(line), Math.max(0, budget)));
+}
+
 export function outputSection(
   tail: string[],
   truncated: boolean,
@@ -122,12 +129,7 @@ export function outputSection(
   budget: number,
   live = false,
 ): string[] {
-  // D-33: live = the task is still producing output. The 5th argument is optional, so the
-  // original 4-argument call sites keep their exact label.
-  const marks = [live ? "live" : undefined, truncated ? "tail truncated" : undefined].filter(Boolean);
-  const label = paint(theme, "dim", `output${marks.length > 0 ? ` (${marks.join(", ")})` : ""}:`);
-  const rows = tail.map((line) => paint(theme, "dim", truncateToWidth(visible(line), Math.max(0, budget))));
-  return [label, ...rows];
+  return [outputLabel(truncated, theme, live), ...tail.map((line) => outputRow(line, theme, budget))];
 }
 
 /**
@@ -256,8 +258,9 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     let follow = true;
     /** D-32: output-line count of the last detail render, used to keep a scrolled-up view still. */
     let lastOutputCount = 0;
-    /** R2-1: window height of the last detail render — 0 while nothing was scrolled out of view. */
-    let lastOutputRows = 0;
+    /** R2-1: scrollable rows and viewport height of the last detail render. */
+    let lastContentRows = 0;
+    let lastWindowRows = 0;
     let lastTaskId: string | undefined;
     let width = 100;
     let height = process.stdout.rows ?? 24;
@@ -275,7 +278,7 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       }
     };
     // D-31: while a task runs the registry publishes no state events, so the panel repaints
-    // itself at 1Hz — the output window then keeps up with the growing log. `requestRender()`
+    // itself at 1Hz — the window then keeps up with the growing log. `requestRender()`
     // keeps its `closed` guard, and teardown() is the single owner of the timer.
     const ticker = setInterval(() => requestRender(), PANEL_REFRESH_MS);
     (ticker as { unref?: () => void }).unref?.();
@@ -325,27 +328,8 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
     const footerLine = (): string => paint(
       theme,
       "dim",
-      `${origin === "rail" ? "Esc close" : "Esc return"} · x kill/cancel · R rerun · c show output path · ↑/↓ scroll`,
+      `${origin === "rail" ? "Esc close" : "Esc return"} · [ ] task · x kill · R rerun · c show output path · ↑/↓ scroll`,
     );
-    /**
-     * Keep the header and the footer visible; collapse the middle into `… (+K lines)`.
-     * The footer is always the last emitted line, so `frame` can never silently cut it.
-     */
-    const withBodyBudget = (lines: string[], budget: number): string[] => {
-      const limit = Math.max(1, Math.floor(budget));
-      if (lines.length <= limit) return lines;
-      const headerCount = Math.min(DETAIL_HEADER_LINES, Math.max(0, limit - 1));
-      const tailCount = limit - headerCount - 1;
-      const last = lines[lines.length - 1]!;
-      // Degenerate viewport: the key hints outrank every other line.
-      if (tailCount <= 0) return [last];
-      const hidden = lines.length - headerCount - tailCount;
-      return [
-        ...lines.slice(0, headerCount),
-        paint(theme, "dim", `… (+${hidden} lines)`),
-        ...lines.slice(lines.length - tailCount),
-      ];
-    };
     const renderBody = (budget: number): string[] => {
       const tasks = filtered();
       if (!detail) {
@@ -367,10 +351,11 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       if (lastTaskId !== task.taskId) {
         lastTaskId = task.taskId;
         lastOutputCount = 0;
-        lastOutputRows = 0;
-      } else if (lastOutputCount <= lastOutputRows) {
+        lastContentRows = 0;
+        lastWindowRows = 0;
+      } else if (lastContentRows <= lastWindowRows) {
         // R2-1: the previous window hid nothing, so the view *was* the tail. A key that cannot
-        // scroll anything (→/k/PageUp on a log shorter than the window) must not leave a phantom
+        // scroll anything (↑/k/PageUp on a body shorter than the window) must not leave a phantom
         // offset behind: D-32 would then anchor the view to the lines visible at keypress time
         // and the newest output would never appear again.
         scroll = 0;
@@ -383,42 +368,54 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       const killHint = task.status === "pending"
         ? "Cancel this pending task? press x again to confirm; any other key cancels"
         : "Kill this task? press x again to confirm; any other key cancels";
-      const divider = sectionDivider(theme, lineBudget);
-      const commandLines = commandSection(task.command, theme, lineBudget);
-      const metadataLines = metadataSection(task.metadata as Record<string, unknown>, theme, lineBudget);
-      // D-30: the output window is whatever the fixed chrome leaves, not a fixed 12 rows.
-      const chrome = 1 // title
-        + 1 // status
-        + 1 // divider
-        + commandLines.length
-        + 1 // divider
-        + metadataLines.length
-        + 1 // divider
-        + 1 // output label
-        + (actionError ? 1 : 0)
-        + (confirmKill ? 1 : 0)
-        + 1; // footer
-      const outputRows = Math.max(MIN_OUTPUT_ROWS, budget - chrome);
-      lastOutputRows = outputRows;
-      pageStep = outputRows;
       const live = task.status === "running" || task.status === "pending";
-      scroll = Math.min(scroll, Math.max(0, outputLines.length - outputRows));
-      // R2-1: clamping back to the tail means we follow again (same invariant as move()/wheel/page).
-      if (scroll === 0) follow = true;
-      const tail = outputLines.slice(Math.max(0, outputLines.length - outputRows - scroll), outputLines.length - scroll);
-      return withBodyBudget([
-        ...detailTitleLines(task, theme),
-        ...detailStatusLines(task, theme, Date.now()),
+      const divider = sectionDivider(theme, lineBudget);
+      // #101: the detail body is one scrollable document — dividers, command, metadata, output —
+      // while only the title/status header, the transient state rows and the footer stay put.
+      // `scroll` still counts the rows hidden below the window (0 = the tail), so the D-32
+      // anchor above measures the same thing.
+      const head = [
         divider,
-        ...commandLines,
+        ...commandSection(task.command, theme, lineBudget),
         divider,
-        ...metadataLines,
+        ...metadataSection(task.metadata as Record<string, unknown>, theme, lineBudget),
         divider,
-        ...outputSection(tail, output.truncated, theme, lineBudget, live),
+      ];
+      // A kill confirmation the user cannot see would be a trap, so error/hint rows are pinned
+      // above the footer instead of scrolling with the document (the old layout had them there).
+      const bottom = [
         ...(actionError ? [paint(theme, "error", `error: ${visible(actionError)}`)] : []),
         ...(confirmKill ? [paint(theme, "warning", killHint)] : []),
         footerLine(),
-      ], budget);
+      ];
+      const totalRows = head.length + 1 + outputLines.length;
+      const header = [...detailTitleLines(task, theme), ...detailStatusLines(task, theme, Date.now())];
+      // D3 (#101): the footer keeps the last line and the header outranks the body, so a
+      // degenerate viewport still shows the title, then the status; the window takes the rest.
+      const fixed = Math.min(header.length, Math.max(0, budget - bottom.length));
+      const windowRows = Math.max(0, budget - bottom.length - fixed);
+      const maxStart = Math.max(0, totalRows - windowRows);
+      scroll = Math.max(0, Math.min(scroll, maxStart));
+      if (scroll === 0) follow = true;
+      lastContentRows = totalRows;
+      lastWindowRows = windowRows;
+      pageStep = Math.max(1, windowRows);
+      const start = maxStart - scroll;
+      const label = outputLabel(output.truncated, theme, live);
+      const rowAt = (index: number): string => {
+        if (index < head.length) return head[index]!;
+        if (index === head.length) return label;
+        return outputRow(outputLines[index - head.length - 1]!, theme, lineBudget);
+      };
+      const window: string[] = [];
+      for (let index = start; index < Math.min(totalRows, start + windowRows); index += 1) window.push(rowAt(index));
+      // The `… (+K lines)` marker is a scroll position now, not a collapse: it appears only once
+      // the view has left the tail, it replaces (never adds) a row so the page size stays fixed,
+      // and K counts the rows above the window (an empty window cannot host it).
+      if (window.length > 0 && scroll > 0 && start > 0) {
+        window[0] = paint(theme, "dim", `… (+${start + 1} lines)`);
+      }
+      return [...header.slice(0, fixed), ...window, ...bottom];
     };
     const render = (nextWidth?: number): string[] => {
       width = nextWidth ?? Math.max(20, Math.floor((process.stdout.columns ?? 120) * ratio.w));
@@ -428,19 +425,40 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
       height = Math.min(Math.max(6, Math.floor(rows * ratio.h)), Math.max(4, rows - 2));
       lastLines = renderBody(Math.max(1, height - 2));
       // The body is already budgeted, so its length no longer measures the scroll range;
-      // renderBody clamps `scroll` against the real output-line count instead.
+      // renderBody clamps `scroll` against the real body-row count instead.
       if (follow) scroll = 0;
       return frame(detail ? "Async task detail" : "Async tasks", lastLines, width, height);
     };
-    const move = (delta: number): void => {
+    /** The row below/above the current selection; `undefined` at either end or for a single task. */
+    const neighbour = (delta: number): TaskSnapshot | undefined => {
       const tasks = filtered();
       const index = tasks.findIndex((task) => task.taskId === selected);
       // Harden dangling selection (filtered away): start from edge rather than relying on -1+delta===0 alone.
       const base = index < 0 ? (delta > 0 ? -1 : 0) : index;
-      const next = tasks[Math.max(0, Math.min(tasks.length - 1, base + delta))];
+      return tasks[Math.max(0, Math.min(tasks.length - 1, base + delta))];
+    };
+    /** List navigation only — the detail view puts its arrows on the window instead (#101 D1). */
+    const move = (delta: number): void => {
+      const next = neighbour(delta);
       if (next) selected = next.taskId;
-      if (detail && delta < 0) { scroll += -delta; follow = false; }
-      else if (detail && delta > 0) { scroll = Math.max(0, scroll - delta); follow = scroll === 0; }
+      requestRender();
+    };
+    /** #101 D1: detail-mode scrolling never touches `selected`; renderBody clamps the range. */
+    const scrollBy = (delta: number): void => {
+      scroll = Math.max(0, scroll + delta);
+      follow = scroll === 0;
+      requestRender();
+    };
+    /** #101 D1: the reachable task switch inside the detail view (arrows belong to the window). */
+    const stepTask = (delta: number): void => {
+      const next = neighbour(delta);
+      // Only a real switch restarts the view: at either end the key must not yank a scrolled
+      // body back to the tail either.
+      if (!next || next.taskId === selected) return;
+      selected = next.taskId;
+      scroll = 0;
+      follow = true;
+      actionError = undefined; // another task's kill failure must not follow the switch
       requestRender();
     };
     const killSelected = (): void => {
@@ -480,9 +498,11 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           return;
         }
         if (data === "\r" || data === "\n") { detail = true; scroll = 0; follow = true; actionError = undefined; requestRender(); return; }
+        // #101 D1: `[`/`]` switch tasks while the arrows scroll, so neighbours stay reachable.
+        if (detail && (data === "[" || data === "]")) { stepTask(data === "[" ? -1 : 1); return; }
         // PLAN §2.9: PageUp/PageDown page the detail body (PageUp = older lines).
-        // D-30: one page = one output window (`pageStep`, set by the last render).
-        // renderBody clamps the actual offset against the output length.
+        // D-30: one page = one window (`pageStep`, set by the last render); renderBody clamps
+        // the actual offset against the body length.
         if (detail && (data === "\u001b[5~" || data === "\u001b[6~")) {
           scroll = Math.max(0, scroll + (data === "\u001b[5~" ? pageStep : -pageStep));
           follow = scroll === 0;
@@ -497,8 +517,8 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
           requestRender();
           return;
         }
-        if (data === "\u001b[A" || key === "k") { move(-1); return; }
-        if (data === "\u001b[B" || key === "j") { move(1); return; }
+        if (data === "\u001b[A" || key === "k") { if (detail) scrollBy(1); else move(-1); return; }
+        if (data === "\u001b[B" || key === "j") { if (detail) scrollBy(-1); else move(1); return; }
         if (data === "R" && detail) {
           const task = choose();
           if (task) {

@@ -1,6 +1,6 @@
 # 场景索引
 
-72 个可独立运行的场景（json + keys 配对）。`make qa-tui SCENARIO=sN` 运行，
+73 个可独立运行的场景（json + keys 配对）。`make qa-tui SCENARIO=sN` 运行，
 由 `tools/run-scenario.sh` 按 id 通配发现 json —— 文件名不统一，不要拼名字。
 
 归档在 `.attic/` 的 30 个不配对场景不在此表（见 `.attic/README.md`）。
@@ -13,6 +13,7 @@
 | s104 | `s104-status-default.json` | 5 | 1 | `async_run,async_status` | run a task then check status with no argument | status-default |
 | s105 | `s105-rail-overflow.json` | 3 | 14 | `async_run` | start 14 long tasks | rail-10-of-14,expanded |
 | s106 | `s106-batch-overflow.json` | 3 | 40 | `async_run` | try to start 40 tasks at once | batch-overflow |
+| s107 | `s107-detail-viewport.json` | 2 | 2 | `async_run` | start two long viewport tasks | list-two-tasks,detail-tail,detail-one-line-up,detail-scrolled,detail-top,detail-switched,detail-switched-back,back-to-list |
 | s11 | `s11-cjk-narrow.json` | 3 | 1 | `async_run` | start it | narrow-rail |
 | s12 | `s12-panel.json` | 3 | 3 | `async_run` | start three tasks | rail,panel-open,panel-ctrl-o |
 | s14 | `s14-delayed.json` | 3 | 1 | `async_run` | schedule a delayed task | pending-state,still-pending,after-fire |
@@ -80,4 +81,4 @@
 | s98 | `s98-notify-combo.json` | 4 | 2 | `async_run` | run tasks with notification options off | notify-combo |
 | s99 | `s99-simultaneous-notify.json` | 5 | 3 | `async_run` | run three tasks that finish at the same time | simultaneous-notify |
 
-合计 72 个场景。
+合计 73 个场景。
