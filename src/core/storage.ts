@@ -125,8 +125,15 @@ export function surveyDataDir(path: string): DirSurvey | undefined {
   catch { survey.unreadable = true; return survey; }
   // Sorted so the snapshot cap below (and every plan built from this survey) is deterministic.
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Marker presence is evidence in itself: "there is a marker we cannot read" must never collapse
+  // into "there is no marker". Anything that is not a plain file (symlink, directory, socket) is
+  // unreadable by policy — this module never follows a symlink.
+  let markerState: "absent" | "plain" | "unreadable" = "absent";
   for (const entry of entries) {
-    if (isOwnerMarkerName(entry.name)) continue; // allowed content: never counted, never foreign
+    if (isOwnerMarkerName(entry.name)) {
+      markerState = entry.isFile() ? "plain" : "unreadable";
+      continue; // allowed content: never counted, never foreign
+    }
     if (entry.isSymbolicLink() || entry.isDirectory()) { survey.foreign = true; continue; }
     if (isTempFileName(entry.name)) continue;
     if (!isArtifactFileName(entry.name)) { survey.foreign = true; continue; }
@@ -138,12 +145,15 @@ export function surveyDataDir(path: string): DirSurvey | undefined {
     survey.bytes += size;
     if (mtimeMs > survey.lastActivityMs) survey.lastActivityMs = mtimeMs;
   }
-  let markerRaw: string | undefined;
-  try { markerRaw = readFileSync(join(path, OWNER_MARKER_NAME), "utf8"); } catch { markerRaw = undefined; }
-  if (markerRaw !== undefined) {
+  if (markerState === "unreadable") survey.ownerUnreadable = true;
+  else if (markerState === "plain") {
     try {
-      const marker = JSON.parse(markerRaw) as { pid?: unknown };
-      if (typeof marker.pid === "number" && Number.isFinite(marker.pid)) survey.ownerPid = marker.pid;
+      const marker = JSON.parse(readFileSync(join(path, OWNER_MARKER_NAME), "utf8")) as { pid?: unknown };
+      // Only a real pid can be probed honestly. `0`, a negative number or a fraction would make the
+      // liveness answer depend on signal semantics instead of on the recorded process (a group
+      // signal or "every process I may signal"), so an unprobeable pid is treated as *unknown* —
+      // the directory is then kept rather than judged.
+      if (isPid(marker.pid)) survey.ownerPid = marker.pid;
       else survey.ownerUnreadable = true;
     } catch { survey.ownerUnreadable = true; }
   }
@@ -159,14 +169,34 @@ export function surveyDataDir(path: string): DirSurvey | undefined {
       survey.unreadable = true;
       continue;
     }
+    // Same rule as the marker, but only for snapshots whose pid is actually probed: a *terminal*
+    // task's pid is never used (it is only an eviction candidate), so an odd pid there must not turn
+    // the whole directory into "unreadable" — that would make its artifacts un-evictable and pin the
+    // quota above its limit forever. A non-terminal pid that cannot be probed (`0` = "my own process
+    // group", negative = "process group N", out of `pid_t` range) is not evidence of death.
+    if (!isTerminal(raw.status) && raw.pid !== undefined && !isPid(raw.pid)) {
+      survey.unreadable = true;
+      continue;
+    }
     survey.snapshots.push({
       taskId: raw.taskId,
       status: raw.status,
-      ...(typeof raw.pid === "number" ? { pid: raw.pid } : {}),
+      ...(raw.pid === undefined ? {} : { pid: raw.pid }),
       ageAnchor: raw.finishedAt ?? raw.createdAt ?? 0,
     });
   }
   return survey;
+}
+
+/**
+ * A pid is a positive integer inside the platform's `pid_t` range. Anything else (`0`, a negative
+ * number, a fraction, a string, `1e21`) cannot be probed honestly — in a marker *and* in a snapshot
+ * — so it must never be read as evidence that the process is alive *or* dead. The upper bound is
+ * not cosmetic: `Number.isInteger(1e21)` is true but `process.kill` rejects it with
+ * `ERR_INVALID_ARG_TYPE`, which would otherwise be read as "dead" and let a sweep reclaim the dir.
+ */
+export function isPid(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 0x7fffffff;
 }
 
 export type SweepSkipReason =
@@ -178,18 +208,38 @@ export type SweepSkipReason =
   | "owner_alive"
   | "unreadable_owner"
   | "recently_active"
-  | "scan_limit";
+  | "scan_limit"
+  | "not_a_data_dir"
+  | "delete_failed";
 
 export interface SiblingVerdict { deletable: boolean; reason?: SweepSkipReason; detail?: string }
 
 /**
- * The three gates of CONTRACT §10 / REV-32. Gate 1 is the current data dir, gate 2 is a
- * non-terminal snapshot whose pid is alive, gate 3 is the age gate (`minAgeMs` is clamped by the
- * caller to stay strictly above `PI_ASYNC_RETENTION_MS`).
+ * The three gates of CONTRACT §10 / §25 (REV-32, corrected by REV-33). Gate 1 is the current data
+ * dir, gate 2 is "nobody is using this" (no non-terminal snapshot pointing at a live pid **and** no
+ * live owner marker), gate 3 is the age gate (`minAgeMs` is clamped by the caller to stay strictly
+ * above `PI_ASYNC_RETENTION_MS`).
+ *
+ * **Two liveness probes, and they are not interchangeable.** `pidAlive` answers "does process
+ * *group* `pid` still have a live member": every task child is spawned `detached`, so its pid *is*
+ * its group id, and a group whose leader already exited still counts as alive. `processAlive`
+ * answers "does *process* `pid` exist", which is the only correct question for the owner marker —
+ * the marker records `process.pid` of a pi session, and a session process is usually **not** a
+ * group leader. Probing the marker with group semantics reports a live session as dead and lets the
+ * sweep delete its data dir (fail-open; REV-33, regression test `owner marker … not a process-group
+ * leader`).
  */
 export function siblingVerdict(
   survey: DirSurvey,
-  opts: { currentDataDir: string; now: number; minAgeMs: number; pidAlive: (pid: number) => boolean },
+  opts: {
+    currentDataDir: string;
+    now: number;
+    minAgeMs: number;
+    /** Group semantics: correct for task pids (`spawnDetached`), wrong for session pids. */
+    pidAlive: (pid: number) => boolean;
+    /** Direct process semantics: correct for the owner marker's `process.pid`. */
+    processAlive: (pid: number) => boolean;
+  },
 ): SiblingVerdict {
   // Identity, not spelling: an alias (symlink, `..`, case-insensitive FS) is still this data dir.
   if (sameDir(survey.path, opts.currentDataDir)) {
@@ -197,15 +247,20 @@ export function siblingVerdict(
   }
   // Doubt is never resolved in favour of deleting.
   if (survey.foreign) return { deletable: false, reason: "foreign_content", detail: "holds content a pi-async data dir never writes" };
-  if (survey.unreadable) return { deletable: false, reason: "unreadable_snapshot", detail: "a snapshot could not be parsed" };
+  if (survey.unreadable) return { deletable: false, reason: "unreadable_snapshot", detail: "a snapshot could not be read as evidence" };
   if (survey.ownerUnreadable) return { deletable: false, reason: "unreadable_owner", detail: "the owner marker could not be read" };
-  if (survey.ownerPid !== undefined && opts.pidAlive(survey.ownerPid)) {
+  if (survey.ownerPid !== undefined && opts.processAlive(survey.ownerPid)) {
     return { deletable: false, reason: "owner_alive", detail: `session pid ${survey.ownerPid} is alive` };
   }
   const live = survey.snapshots.find((snapshot) => !isTerminal(snapshot.status) && snapshot.pid !== undefined && opts.pidAlive(snapshot.pid));
   if (live) {
     return { deletable: false, reason: "live_task", detail: `${live.taskId} is ${live.status} (pid ${live.pid} alive)` };
   }
+  // A non-terminal snapshot with no pid (a delayed `pending` task, which is the normal leftover of
+  // `shutdown()`) carries **no** liveness evidence in either direction: it must not be read as "the
+  // run is alive", and it must not block reclamation forever either (that would pin every directory
+  // a session ever quit in — REV-33 review). It falls through to the marker and the age gate, which
+  // are the gates that can actually answer "will anybody come back for this".
   const idleMs = opts.now - survey.lastActivityMs;
   if (idleMs < opts.minAgeMs) {
     return { deletable: false, reason: "recently_active", detail: `idle ${formatDuration(idleMs)} < ${formatDuration(opts.minAgeMs)}` };
