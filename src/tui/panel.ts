@@ -453,8 +453,9 @@ export function openPanel(pi: PiCtx, registry: TaskRegistry, initialTaskId?: str
         const changed = next.taskId !== selected;
         selected = next.taskId;
         // #101 D1: a task switch in the detail view restarts the viewport anchor (the previous
-        // task's scroll offset says nothing about this one's log).
-        if (changed && detail) { scroll = 0; follow = true; }
+        // task's scroll offset says nothing about this one's log). The error row belongs to the
+        // task whose kill failed, so it leaves with it — Enter/Esc clear it the same way.
+        if (changed && detail) { scroll = 0; follow = true; actionError = undefined; }
       }
       requestRender();
     };
