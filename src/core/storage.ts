@@ -169,10 +169,12 @@ export function surveyDataDir(path: string): DirSurvey | undefined {
       survey.unreadable = true;
       continue;
     }
-    // Same rule as the marker: a pid that cannot be probed honestly (`0` = "my own process group",
-    // negative = "process group N", fraction = nothing at all) must not be read as evidence of
-    // death. Its liveness answer would be platform-dependent, so the snapshot is *unknown*.
-    if (raw.pid !== undefined && !isPid(raw.pid)) {
+    // Same rule as the marker, but only for snapshots whose pid is actually probed: a *terminal*
+    // task's pid is never used (it is only an eviction candidate), so an odd pid there must not turn
+    // the whole directory into "unreadable" — that would make its artifacts un-evictable and pin the
+    // quota above its limit forever. A non-terminal pid that cannot be probed (`0` = "my own process
+    // group", negative = "process group N", out of `pid_t` range) is not evidence of death.
+    if (!isTerminal(raw.status) && raw.pid !== undefined && !isPid(raw.pid)) {
       survey.unreadable = true;
       continue;
     }
@@ -187,12 +189,14 @@ export function surveyDataDir(path: string): DirSurvey | undefined {
 }
 
 /**
- * A pid is a positive integer. Anything else (`0`, a negative number, a fraction, a string) cannot
- * be probed honestly — in a marker *and* in a snapshot — so it must never be read as evidence that
- * the process is alive *or* dead.
+ * A pid is a positive integer inside the platform's `pid_t` range. Anything else (`0`, a negative
+ * number, a fraction, a string, `1e21`) cannot be probed honestly — in a marker *and* in a snapshot
+ * — so it must never be read as evidence that the process is alive *or* dead. The upper bound is
+ * not cosmetic: `Number.isInteger(1e21)` is true but `process.kill` rejects it with
+ * `ERR_INVALID_ARG_TYPE`, which would otherwise be read as "dead" and let a sweep reclaim the dir.
  */
 export function isPid(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 0x7fffffff;
 }
 
 export type SweepSkipReason =

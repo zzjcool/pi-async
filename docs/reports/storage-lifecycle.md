@@ -269,7 +269,9 @@ quota: a pending delayed task is in flight too — its artifacts survive a hard 
 |---|---|---|---|---|
 | **D1** | owner marker 的 pid 用 `pidAlive()`（进程**组**语义）探测 | fail-open | **活着的 session 的整份 data dir 被 `rm -rf`** | 已修 |
 | **D2** | 「marker 存在但**读不出来**」被吞成「**没有** marker」 | fail-open | 同上（EACCES/EIO、marker 成了目录、悬空软链） | 已修 |
-| **D3** | 快照的 `pid` 只要求是 `number`：`pid: 0` 在 macOS 判「活」、Linux 判「死」 | 平台相关判定 | 同一快照两个平台相反结论 | 已修 |
+| **D3** | 快照的 `pid` 只要求是 `number`：`pid: 0` 在 macOS 判「活」、Linux 判「死」；`pid: 1e21` 让 `kill()` 抛 `ERR_INVALID_ARG_TYPE` 被读成「死」 | 平台相关判定 / fail-open | 同一快照两个平台相反结论；超范围 pid 直接删目录 | 已修 |
+| **D4** | （**我第一版补丁引入的配额回归**）把 pid 校验套到了**终态**快照上 | 泄漏 | 一个坏 pid 让整个目录变「不可读」→ 产物永不淘汰、`overQuota` 永远为真（实测 10390 B / 6000 B 配额，0 淘汰） | 已修：只校验**非终态**快照 |
+| **D5** | （**我第一版补丁仍存在的漏洞**）`isPid` 没有 `pid_t` 上界 | fail-open | `kill(1e21)` 抛 `ERR_INVALID_ARG_TYPE` → `processAlive` 返回 false → 「owner 已死」→ 目录被回收 | 已修：`isPid` 限 `<= 0x7fffffff`，且 `processAlive` 对不可探测的 pid 返回 **true**（保留目录） |
 
 三条都属于同一类错误：**把「无法证明活着」读成「证明死了」**。§25.3 的原文承诺是「判无知的默认答案是
 **不删**」，实现没做到。
@@ -338,11 +340,29 @@ CASE2  marker pid = 活着的组长进程   → removedDirs=[]  skipped=["owner_
 | M6 把 `pending` 快照重新当成「永久保护」（第一版补丁的写法） | 同上 | **1 fail**：`#102 REV-33: a pending snapshot has no pid, so the owner marker decides — not the snapshot`（断言「无人认领的那个目录必须仍可回收」） |
 | M6b 读不出 marker 时当作「没有 marker」（合入时的写法） | 同上 | **1 fail**：`#102 REV-33: a marker that cannot be read is unknown, never 'no owner'` |
 | M6c 快照 pid 回到「任何 number」（合入时的写法） | 同上 | **1 fail**：`#102 REV-33: a snapshot pid that cannot be probed makes the directory unknown` |
+| M8 把 pid 校验套到终态快照（第一版补丁） | 同上 | **1 fail**：`#102 REV-33: a terminal snapshot's pid is never probed, so an odd one must not pin the quota` |
+| M9 `isPid` 去掉 `pid_t` 上界（第一版补丁） | 同上 | **1 fail**：`#102 REV-33: a marker pid outside the pid_t range is unknown, not 'dead'` |
 | M7 把「一字节超限」用例改回软模式 | 同上 | **1 fail**：`#102 quota: one byte over the limit evicts…`（该用例原来那句 `existsSync("a.json")` 是**空转断言**：`a` 从未被创建，永远为真；已改成断言真正被淘汰的 `older.json` + 对照 `newer.json` 仍在） |
 
 新增 6 例里，「非组长 marker」那条**自带 fixture 断言**：先断言该 pid `kill(pid,0)` 成功、且 `kill(-pid,0)`
 必须是 `ESRCH` —— 也就是说，如果将来某个平台让这个子进程变成组长，测试会主动红，而不是「恰好通过」。
 另有一条 `pending` 快照的用例，两半在同一轮里对照：marker 活 → 保留（`owner_alive`），无 marker 且过龄 → 回收。
+
+### 10.4b 对我自己补丁的两轮复核（为什么值得记）
+
+这类「修 fail-closed」的补丁最容易反向搞出新问题，所以补丁本身也过了两轮 fresh-context 对抗式复核，
+两轮都抓到了真东西：
+
+| 轮次 | 抓到 | 处理 |
+|---|---|---|
+| 1 | 第一版给「非终态但无 pid」加了**永久保护**（`unproven_task`）→ 每个「排过延迟任务后退出」的目录永不回收（实测 10 年后仍拒绝） | **回退**（见 §10.1） |
+| 1 | marker **存在但读不出来**被吞成「没有 marker」 | 修（D2），并补 3 种不可读形态的用例 |
+| 1 | 快照 pid 未校验（平台相反结论） | 修（D3） |
+| 2 | **我引入的配额回归**：pid 校验套到终态快照上 → 坏 pid 让整个目录的产物永不淘汰 | 修（D4），只校验非终态 |
+| 2 | **我留下的漏洞**：`isPid` 无 `pid_t` 上界 → `kill(1e21)` 抛 `ERR_INVALID_ARG_TYPE` → 读成「已死」 | 修（D5） |
+| 2 | 附带发现：marker 若是 **FIFO**，旧代码 `readFileSync` **永久阻塞**（挂死 `configure()`）；修后按 `unreadable_owner` 立即返回 | 修 |
+
+两轮都各自给出了「撤掉修复即红」的实测（§10.4），并按轮次复跑全量 + `tsc --noEmit`。
 
 ### 10.5 复核过、**不改**的项（附理由）
 
@@ -367,6 +387,7 @@ CASE2  marker pid = 活着的组长进程   → removedDirs=[]  skipped=["owner_
 | 同一 taskId 在两个目录都留有副本时，两份是**独立候选**，配额可能两份都删（虽然只删大的那份就够了） | 多删 | 删序是确定的全序（§25.4），不是最优子集；被删的仍是 policy-expired / 显式 hard 的候选，不违反保留承诺。已写入 §25.7 |
 | `planEvictions.bytesAfter` 是**乐观值**（按 surveyed 字节递减），与 `StorageReport.overQuota`（按实测递减）可能不一致 | 保守 | 后果只会是**少删** + 诚实报满，下一轮补完；已写入 §25.7 |
 | `MAX_SCAN_DIRS = 256` 截断掉的目录既不计字节也不产候选 → 目录数超 256 时配额可能报 `overQuota: false` 而盘上仍超 | 记账不精确（有界） | 已写入 §25.7；改上限要付同步 I/O 代价（§25.6） |
+| **头部饥饿**：前 256 个目录若都被永久跳过（如各带一个 `.DS_Store` → `foreign_content`），排在后面的可回收目录永远扫不到 | 漏回收 | 既有语义（与记账上限同源）。REV-33 修掉「活 session 被删」后才变得可见（旧代码会先删掉头部那些目录）；已写入 §25.7 |
 | `PI_ASYNC_TOTAL_BYTES=1e18` 被接受（有限整数、无 `max`），等于开了个够不着的配额 | 无害 | 不 throw、不改行为；加 `max` 反而可能把合理的大值静默降级 |
 
 另修了一处**事实性注释错误**：`sweepStorage()` phase 2 的注释原写「`foreign_content` 目录的字节不进配额」，
@@ -377,10 +398,10 @@ CASE2  marker pid = 活着的组长进程   → removedDirs=[]  skipped=["owner_
 | | total | pass | fail | skip |
 |---|---|---|---|---|
 | 基线 `origin/main` `46d046e`（含 PR #106/#108，未改动） | 480 | 451 | 16 | 13 |
-| 本分支 | **484** | **455** | 16 | 13 |
-| 增量 | **+4** | **+4** | 0 | 0 |
+| 本分支 | **488** | **459** | 16 | 13 |
+| 增量 | **+8** | **+8** | 0 | 0 |
 
-- 单文件：`tests/a-storage-sweep.test.ts` **38/38** 全绿（合入时 32 例 → +6）。
+- 单文件：`tests/a-storage-sweep.test.ts` **40/40** 全绿（合入时 32 例 → +8）。
 - 16 条失败/13 条 skip 与基线**逐条相同**：在 `/tmp` 里用 `git archive origin/main` 独立展开一份未改动基线
   跑全量，失败用例名集合与本分支 `diff` 为空（16 条同名；macOS 环境性：`/var`→`private/var` 软链、无 `/proc`、
   TUI 时序；CI 为 Ubuntu）。

@@ -1491,8 +1491,11 @@ Async task admission is closed (registry suspended: a reload or resume retired t
     的权限）即视为活；Linux 上再查 `/proc/<pid>/stat` 的状态位，`Z`（僵尸）算死。**不是** `pidAlive()` 的
     进程组语义：marker 记的是 `process.pid`，而 pi session 进程通常是 shell 进程组的成员、不是组长——
     用组语义判它会把活着的 session 判成死的（0.5.2 合入后的缺陷，§25.9）。
-  - marker 的 `pid` 必须是**正整数**；`0`/负数/小数无法诚实探测（`0` 会变成「我自己的进程组」、负数变成
-    「进程组 N」），一律按 `unreadable_owner` 当作**不知道**——目录保留，绝不据此认定 owner 已死。
+  - marker 的 `pid` 必须是**正整数且在 `pid_t` 范围内**；`0`/负数/小数/`1e21` 无法诚实探测（`0` 会变成
+    「我自己的进程组」、负数变成「进程组 N」、超范围会让 `kill()` 抛 `ERR_INVALID_ARG_TYPE` 而被误读成
+    「已死」），一律按 `unreadable_owner` 当作**不知道**——目录保留，绝不据此认定 owner 已死。
+  - **marker 是 FIFO/socket 时不许读**：`readFileSync` 在 FIFO 上会**永久阻塞**（会把 `configure()` 挂死）。
+    `surveyDataDir()` 先看 dirent 再决定读不读，非常规文件一律不读、直接按 `unreadable_owner` 处理。
   - **marker 的存在本身就是证据**（REV-33）：名字在、但读不出来（EACCES/EIO/EISDIR、悬空软链、
     根本不是普通文件）**不等于**「没有 marker」，一律 `unreadable_owner` 并跳过。本模块从不跟随软链，
     所以「marker 是软链」也按不可读处理（即使它指向一个能读的 JSON）。
@@ -1530,7 +1533,7 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 | 目录里有 dataDir 永远不会写的东西（子目录、软链、非产物文件） | `foreign_content` |
 | 有 `.json` 解析不出快照（损坏/半写/不认识） | `unreadable_snapshot` |
 | 非终态快照指向活 pid | `live_task` |
-| 快照的 `pid` 存在但不是正整数（`0`/负数/小数）：无法诚实探测 | `unreadable_snapshot` |
+| **非终态**快照的 `pid` 存在但不可探测（`0`/负数/小数/超出 `pid_t`）：终态快照的 pid 从不被探测，不受此限 | `unreadable_snapshot` |
 | owner marker 的 pid 仍活着（进程语义） | `owner_alive` |
 | owner marker 存在且读不出正整数 pid（解析失败、**不是普通文件**、EISDIR/EACCES/EIO） | `unreadable_owner` |
 | 未过年龄闸 | `recently_active` |
@@ -1626,6 +1629,9 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - **扫描上限也是记账上限**：`MAX_SCAN_DIRS = 256` 按名字排序截断，截断掉的目录既不计字节也不产候选。
   因此 `usedBytesBefore` / `overQuota` 只对**已经扫到的**目录成立：目录数超过 256 时，配额可能在
   「还有未扫描字节在盘上」的情况下报 `overQuota: false`。这是有界但真实的不精确；要更准就抬高上限（同步代价见 §25.6）。
+- **头部饥饿**：截断是按名字排序取前 256 个。如果前 256 个里有大量**永久跳过**的目录（例如每个都带一个
+  `.DS_Store` → `foreign_content`），排在后面的可回收目录**永远不会被扫到**。这是既有语义（与上面的记账上限同源），
+  REV-33 修掉「活 session 被删」之后它才变得可见（旧代码会先删掉那些头部的目录）。
 - **扫描/计划的字节是“扫到的”，删除后的字节是“量到的”**：`planEvictions` 乐观地按 surveyed size 递减，
   `StorageReport` 用实际 `lstat` 到的 size 累计。两者不一致时（文件消失、变成非普通文件、metadata 指向异常），
   实际结果只会是**少删 + 诚实地报 `overQuota`**，要等下一轮补完。
@@ -1688,8 +1694,10 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - **明确不做**：给「非终态但无 pid」加永久保护。`shutdown()` 会将 `pending` 快照留在盘上（延迟任务在 spawn
   前就没有 pid），加永久保护会让每个「排过延迟任务后退出」的目录永不回收——复核实测该写法的第一版补丁
   确实把这类目录钉死了 10 年，**已回退**：这类快照不提供判活证据，降到 marker + 年龄闸判定。
-- 新增 6 例回归（含一个**自觉地断言自己处在难例**的 fixture：marker 的 pid 必须活着且不是进程组长，
+- 新增 8 例回归（含一个**自觉地断言自己处在难例**的 fixture：marker 的 pid 必须活着且不是进程组长，
   否则测试自己红），并把一条**空转断言**（`a.json` 从未被创建，永远为真）改成断言真正被淘汰的文件。
+- **只对非终态快照做 pid 校验**：终态任务的 pid 从不被探测，若把不可探测的终态 pid 也算成「目录不可读」，
+  该目录的产物会**永不淘汰**、配额永远报满（这是第一版补丁引入的配额回归，第二轮回核抓到并修掉）。
 - 不改工具面、不改默认值、不改 `prune()`/`reapOrphans()`、不新增 env。
 
 **回退开关**：无（纯安全修正；若需与 0.5.2 行为一致，把 `PI_ASYNC_SWEEP_SIBLINGS` / `PI_ASYNC_TOTAL_BYTES`

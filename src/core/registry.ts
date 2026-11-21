@@ -1658,7 +1658,10 @@ export class TaskRegistry {
    * only the exit status is left. Pid reuse can only make a dead owner look alive — stale safe.
    */
   private processAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
+    // An out-of-range pid can never name a process, so it carries no evidence of death: answering
+    // "alive" keeps the directory. (`surveyDataDir()` already refuses such markers as unreadable;
+    // this is the second line of defence, and the `ERR_INVALID_ARG_TYPE` case is why it exists.)
+    if (!Number.isInteger(pid) || pid <= 0 || pid > 0x7fffffff) return true;
     try { process.kill(pid, 0); }
     catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
     // Signalling succeeded (or was refused as EPERM, i.e. it exists): refine only the zombie case.

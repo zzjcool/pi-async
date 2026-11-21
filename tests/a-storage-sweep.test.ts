@@ -697,6 +697,43 @@ test("#102 REV-33: an unprobeable marker pid is unknown, never proof of death", 
   }
 });
 
+test("#102 REV-33: a marker pid outside the pid_t range is unknown, not 'dead'", async () => {
+  // `Number.isInteger(1e21)` is true, but `process.kill(1e21, 0)` throws ERR_INVALID_ARG_TYPE — which
+  // a naive probe reads as "dead" and then reclaims the directory. A pid no process can have is not
+  // evidence of anything.
+  const t = tree();
+  const sibling = join(t.root, "session-huge-pid");
+  mkdirSync(sibling);
+  seed(sibling, { taskId: "done", finishedAt: OLD() });
+  age(sibling, OLD());
+  try {
+    const registry = t.open({ sweepSiblings: true });
+    seedOwner(sibling, 1e21);
+    age(sibling, OLD());
+    const report = registry.sweepStorage();
+    assert.deepEqual(report.removedDirs, [], "an impossible pid must not be read as a dead owner");
+    assert.equal(report.skipped.find((entry) => entry.path === sibling)?.reason, "unreadable_owner");
+  } finally { await t.cleanup(); }
+});
+
+test("#102 REV-33: a terminal snapshot's pid is never probed, so an odd one must not pin the quota", async () => {
+  // The pid of a finished task is never used (it is only an eviction candidate). Turning such a
+  // directory "unreadable" would make its artifacts un-evictable and report the quota as exceeded
+  // forever — a leak that the first version of this fix actually introduced (found in review).
+  const t = tree();
+  seed(t.current, { taskId: "healthy", finishedAt: Date.now() - 3000 });
+  seed(t.current, { taskId: "odd", finishedAt: Date.now() - 1000, pid: 0 });
+  const used = bytesOf(t.current);
+  try {
+    const registry = t.open({ totalBytes: used - 1, quotaHard: true });
+    await registry.reloadFromDisk();
+    const report = registry.sweepStorage();
+    assert.deepEqual(report.unreadableDirs, [], "a finished task's pid must not mark the dir unreadable");
+    assert.equal(report.overQuota, false, "the odd pid must not disable eviction");
+    assert.ok(report.evicted.length >= 1, "the over-quota bytes still have to come off");
+  } finally { await t.cleanup(); }
+});
+
 test("#102 REV-33: a pending snapshot has no pid, so the owner marker decides — not the snapshot", async () => {
   // `pending` (delayed) tasks are persisted before they spawn, so they carry no pid; `shutdown()`
   // deliberately leaves them on disk. That is NOT evidence of a live run (it must not block

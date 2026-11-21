@@ -48,8 +48,11 @@
   现在 marker 的**存在**本身就是证据：不可读/非普通文件一律 `unreadable_owner` 并保留；marker 里非正整数
   （`0`/负数/小数）的 pid 同样记 `unreadable_owner`，不再被拿去探测。
 - **快照里不可探测的 pid 不再被当成「已死」（REV-33）**：`pid: 0` 在 macOS 上会被 `kill(-0, 0)` 判成「活着」、
-  在 Linux 上判成「已死」——同一个快照两个平台相反。现在非终态快照的 pid 必须是正整数，否则整个目录记
-  `unreadable_snapshot`（不猜测）。
+  在 Linux 上判成「已死」——同一个快照两个平台相反；`pid: 1e21` 会让 `kill()` 抛 `ERR_INVALID_ARG_TYPE`。
+  现在**非终态**快照的 pid 必须是 `pid_t` 范围里的正整数，否则整个目录记 `unreadable_snapshot`（不猜测）。
+  **终态快照的 pid 从不被探测，因此不受此限**——否则一个坏 pid 会让整个目录的产物永不淘汰、配额永远报满。
+- **owner marker 是 FIFO 时不再挂死 `configure()`（REV-33）**：`readFileSync` 在 FIFO 上会永久阻塞。现在先看
+  dirent 再决定读不读，非常规文件（FIFO/socket/目录/软链）一律不读，按 `unreadable_owner` 处理。
 - **不为 `pending` 快照加永久保护（有意）**：延迟任务在 spawn 前没有 pid，`shutdown()` 又会故意把这类快照
   留在盘上；把它们当「可能是活的」永久保留，会让每个「排过延迟任务后退出」的目录永不回收。它们不提供
   判活证据，由 owner marker + 年龄闸定生死（复核抓到的第一版写法正是这个反向回归，已回退）。
