@@ -253,7 +253,11 @@ quota: a pending delayed task is in flight too — its artifacts survive a hard 
   `tests/b-watch-integration.test.ts:104`）：在未改动的 `origin/main` 独立 worktree 上单文件跑 3 次 3 次全红，
   本分支 3 次 1 次红 —— 与本次改动无关。两次全量正好一次命中、一次不命中（15 / 16 的来源）。
 
-## 10. 合入后复核（REV-33）：闸 2 的两个判活口子
+## 10. 合入后复核（REV-33）：闸 2 的判活口子
+
+- 补丁：PR https://github.com/zzjcool/pi-async/pull/109（分支 `pi-subagent/pi-async-102-61a83d57`）
+- 基线：`origin/main` `46d046e`（已含 #102 的 PR #106 与 #108）；本节所有行号都以该基线为准
+- 契约：`docs/CONTRACT.md` §25.9（REV-33）× §25.2 / §25.3 / §25.7 / §25.8
 
 本节记录一次**独立派发**的复核（派发时的 `main` 已前进到含 PR #106 的 `d0407d1`，本子树先 fast-forward 到
 `origin/main` 再动手）。复核的目标不是「重做 #102」，而是验证 §25 的**核心安全承诺**是否真的成立：
