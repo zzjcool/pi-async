@@ -1326,6 +1326,8 @@ export class TaskRegistry {
         const verdict = siblingVerdict(survey, {
           currentDataDir: dataDir, now, minAgeMs: this.sweepSiblingAgeMs,
           pidAlive: (pid) => this.pidAlive(pid),
+          // REV-33: the marker holds a session pid, not a process-group id.
+          processAlive: (pid) => this.processAlive(pid),
         });
         if (!verdict.deletable) {
           report.skipped.push({ path: survey.path, reason: verdict.reason ?? "recently_active", ...(verdict.detail === undefined ? {} : { detail: verdict.detail }) });
@@ -1347,9 +1349,13 @@ export class TaskRegistry {
       survivors = keep;
     }
 
-    // Phase 2 — global byte quota over the surviving data dirs. A `foreign_content` directory is not
-    // a pi-async data dir, so its bytes are not part of the artifact budget (and it yields no
-    // candidates): a wrong `dirname(dataDir)` can neither inflate the quota nor lose data to it.
+    // Phase 2 — global byte quota over the surviving data dirs. `isDataDir()` is the filter: a
+    // directory holding only foreign content (no snapshot, no identity with this data dir) is not a
+    // pi-async data dir, so its bytes are neither counted nor made into candidates — a wrong
+    // `dirname(dataDir)` can neither inflate the quota nor lose data to it. A *foreign* directory
+    // that still holds a parseable snapshot **does** count (and may yield candidates): the snapshot
+    // is positive evidence that this is a pi-async data dir with a stray file in it, which is the
+    // same call `surveyDataDir()` makes for the current data dir.
     if (this.totalBytes > 0) {
       const dataDirs = survivors.filter((survey) => isDataDir(survey));
       const used = dataDirs.reduce((total, survey) => total + survey.bytes, 0);
@@ -1421,7 +1427,9 @@ export class TaskRegistry {
   /**
    * `configure()` entry point: throttled and non-throwing (D-05 — it runs inside a session-start
    * handler, where a throw becomes extension noise). Runs at most once per
-   * `PI_ASYNC_SWEEP_INTERVAL_MS`; `<= 0` means every configure.
+   * `PI_ASYNC_SWEEP_INTERVAL_MS`. `0` means every configure; a negative value only reaches here
+   * through the programmatic `sweepIntervalMs` (the env knob is floored at `0` by `envNumber`, so
+   * `PI_ASYNC_SWEEP_INTERVAL_MS=-1` falls back to the 60 s default rather than meaning "always").
    */
   private maybeSweepStorage(now = Date.now()): void {
     if (!this.sweepSiblings && this.totalBytes <= 0) return;
@@ -1631,6 +1639,35 @@ export class TaskRegistry {
       throw new Error(`Refusing to read task output outside the async data directory: ${target}`);
     }
     return resolvedTarget;
+  }
+
+  /**
+   * Does *process* `pid` exist (REV-33)? Direct-pid semantics, deliberately different from
+   * `pidAlive()` below.
+   *
+   * `pidAlive()` answers a **process-group** question (`/proc` row with `pgrp === pid`, else
+   * `kill(-pid, 0)`) because every task child is spawned `detached` and therefore *is* its own group
+   * leader — that is what lets a group whose leader already exited still count as alive (#6).
+   *
+   * The owner marker records `process.pid` of a pi **session**, and a session process is usually a
+   * member of its shell's process group, not a leader. Probing it with group semantics makes a live
+   * session look dead, which is the one direction the storage sweep must never guess: it would
+   * reclaim the whole data dir of a session that is still running (fail-open, found in the #102
+   * post-merge audit). Fail-closed rules: `EPERM` means "exists, not mine" and counts as alive; a
+   * pid that cannot be signalled at all counts as dead; a Linux zombie (state `Z`) is dead because
+   * only the exit status is left. Pid reuse can only make a dead owner look alive — stale safe.
+   */
+  private processAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+    // Signalling succeeded (or was refused as EPERM, i.e. it exists): refine only the zombie case.
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const closeParen = stat.lastIndexOf(") ");
+      if (closeParen >= 0) return stat.slice(closeParen + 2, closeParen + 3) !== "Z";
+    } catch { /* no /proc (macOS), or raced with exit: the signal probe already answered */ }
+    return true;
   }
 
   private pidAlive(pid: number): boolean {

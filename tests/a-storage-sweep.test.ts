@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { TaskRegistry, type RegistryConfig } from "../src/core/registry.ts";
@@ -40,6 +41,10 @@ interface Tree {
  *  usually computed *before* the registry exists, so the fixture cannot build it up front). */
 function tree(): Tree {
   const root = mkdtempSync(join(tmpdir(), "pi-async-sweep-"));
+  // Enforced, not just intended: every fixture must live under the OS tmp dir and outside the real
+  // home directory, so no test can ever be pointed at a live `~/.pi` tree by accident.
+  assert.ok(root.startsWith(tmpdir()), "fixtures must live under the OS tmp dir");
+  assert.ok(!root.startsWith(homedir()), "fixtures must never live under $HOME");
   const current = join(root, "session-current");
   mkdirSync(current, { recursive: true });
   const opened: TaskRegistry[] = [];
@@ -83,9 +88,13 @@ function seed(
   writeFileSync(join(dir, `${opts.taskId}.output`), "x".repeat(opts.outputBytes ?? 200));
 }
 
-/** Push every mtime in the dir (and the dir itself) into the past — the age gate's only input. */
+/** Push every mtime in the dir (and the dir itself) into the past — the age gate's only input.
+ *  Entries that cannot be timestamped (a dangling symlink) are skipped: they are never artifact
+ *  files, so the age gate does not read them. */
 function age(dir: string, atMs: number): void {
-  for (const name of readdirSync(dir)) utimesSync(join(dir, name), new Date(atMs), new Date(atMs));
+  for (const name of readdirSync(dir)) {
+    try { utimesSync(join(dir, name), new Date(atMs), new Date(atMs)); } catch { /* unlinkable target */ }
+  }
   utimesSync(dir, new Date(atMs), new Date(atMs));
 }
 
@@ -346,7 +355,8 @@ test("#102 quota: one byte over the limit evicts, and the bookkeeping reflects i
     assert.equal(report.evicted[0]?.taskId, "older");
     assert.equal(report.overQuota, false);
     assert.ok(report.usedBytesAfter <= used - 1, "the pass must end inside the budget");
-    assert.equal(existsSync(join(t.current, "a.json")), false);
+    assert.equal(existsSync(join(t.current, "older.json")), false, "the evicted task's snapshot must be gone");
+    assert.equal(existsSync(join(t.current, "newer.json")), true, "the newest task must survive");
   } finally { await t.cleanup(); }
 });
 
@@ -629,6 +639,143 @@ test("#102 safety: an idle data dir of a live session is protected by its owner 
     const after = registry.sweepStorage();
     assert.deepEqual(after.removedDirs, [sibling]);
     assert.equal(existsSync(sibling), false);
+  } finally { await t.cleanup(); }
+});
+
+test("#102 REV-33: a marker pid that is live but NOT a process-group leader protects the dir", async () => {
+  const t = tree();
+  const sibling = join(t.root, "session-live-idle");
+  mkdirSync(sibling);
+  // Only terminal work, idle past the age gate: the marker is the *only* thing that can prove the
+  // session is still there, so this test fails exactly when that proof is broken.
+  seed(sibling, { taskId: "done", finishedAt: OLD() });
+  age(sibling, OLD());
+  // What `writeOwnerMarker()` records is `process.pid` of a pi session — an ordinary process that
+  // shares its shell's process group. `pidAlive()` answers a *group* question (`kill(-pid, 0)` /
+  // `/proc` `pgrp === pid`), so for this shape it answers "dead" about a live process.
+  const session = spawn("/bin/sh", ["-c", "sleep 30"], { stdio: "ignore" });
+  try {
+    await new Promise((resolve) => session.once("spawn", resolve));
+    const pid = session.pid!;
+    // Fixture guard: these two assertions are what makes this the hard case. If a future platform
+    // made the child a group leader, the test must fail loudly instead of passing for free.
+    assert.doesNotThrow(() => process.kill(pid, 0), "fixture pid must be alive");
+    assert.throws(() => process.kill(-pid, 0), /ESRCH/, "fixture pid must NOT be a process-group leader");
+
+    const registry = t.open({ sweepSiblings: true });
+    seedOwner(sibling, pid);
+    age(sibling, OLD()); // the marker write bumped the mtime: idle past the age gate again
+    const report = registry.sweepStorage();
+    assert.deepEqual(report.removedDirs, [], "a live session's data dir must never be reclaimed");
+    assert.equal(existsSync(join(sibling, "done.json")), true);
+    assert.equal(report.skipped.find((entry) => entry.path === sibling)?.reason, "owner_alive");
+  } finally {
+    session.kill("SIGKILL");
+    await t.cleanup();
+  }
+});
+
+test("#102 REV-33: an unprobeable marker pid is unknown, never proof of death", async () => {
+  // `0` would be signalled as "my own process group", a negative value as "process group N" and a
+  // fraction as no process at all: none of them is evidence that the owner is gone, so all three
+  // must land on `unreadable_owner` (keep the dir) instead of being trusted.
+  for (const pid of [0, -5, 1.5]) {
+    const t = tree();
+    const sibling = join(t.root, "session-bad-marker");
+    mkdirSync(sibling);
+    seed(sibling, { taskId: "done", finishedAt: OLD() });
+    age(sibling, OLD());
+    try {
+      const registry = t.open({ sweepSiblings: true });
+      seedOwner(sibling, pid);
+      age(sibling, OLD());
+      const report = registry.sweepStorage();
+      assert.deepEqual(report.removedDirs, [], `marker pid ${pid} must not be read as a dead owner`);
+      assert.equal(existsSync(sibling), true);
+      assert.equal(report.skipped.find((entry) => entry.path === sibling)?.reason, "unreadable_owner", `marker pid ${pid}`);
+    } finally { await t.cleanup(); }
+  }
+});
+
+test("#102 REV-33: a pending snapshot has no pid, so the owner marker decides — not the snapshot", async () => {
+  // `pending` (delayed) tasks are persisted before they spawn, so they carry no pid; `shutdown()`
+  // deliberately leaves them on disk. That is NOT evidence of a live run (it must not block
+  // reclamation forever — a session that quits after scheduling a delayed task would pin its
+  // directory for good), and it is NOT evidence of death either. The marker answers the question.
+  const t = tree();
+  const liveOwner = join(t.root, "session-pending-live");
+  const goneOwner = join(t.root, "session-pending-gone");
+  for (const dir of [liveOwner, goneOwner]) {
+    mkdirSync(dir);
+    seed(dir, { taskId: "later", status: "pending" });
+    age(dir, OLD());
+  }
+  try {
+    const registry = t.open({ sweepSiblings: true });
+    seedOwner(liveOwner, process.pid); // this test process: live, and normally not a group leader
+    age(liveOwner, OLD());
+    const report = registry.sweepStorage();
+    assert.deepEqual(report.removedDirs, [goneOwner], "the directory nobody claims is still reclaimable");
+    assert.equal(existsSync(join(liveOwner, "later.json")), true, "a live owner keeps its pending work");
+    assert.equal(report.skipped.find((entry) => entry.path === liveOwner)?.reason, "owner_alive");
+  } finally { await t.cleanup(); }
+});
+
+test("#102 REV-33: a marker that cannot be read is unknown, never 'no owner'", async () => {
+  // Presence is evidence. A marker that became a directory or a dangling symlink (restored backup,
+  // rsync, a hostile entry) cannot be read as a claim — and an unreadable claim is not an absent one.
+  const cases: Array<[string, (path: string) => void]> = [
+    ["a directory", (path) => mkdirSync(path)],
+    ["a dangling symlink", (path) => symlinkSync(join(tmpdir(), "pi-async-nonexistent-marker"), path)],
+  ];
+  for (const [label, make] of cases) {
+    const t = tree();
+    const sibling = join(t.root, "session-broken-marker");
+    mkdirSync(sibling);
+    seed(sibling, { taskId: "done", finishedAt: OLD() });
+    make(join(sibling, OWNER_MARKER_NAME));
+    age(sibling, OLD());
+    try {
+      const registry = t.open({ sweepSiblings: true });
+      const report = registry.sweepStorage();
+      assert.deepEqual(report.removedDirs, [], `marker as ${label} must not be read as 'no owner'`);
+      assert.equal(existsSync(join(sibling, "done.json")), true, label);
+      assert.equal(report.skipped.find((entry) => entry.path === sibling)?.reason, "unreadable_owner", label);
+    } finally { await t.cleanup(); }
+  }
+});
+
+test("#102 REV-33: a snapshot pid that cannot be probed makes the directory unknown", async () => {
+  // `pid: 0` would be signalled as "my own process group" (macOS) and match nothing on Linux: the
+  // answer would be platform-dependent, so it must not count as evidence either way.
+  const t = tree();
+  const sibling = join(t.root, "session-bad-pid");
+  mkdirSync(sibling);
+  writeFileSync(join(sibling, "odd.json"), JSON.stringify({ taskId: "odd", status: "running", pid: 0, createdAt: OLD(), metadata: {} }));
+  age(sibling, OLD());
+  try {
+    const registry = t.open({ sweepSiblings: true });
+    const report = registry.sweepStorage();
+    assert.deepEqual(report.removedDirs, []);
+    assert.equal(report.skipped.find((entry) => entry.path === sibling)?.reason, "unreadable_snapshot");
+  } finally { await t.cleanup(); }
+});
+
+test("#102 safety: a snapshot with an unknown status is unreadable, not a finished task", async () => {
+  const t = tree();
+  const sibling = join(t.root, "session-future");
+  mkdirSync(sibling);
+  // A newer build could write a status this one does not know: it must count as "cannot judge",
+  // never as "terminal, so its artifacts are garbage".
+  writeFileSync(join(sibling, "future.json"), JSON.stringify({ taskId: "future", status: "cancelled", createdAt: OLD(), finishedAt: OLD() }));
+  writeFileSync(join(sibling, "future.output"), "x".repeat(100));
+  age(sibling, OLD());
+  try {
+    const registry = t.open({ sweepSiblings: true });
+    const report = registry.sweepStorage();
+    assert.deepEqual(report.removedDirs, []);
+    assert.equal(existsSync(join(sibling, "future.output")), true);
+    assert.equal(report.skipped.find((entry) => entry.path === sibling)?.reason, "unreadable_snapshot");
   } finally { await t.cleanup(); }
 });
 

@@ -252,3 +252,134 @@ quota: a pending delayed task is in flight too — its artifacts survive a hard 
 - 另有 1 条**既有 flake** `async_kill still kills a process after watch timeout finalized it`（`kill EPERM`，
   `tests/b-watch-integration.test.ts:104`）：在未改动的 `origin/main` 独立 worktree 上单文件跑 3 次 3 次全红，
   本分支 3 次 1 次红 —— 与本次改动无关。两次全量正好一次命中、一次不命中（15 / 16 的来源）。
+
+## 10. 合入后复核（REV-33）：闸 2 的两个判活口子
+
+本节记录一次**独立派发**的复核（派发时的 `main` 已前进到含 PR #106 的 `d0407d1`，本子树先 fast-forward 到
+`origin/main` 再动手）。复核的目标不是「重做 #102」，而是验证 §25 的**核心安全承诺**是否真的成立：
+「正在运行的任务/活着的 session 的目录绝不被删」。
+
+### 10.1 结论：合入的实现有三个 fail-open 口子，均已在本次修掉
+
+| # | 缺陷 | 方向 | 后果 | 状态 |
+|---|---|---|---|---|
+| **D1** | owner marker 的 pid 用 `pidAlive()`（进程**组**语义）探测 | fail-open | **活着的 session 的整份 data dir 被 `rm -rf`** | 已修 |
+| **D2** | 「marker 存在但**读不出来**」被吞成「**没有** marker」 | fail-open | 同上（EACCES/EIO、marker 成了目录、悬空软链） | 已修 |
+| **D3** | 快照的 `pid` 只要求是 `number`：`pid: 0` 在 macOS 判「活」、Linux 判「死」 | 平台相关判定 | 同一快照两个平台相反结论 | 已修 |
+
+三条都属于同一类错误：**把「无法证明活着」读成「证明死了」**。§25.3 的原文承诺是「判无知的默认答案是
+**不删**」，实现没做到。
+
+**一次被复核抓到的自我回归（诚实记录）**：本次补丁的第一版给「非终态但快照没有 pid」加了**永久保护**
+（`unproven_task`）。独立审查指出：`pending`（延迟任务）在 spawn 前本来就没有 pid，而 `shutdown()`
+**故意**把这类快照留在盘上 —— 于是每个「排过延迟任务后退出」的目录会永远无法回收，实测「10 年后仍拒绝回收」。
+这是把一个罕见的 fail-open 换成一个**常见且无界**的泄漏，方向错误，**已回退**。现在的规则是：
+`pending` 快照**不提供**判活证据（既不算活、也不算死），由 owner marker + 年龄闸定生死 —— 这正是 marker
+存在的理由。该结论有回归断言钉住（见 §10.4 的 M6）。
+
+### 10.2 D1 的机理与证据
+
+`writeOwnerMarker()` 写的是 `process.pid`（`src/core/registry.ts`），而 `pidAlive(pid)` 答的是
+**进程组**问题：
+
+- Linux：`/proc/<pid>/stat` 里 `pgrp === pid`（`pgrp` 是 *字段 5 = 进程组 id*）；
+- macOS：`process.kill(-pid, 0)`（负号 = 向进程组发信号）。
+
+任务子进程经 `spawn("/bin/sh", …, { detached: true })`（`src/core/spawn.ts:80`）成为 session/组组长，
+所以 `pid == pgid`，组语义对**任务 pid** 是对的（也是 0.4.2 REV-28c/#6 刻意要的：组长退出但组里还有人
+要算活）。但 **pi session 进程通常是 shell 进程组的成员，不是组长** —— 于是「活着的 session」被报成死的。
+
+实测（本机 macOS，`node -e`，非组长子进程）：
+
+```
+childPid=78802  kill(-pid,0)=ESRCH → pidAlive()=false   # 明明是活着的进程
+                kill( pid,0)=ok   → 进程确实存在
+```
+
+再把这条事实接进真实路径（scout 独立复现，fixture 全在 `mkdtemp`）：
+
+```
+CASE1  marker pid = 活着的非组长进程 → removedDirs=["…/session-live-nonleader"]  existsAfter=false
+CASE2  marker pid = 活着的组长进程   → removedDirs=[]  skipped=["owner_alive"]    existsAfter=true
+```
+
+**为什么 32 例测试全绿却漏了它**：`tests/a-storage-sweep.test.ts` 的 marker fixture 用的是
+`registry.submit({command:"sleep 30"}).pid` —— 一个 `detached` 的**任务** pid，必然是组长，于是
+`pidAlive()` 恰好返回 `true`（理由错、结果对）。生产永远不会写这种值。
+
+### 10.3 修复
+
+- `src/core/registry.ts`：新增 `processAlive(pid)` —— **进程**语义（`process.kill(pid, 0)`；`EPERM` = 存在
+  但不是我 的权限 → 算活；Linux 上再查 `/proc/<pid>/stat` 状态位，`Z` 僵尸算死）。**只给 owner marker 用**。
+  `pidAlive()` 一字未改：任务 pid 继续走组语义，REV-28c 的语义边界不动。
+- `src/core/storage.ts`：`siblingVerdict()` 接两个**独立注入**的判活函数（`pidAlive` 给任务、`processAlive`
+  给 marker），避免「一个回调两处用」再次把两种语义混起来；`surveyDataDir()` 只接受**正整数** marker pid
+  （`isPid()`），`0`/负数/小数 → `ownerUnreadable`（`0` 会被当成「我自己的进程组」、负数当成「进程组 N」，
+  都不是关于那个进程的证据）。
+- D2：`surveyDataDir()` 把「marker 的存在」与「marker 的可读性」分开。旧代码用一个 `try/catch` 把
+  读失败归成 `markerRaw = undefined`（= 没有 marker）；现在先把 entry 记成 `absent` / `plain` /
+  `unreadable`，非普通文件（目录、软链、socket）直接 `unreadable_owner` —— 本模块从不跟随软链，
+  即使软链指向一个能读的 JSON 也不算证据。
+- D3：快照的 `pid` 同样只接受**正整数**（`isPid`），否则整个目录记 `unreadable_snapshot`：`0` 会被
+  `kill(-0, 0)` 当成「我自己的进程组」，负数当成「进程组 N」，两者都不能回答「那个进程还在吗」。
+- **不做**：给「非终态但无 pid」加永久保护（见 §10.1 的自我回归记录）。这类快照不提供判活证据，
+  由 marker + 年龄闸判定；这一条也有回归断言（M6）。
+
+### 10.4 变异证据（撤掉修复即红，逐条实测）
+
+| 变异 | 命令 | 结果 |
+|---|---|---|
+| M4 marker 改回组语义（`opts.processAlive` → `opts.pidAlive`） | `node --test tests/a-storage-sweep.test.ts` | **1 fail**：`#102 REV-33: a marker pid that is live but NOT a process-group leader protects the dir` |
+| M5 撤掉 marker pid 的正整数闸（回到「任何有限数」） | 同上 | **1 fail**：`#102 REV-33: an unprobeable marker pid is unknown, never proof of death` |
+| M6 把 `pending` 快照重新当成「永久保护」（第一版补丁的写法） | 同上 | **1 fail**：`#102 REV-33: a pending snapshot has no pid, so the owner marker decides — not the snapshot`（断言「无人认领的那个目录必须仍可回收」） |
+| M6b 读不出 marker 时当作「没有 marker」（合入时的写法） | 同上 | **1 fail**：`#102 REV-33: a marker that cannot be read is unknown, never 'no owner'` |
+| M6c 快照 pid 回到「任何 number」（合入时的写法） | 同上 | **1 fail**：`#102 REV-33: a snapshot pid that cannot be probed makes the directory unknown` |
+| M7 把「一字节超限」用例改回软模式 | 同上 | **1 fail**：`#102 quota: one byte over the limit evicts…`（该用例原来那句 `existsSync("a.json")` 是**空转断言**：`a` 从未被创建，永远为真；已改成断言真正被淘汰的 `older.json` + 对照 `newer.json` 仍在） |
+
+新增 6 例里，「非组长 marker」那条**自带 fixture 断言**：先断言该 pid `kill(pid,0)` 成功、且 `kill(-pid,0)`
+必须是 `ESRCH` —— 也就是说，如果将来某个平台让这个子进程变成组长，测试会主动红，而不是「恰好通过」。
+另有一条 `pending` 快照的用例，两半在同一轮里对照：marker 活 → 保留（`owner_alive`），无 marker 且过龄 → 回收。
+
+### 10.5 复核过、**不改**的项（附理由）
+
+| 发现 | 结论 | 理由 |
+|---|---|---|
+| **S2 配额不读 owner marker**：活着的空转 session 的**终态**产物仍可能被配额淘汰 | 不改代码，改文档 | tier 1 是那个 session 自己的 `prune()` 下一轮也会删的（同一并集策略），tier 2 需要显式 `PI_ASYNC_QUOTA_HARD=1`。若让 marker 也保护配额，「活着但 14 天没动静的 session」会永久钉住配额。文档原先把 marker 写成「这个目录还有人用吗」（读起来覆盖 S2），已在 §25.2/README 里把范围收窄到 S1 |
+| **tier 0「孤儿」按目录判定**：`migrateDataDir()` 残留使同一 taskId 出现在两个目录时，没有快照的那份算孤儿并软模式即删 | 不改 | 已核对：迁移后 `metadata.outputFile` 指向新目录，且快照与产物同目录；旧目录那份本来就是 best-effort 清理的残留。契约 §25.4 已明文覆盖这个两目录场景 |
+| 0.5.1 及更早目录**没有 marker**，只能靠「无活 pid + 年龄闸」判定 | 不改，记为已知边界 | 无法凭空取得证据。残留风险有界（需要同目录 14 天零写入），且新版本一写入就补 marker。已写进 §25.7 |
+| pid 复用（死 session 的 marker pid 被无关进程复用） | 不改，记为已知边界 | 只往「多保留」方向错，不会误删 |
+| `not_a_directory` / `not_a_data_dir` / `delete_failed` 三个 reason 不在 `SweepSkipReason` 联合里，契约表格也缺 | 修（纯文档/类型） | 类型诚实化 + 契约表格补齐；`report.skipped.reason` 是 `string`，不影响运行 |
+| `CONTRACT.md` 旧引用的 `registry.ts:1374-1377` 已漂移成配额记账行 | 修（纯文档） | 改成按**函数名**引用 `pidAlive()`，以后不再随行号漂移 |
+| `registry.ts` 注释「`<= 0` means every configure」与环境变量语义不符（负值会被 `envNumber` 回退成默认 60000） | 修（注释） | 只有程序化 `config.sweepIntervalMs` 能为负 |
+
+### 10.6 复核过、但**未在本次修**的配额路径问题（审计有据，范围外）
+
+第二轮独立复核（专门盯 `planEvictions` / `evictCandidate` / `envNumber`）又找到四处，均在**合入的配额路径**
+里，但都是**既有语义**或**保守方向**，本次不动，只如实记录：
+
+| 发现 | 方向 | 为何不改 |
+|---|---|---|
+| 当前 dataDir 的任务被淘汰时走 `removeArtifacts()`，它按 `metadata.outputFile` 删文件，而不是按 surveyed 文件清单。若 metadata 指向别处（迁移后 `persist()` 失败被吞、备份恢复、手拷目录），会**少删**本任务的文件、甚至删掉**另一个任务**的同名文件 | 可致错删 | 这是 `removeArtifacts()` 与 `prune()` 的**既有**共享语义（#102 之前就在），修它要动 `prune()`/`D-11` 边界与 `migrateDataDir`，属独立变更。正常写入路径（`join(dataDir, taskId+".output")`）不受影响 |
+| 同一 taskId 在两个目录都留有副本时，两份是**独立候选**，配额可能两份都删（虽然只删大的那份就够了） | 多删 | 删序是确定的全序（§25.4），不是最优子集；被删的仍是 policy-expired / 显式 hard 的候选，不违反保留承诺。已写入 §25.7 |
+| `planEvictions.bytesAfter` 是**乐观值**（按 surveyed 字节递减），与 `StorageReport.overQuota`（按实测递减）可能不一致 | 保守 | 后果只会是**少删** + 诚实报满，下一轮补完；已写入 §25.7 |
+| `MAX_SCAN_DIRS = 256` 截断掉的目录既不计字节也不产候选 → 目录数超 256 时配额可能报 `overQuota: false` 而盘上仍超 | 记账不精确（有界） | 已写入 §25.7；改上限要付同步 I/O 代价（§25.6） |
+| `PI_ASYNC_TOTAL_BYTES=1e18` 被接受（有限整数、无 `max`），等于开了个够不着的配额 | 无害 | 不 throw、不改行为；加 `max` 反而可能把合理的大值静默降级 |
+
+另修了一处**事实性注释错误**：`sweepStorage()` phase 2 的注释原写「`foreign_content` 目录的字节不进配额」，
+对「异物 + 可解析快照」的目录是**假的**（这种目录照样计数、照样产候选）。代码与契约 §25.2 一致，注释已改对。
+
+### 10.7 测试数字
+
+| | total | pass | fail | skip |
+|---|---|---|---|---|
+| 基线 `origin/main` `46d046e`（含 PR #106/#108，未改动） | 480 | 451 | 16 | 13 |
+| 本分支 | **484** | **455** | 16 | 13 |
+| 增量 | **+4** | **+4** | 0 | 0 |
+
+- 单文件：`tests/a-storage-sweep.test.ts` **38/38** 全绿（合入时 32 例 → +6）。
+- 16 条失败/13 条 skip 与基线**逐条相同**：在 `/tmp` 里用 `git archive origin/main` 独立展开一份未改动基线
+  跑全量，失败用例名集合与本分支 `diff` 为空（16 条同名；macOS 环境性：`/var`→`private/var` 软链、无 `/proc`、
+  TUI 时序；CI 为 Ubuntu）。
+- `npm run typecheck` 在本 worktree **无法执行**：`tsc: command not found`（没有 `node_modules`，`typescript`
+  未安装）。这是环境缺失，不是本次改动的问题；已用 `node --experimental-strip-types`（`npm test` 的路径）
+  实际加载全部改动过的模块来兜底，并逐行复核类型。

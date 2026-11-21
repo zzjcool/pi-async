@@ -670,8 +670,8 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   （**Trusted Publishing / OIDC**：`id-token: write`，**无 `NODE_AUTH_TOKEN` / `NPM_TOKEN`**）→
   `gh release create --generate-notes`（`GITHUB_TOKEN`）。
 - **平台 = POSIX only（#100）**：依赖 `/bin/sh -c` + `detached` 进程组（`src/core/spawn.ts:80`）、负 pid
-  进程组信号（`spawn.ts:226,230`）与 `/proc/<pid>/stat` 判活（`spawn.ts:198-201`、`registry.ts:1374-1377`；
-  缺 `/proc` 时退化到 `kill(-pid, 0)`，僵尸组不再区分）。支持 Linux 与 macOS（后者无 `/proc`，走退化
+  进程组信号（`spawn.ts:226,230`）与 `/proc/<pid>/stat` 判活（`spawn.ts:198-201`、`registry.ts` 的
+  `pidAlive()`；缺 `/proc` 时退化到 `kill(-pid, 0)`，僵尸组不再区分）。支持 Linux 与 macOS（后者无 `/proc`，走退化
   路径），**Windows 未支持/未验证**；CI 只跑 Ubuntu（`.github/workflows/ci.yml:17,53,91`）。不加
   `package.json` 的 `os` 字段：那会把「不承诺」变成 npm 拒装，属行为变更，需 REV。
 - **工具面是冻结契约（#100）**：增/删/改名/改默认注册面必须新增 REV 段（格式同 §16：原因 / 影响面 /
@@ -1457,7 +1457,7 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - 全量 `npm test` 441 条全绿（0.5.0 基线 435 条，只增不减）；`npm run typecheck` 全绿。
 - 变异：逐个撤掉 D1/D2/D3 修复 → 对应断言必须红（证据见 `docs/reports/tui-detail-viewport.md`）。
 
-## 25. 存储生命周期：跨 dataDir 回收 + 全局字节配额（REV-32，冻结）
+## 25. 存储生命周期：跨 dataDir 回收 + 全局字节配额（REV-32，冻结；判活与「无证据」两条由 REV-33 修订，见 §25.9）
 
 基线 `origin/main` `91a4d88`（0.5.0 已发，#105 已合入）；来源 issue #102（父 #81 的 8.1 + 8.2）。
 本修订**只新增两个默认关闭的存储开关**；不改 `prune()` 的既有语义（§10 的并集策略一字不动），
@@ -1482,10 +1482,22 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 - **配额单位 = 字节**。`PI_ASYNC_TOTAL_BYTES` 是整数、`0` = 关闭（负值/非法值回退 `0`，见 `envNumber`）。
   报表与日志用二进制单位（KiB/MiB/GiB）渲染，便于人读；**判据只比字节**。
 - **同界含于配额**：`used <= quota` 视为在预算内，只有 `used > quota` 才淘汰（边界见 §25.8 的「恰好等于」用例）。
-- **owner marker**：`<dataDir>/.pi-async-owner`，`{pid, at}`，由 `ensureDataDir()` 在目录首次就绪时原子写入
+- **owner marker**：`<dataDir>/.pi-async-owner`，`{pid, at, marker}`，由 `ensureDataDir()` 在目录首次就绪时原子写入
   （temp+rename，0600），`migrateDataDir()` 成功后删除旧目录的 marker。它**不是产物**（不匹配四个后缀，
   因此不计字节、不被当快照解析、不被迁移），`surveyDataDir()` 把它列为**允许内容**（不会让目录变 `foreign`）。
-  它的唯一作用是回答「这个目录还有人用吗」。
+  它回答的是 **S1 的问题**「这个目录所属的 session 还有进程在吗」——**只对 S1 生效**：S2 配额不看 marker
+  （配额保护的是「目录内有活着的非终态任务」，见 §25.4）。
+  - **marker 的 pid 用「进程存在」判活（REV-33）**：`process.kill(pid, 0)` 成功或 `EPERM`（存在但不是我
+    的权限）即视为活；Linux 上再查 `/proc/<pid>/stat` 的状态位，`Z`（僵尸）算死。**不是** `pidAlive()` 的
+    进程组语义：marker 记的是 `process.pid`，而 pi session 进程通常是 shell 进程组的成员、不是组长——
+    用组语义判它会把活着的 session 判成死的（0.5.2 合入后的缺陷，§25.9）。
+  - marker 的 `pid` 必须是**正整数**；`0`/负数/小数无法诚实探测（`0` 会变成「我自己的进程组」、负数变成
+    「进程组 N」），一律按 `unreadable_owner` 当作**不知道**——目录保留，绝不据此认定 owner 已死。
+  - **marker 的存在本身就是证据**（REV-33）：名字在、但读不出来（EACCES/EIO/EISDIR、悬空软链、
+    根本不是普通文件）**不等于**「没有 marker」，一律 `unreadable_owner` 并跳过。本模块从不跟随软链，
+    所以「marker 是软链」也按不可读处理（即使它指向一个能读的 JSON）。
+  - **单 marker 只记一个 owner**：两个进程共用同一个 dataDir 时后写者覆盖前者；后者死后目录会被回收，
+    即使前者还活着。走真实布局（一个 sessionId 一个进程）碰不到；记为已知边界（§25.7）。
 - **dataDir 的认定（正证据，不是「没有异物」）**：一个目录算 dataDir 当且仅当 **它是当前 dataDir**、
   **或**含至少一个可解析快照、**或**没有任何异物。`.`/`..`/软链/大小写不敏感的别名都用**目录身份**
   （`dev`+`ino`，回退 `realpath`）判定，而不是比较字符串 —— 否则闸 1 会被别名绕过，
@@ -1495,9 +1507,15 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 `PI_ASYNC_SWEEP_SIBLINGS=1` 时，对 root 下每个**其他**目录逐一判定；**三闸同时成立**才整目录 `rm -rf`：
 
-1. **不是当前 dataDir**（`resolve` 后比较，防 `..`/软链）——当前目录哪怕早已没人动、全是终态产物也不删。
-2. **不含「非终态且 pid 仍活着」的快照**（`running`/`pending` + `pidAlive`）。判活走既有 `pidAlive()`
-   （`/proc` 优先，macOS 退化到 `kill(-pid, 0)`），**不复用** `reapOrphans()` 的结算逻辑、**不 kill 任何进程**。
+1. **不是当前 dataDir**（按**目录身份**：`dev`+`ino`，回退 `realpath`，见 §25.2）——当前目录哪怕早已没人动、全是终态产物也不删。
+2. **没人用**：(a) 不含「非终态且 pid 仍活着」的快照（`running`/`pending` + `pidAlive`：`/proc` 优先，
+   macOS 退化到 `kill(-pid, 0)`；**组语义**，因为任务子进程 `detached` 后 pid 即 pgid）；**且** (b) owner marker
+   不存在，或它的 pid 已死（**进程语义**，见 §25.2 / REV-33）。判活**不复用** `reapOrphans()` 的结算逻辑、
+   **不 kill 任何进程**。
+   **(c) 非终态快照里没有 pid（延迟 `pending` 任务）时不提供任何判活证据**：既不算「活着」，也不算「死了」
+   ——它降到 marker + 年龄闸判定（那才是能回答「还会有人回来吗」的闸）。**不能**把它当成永久保护：
+   `shutdown()` 会故意留下 `pending` 快照，那样会让每个「排过延迟任务后退出」的目录永不回收
+   （REV-33 复核抓到的反向回归，已回退）。
 3. **空闲时长 ≥ `max(PI_ASYNC_SWEEP_SIBLING_AGE_MS, PI_ASYNC_RETENTION_MS + 1)`**。默认年龄闸 = 14 天
    （2 × 默认 retention 7 天）；**钳位使得年龄闸永远严格大于 retention 窗口**，因此本闸不会早于
    「产物本来也该过期」的时刻生效。
@@ -1512,10 +1530,13 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 | 目录里有 dataDir 永远不会写的东西（子目录、软链、非产物文件） | `foreign_content` |
 | 有 `.json` 解析不出快照（损坏/半写/不认识） | `unreadable_snapshot` |
 | 非终态快照指向活 pid | `live_task` |
-| owner marker 的 pid 仍活着 | `owner_alive` |
-| owner marker 存在但读不出 pid | `unreadable_owner` |
+| 快照的 `pid` 存在但不是正整数（`0`/负数/小数）：无法诚实探测 | `unreadable_snapshot` |
+| owner marker 的 pid 仍活着（进程语义） | `owner_alive` |
+| owner marker 存在且读不出正整数 pid（解析失败、**不是普通文件**、EISDIR/EACCES/EIO） | `unreadable_owner` |
 | 未过年龄闸 | `recently_active` |
 | 超过本轮扫描上限（`MAX_SCAN_DIRS = 256`，按名字排序后截断） | `scan_limit` |
+| root 下的条目不是**不跟随软链的普通目录**（符号链接 / 普通文件） | `not_a_directory` |
+| 不是 dataDir 的目录却带有产物字节（不参与配额也不产生候选） | `not_a_data_dir` |
 | `rm` 抛错 | `delete_failed` |
 | `dirname(dataDir)` 是文件系统根（`/`） | 直接拒绝整轮，日志明示 |
 
@@ -1583,6 +1604,31 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 - 不杀跨进程的活 pid 孤儿；只跳过。
 - 不删父目录、不删当前 dataDir、不删未过年龄闸的 sibling。
+- **S2 不看 owner marker**：配额保护的单位是「目录内有活着的非终态任务」，不是「目录属于活 session」。
+  因此活着的空转 session 的**终态**产物仍可能被配额淘汰（tier 1 是它自己的 `prune()` 也会删的，tier 2 需显式
+  `PI_ASYNC_QUOTA_HARD=1`）。这是有意的：marker 回答的是 S1 的问题（整目录回收），把它接进配额会让
+  「一个活着但 14 天没动静的 session」永久钉住配额。
+- **marker 之前的目录没有自证能力**：0.5.1 及更早的 session 从不写 marker。这类目录只能靠
+  「没有活 pid 的非终态快照 + 年龄闸」判定；如果那个老进程**还活着**但只剩终态任务，就区分不出来。
+  残留风险是有界的：需要同一目录下 14 天没有任何写入。新版本一旦写入就补上 marker（§25.2）。
+- **`pending` 快照不提供判活证据**：延迟任务在 spawn 前没有 pid，这类目录靠 marker + 年龄闸判定。
+  后果：一个 **0.5.1 及更早**（从不写 marker）的 session 如果只剩 `pending` 任务且还活着，理论上在
+  14 天后可被回收。与上面「无 marker 的旧目录」是同一条残留风险。
+- **单 marker 单 owner**：两个进程共用同一个 dataDir（同一 sessionId 并发打开）时，marker 是 last-writer-wins；
+  后写者死后目录会被回收，即使另一个 owner 还活着。代价是该会话丢失数据目录（其任务在内存里仍可见，
+  但盘上产物没了）。要彻底封闭需改 marker schema（记 owner 集合），属独立变更。
+- **survey 与 rmSync 之间无二次确认**：一轮先全部 survey（含判定），再统一删；几十毫秒到百毫秒的窗口里
+  若有进程恰好“恢复”到那个旧目录，会丢。这是既有设计（§25.6 的同步一轮），修需重新判定，未做。
+- **marker 写失败只记日志**（`writeOwnerMarker` 不得打断 `persist()`）：写不出 marker 的活 session
+  在年龄闸后可能丢目录（与「无 marker 的旧目录」同一条风险）。
+- **pid 复用只往保守方向错**：一个死 session 的 marker pid 被无关进程复用时，该目录会一直被保留。
+  只漏回收，不误删。
+- **扫描上限也是记账上限**：`MAX_SCAN_DIRS = 256` 按名字排序截断，截断掉的目录既不计字节也不产候选。
+  因此 `usedBytesBefore` / `overQuota` 只对**已经扫到的**目录成立：目录数超过 256 时，配额可能在
+  「还有未扫描字节在盘上」的情况下报 `overQuota: false`。这是有界但真实的不精确；要更准就抬高上限（同步代价见 §25.6）。
+- **扫描/计划的字节是“扫到的”，删除后的字节是“量到的”**：`planEvictions` 乐观地按 surveyed size 递减，
+  `StorageReport` 用实际 `lstat` 到的 size 累计。两者不一致时（文件消失、变成非普通文件、metadata 指向异常），
+  实际结果只会是**少删 + 诚实地报 `overQuota`**，要等下一轮补完。
 - 不清理 `*.tmp` 残留（只有整目录回收会连带带走）。
 - 一个目录里有活着的非终态任务时，该目录的**终态**产物也不会被配额淘汰（保守；下一轮该目录空闲后再参与）。
 - **S1 的年龄闸只按年龄，不叠加 `PI_ASYNC_RETENTION_COUNT`**（有意的不对称）：`prune()` 的 count 窗口是
@@ -1594,8 +1640,13 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 - `tests/a-storage-sweep.test.ts`：三闸（当前 dataDir 不删 / 无活 pid 快照/无活 owner 才删 / 未过期不删）
   与反向用例（三闸都满足时目录被删）；父目录不被删；`*.tmp` 残留不被误判；`foreign_content` /
-  `unreadable_snapshot` / `unreadable_owner` 不删；年龄闸钳位不弱于 retention；**软链别名下当前 dataDir
+  `unreadable_snapshot` / `unreadable_owner` / `unknown status` 不删；年龄闸钳位不弱于 retention；**软链别名下当前 dataDir
   仍不被删**；**活 session 的空转 dataDir 被 owner marker 保护**（owner 死后可回收）；文件系统根被拒绝。
+- **REV-33 的判活断言**：marker 的 pid 是一个**活着但不是进程组长**的进程时目录仍被保护（并自带
+  fixture 断言：该 pid 活着、且 `kill(-pid, 0)` 必须是 ESRCH，否则测试主动红）；marker pid 为 `0` / 负数 / 小数
+  → `unreadable_owner`；marker 变成**非普通文件 / 悬空软链** → `unreadable_owner`（不得读成「无 owner」）；
+  快照 `pid: 0` → `unreadable_snapshot`；**`pending` 无 pid 的目录由 marker 定生死**（marker 活 → 保；
+  marker 不存在且过龄 → 回收），并以此钉住「不得把 pending 当永久保护」的反向回归。
 - 配额：恰好等于配额不删（边界）、多一字节才删；软模式只淘汰 policy-expired 且超限时 `overQuota: true`
   并保留；硬模式淘汰仍保留的产物且逐条日志；活任务永不被淘汰；**读不出快照/触到快照上限不产生候选**；
   **当前 dataDir 里有一个 `.DS_Store` 不会让配额自行失效**。
@@ -1603,6 +1654,45 @@ Async task admission is closed (registry suspended: a reload or resume retired t
   **跨目录同 taskId 时 `dataDir` 兜底**；`orderSiblings` 用 `lastActivityMs` + name 兜底断言。
 - 默认关闭：两个开关都不设时 `configure()` 不删任何东西、`sweepStorage()` 是零 I/O 空操作。
 - 测试**不指向真实 `$HOME`**：全部在 `mkdtemp` 的假 session 树下构造。
-- 全量 `npm test` 只增不减（新增 32 例全绿；本机 macOS 上另有 15 个**既有**失败与本次无关，其中 `kill EPERM`
+- 全量 `npm test` 只增不减（新增 38 例全绿；本机 macOS 上另有 15 个**既有**失败与本次无关，其中 `kill EPERM`
   那条 flake 在未改动的 `origin/main` 上同样复现），`npm run typecheck` 全绿；变异证据见
   `docs/reports/storage-lifecycle.md`。
+
+### 25.9 REV-33：0.5.2 合入后复核的判活修正
+
+**原因（为什么这条要写进冻结契约）**：PR #106 合入后的独立复核发现闸 2 的判活口子，能把一个
+**还活着的 session** 的 data dir 判成可回收——正是本条声称要防的事。两项都不是「新需求」，而**是实现
+没做到契约已经承诺的事**，所以按修订记录而不是新增能力。
+
+1. **marker 用错判活语义**。`writeOwnerMarker()` 写的是 `process.pid`（§25.2），但 `siblingVerdict()` 用
+   `pidAlive()` 探测它，而 `pidAlive()` 答的是**进程组**问题（`/proc` 里 `pgrp === pid`，否则
+   `kill(-pid, 0)`）——任务子进程 `detached` 后 pid == pgid，所以对任务是对的；session 进程通常只是
+   shell 进程组的成员，于是「活着的 session」被报成死的，整目录在过完年龄闸后被 `rm -rf`。
+   实测（macOS）：非组长子进程 `kill(pid, 0)` 成功、`kill(-pid, 0)` = ESRCH → 旧代码删除目录且
+   `skipped` 里根本没有 marker 的影子；压测同形状的 leader pid 则被保护。Linux 同一结论：非组长进程的
+   `pgrp` 永不等于它的 pid。**合入时那 32 例测试全绿**，因为它们把 marker 里的 pid 填成 `submit()` 的
+   任务 pid（detached ⇒ leader），生产永远不会写这种值。
+2. **「读不出 marker」被当成「没有 marker」**。旧代码把 `readFileSync` 的任何失败（EACCES/EIO、marker 变成
+   目录或悬空软链）归成 `markerRaw = undefined`，于是「不知道 owner 是谁」直接退化成「没人拥有这个目录」。
+   同类问题：快照的 `pid` 只要求是 `number`，`pid: 0` 在 macOS 上是「我自己的进程组」（判活）、在 Linux
+   上是「永不死」（判死）——同一个快照在两个平台得出相反结论。
+
+**影响面（改了什么）**：
+
+- `src/core/registry.ts` 新增 `processAlive(pid)`（**进程**语义：`kill(pid,0)`，`EPERM` = 活，Linux `Z` = 死），
+  **只给 owner marker 用**；`pidAlive()` 一字不改，任务 pid 继续走组语义（REV-28c 的#6 语义不动）。
+- `src/core/storage.ts`：marker 的 pid 只接受**正整数**（其余 `ownerUnreadable`）；**marker 的存在本身是证据**
+  ——名字在但读不出/不是普通文件 → `ownerUnreadable`，不得当成「无 owner」；快照的 pid 同样只接受正整数，
+  否则整个目录记 `unreadable_snapshot`；`siblingVerdict()` 接两个**独立注入**的判活函数（避免一次注入
+  两处复用又把两种语义混起来）。理由都是同一条：**「无法证明」不得等于「已死」**。
+- **明确不做**：给「非终态但无 pid」加永久保护。`shutdown()` 会将 `pending` 快照留在盘上（延迟任务在 spawn
+  前就没有 pid），加永久保护会让每个「排过延迟任务后退出」的目录永不回收——复核实测该写法的第一版补丁
+  确实把这类目录钉死了 10 年，**已回退**：这类快照不提供判活证据，降到 marker + 年龄闸判定。
+- 新增 6 例回归（含一个**自觉地断言自己处在难例**的 fixture：marker 的 pid 必须活着且不是进程组长，
+  否则测试自己红），并把一条**空转断言**（`a.json` 从未被创建，永远为真）改成断言真正被淘汰的文件。
+- 不改工具面、不改默认值、不改 `prune()`/`reapOrphans()`、不新增 env。
+
+**回退开关**：无（纯安全修正；若需与 0.5.2 行为一致，把 `PI_ASYNC_SWEEP_SIBLINGS` / `PI_ASYNC_TOTAL_BYTES`
+置回默认 `0` 即与 0.5.x 完全一致）。
+
+**证据**：`docs/reports/storage-lifecycle.md` §11（逐项断言、变异「撤掉即红」、仍存留的已知边界）。
