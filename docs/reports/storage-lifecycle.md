@@ -263,7 +263,7 @@ quota: a pending delayed task is in flight too — its artifacts survive a hard 
 `origin/main` 再动手）。复核的目标不是「重做 #102」，而是验证 §25 的**核心安全承诺**是否真的成立：
 「正在运行的任务/活着的 session 的目录绝不被删」。
 
-### 10.1 结论：合入的实现有三个 fail-open 口子，均已在本次修掉
+### 10.1 结论：合入的实现有三个 fail-open 口子，加上复核自己补丁时抓到的两处，均已在本次修掉
 
 | # | 缺陷 | 方向 | 后果 | 状态 |
 |---|---|---|---|---|
@@ -273,7 +273,7 @@ quota: a pending delayed task is in flight too — its artifacts survive a hard 
 | **D4** | （**我第一版补丁引入的配额回归**）把 pid 校验套到了**终态**快照上 | 泄漏 | 一个坏 pid 让整个目录变「不可读」→ 产物永不淘汰、`overQuota` 永远为真（实测 10390 B / 6000 B 配额，0 淘汰） | 已修：只校验**非终态**快照 |
 | **D5** | （**我第一版补丁仍存在的漏洞**）`isPid` 没有 `pid_t` 上界 | fail-open | `kill(1e21)` 抛 `ERR_INVALID_ARG_TYPE` → `processAlive` 返回 false → 「owner 已死」→ 目录被回收 | 已修：`isPid` 限 `<= 0x7fffffff`，且 `processAlive` 对不可探测的 pid 返回 **true**（保留目录） |
 
-三条都属于同一类错误：**把「无法证明活着」读成「证明死了」**。§25.3 的原文承诺是「判无知的默认答案是
+D1–D3 都属于同一类错误：**把「无法证明活着」读成「证明死了」**；D4–D5 则是「加了严格性却加错了对象」。§25.3 的原文承诺是「判无知的默认答案是
 **不删**」，实现没做到。
 
 **一次被复核抓到的自我回归（诚实记录）**：本次补丁的第一版给「非终态但快照没有 pid」加了**永久保护**
