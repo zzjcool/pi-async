@@ -237,11 +237,16 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
 | legion child，跨 turn | **hold 模式**：settle 前守卫上报 busy（见 §7）；上游 #156 busy-hold 落地前，通知可能无法送达——**契约要求 agent 在 legion 环境用 async_wait 收割后再报 verdict**（守卫强制提醒，最多 3 次） |
 
 - 环境检测：`PI_LEGION_NODE_ID` 存在 → legion child 环境，settle 守卫默认开启。
-- 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/**kill-kind**/**failure-kind**/output-file/summary/**summary-truncated**/guidance
+- 通知 XML：`<async-task-notification>` + task-id/name/status/exit-code/**kill-kind**/**failure-kind**/**process-alive**/**process-alive-known**/**exit-code-known**/output-file/summary/**summary-truncated**/guidance
   （guidance 仅在 `failed` **或** `killKind === "timeout"` 时带，completed 纯信息——patty chatter 教训；
   §17 REV-21 修订）。
   - `kill-kind` / `failure-kind`：有值才输出（与 snapshot 同名语义）；模型据此区分非零退出 / output_cap / watch 失败 / lost，无需先 round-trip `async_status`（#37）。
   - `summary-truncated`：summary 因 output_cap 或通知 tail 上限被截断时输出 `true`，避免把截断前缀误读为完整输出。
+  - **`process-alive` / `process-alive-known` / `exit-code-known`（REV-35，0.5.4）**：判活与退出码的
+    **诚实三态**。`process-alive` 取 `true` / `false` / `unknown` 三个值（不是缺字段）；`process-alive-known`
+    为 `true` **仅当**那次判活是观测到的（进程退出被看到 / 探活证明进程组已消失）；`exit-code` 只在拿到
+    **观测到的数字**时输出，`exit-code-known` 为 `false` 时表示「没拿到」，**不得**读成「退出码 0」。
+    旧快照（无这三字段）通知里也不会有——缺字段读作 `unknown`，不推断、不迁移（§27）。
   - **失败原因矩阵（REV-11）**：
 
     | 原因 | status | killKind | failureKind | 通知要点 |
@@ -492,6 +497,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   汇总（可选、默认关闭）。`initStatus` 保留 `reportActivity`（feature-detect），`setStatus` 调用为
   best-effort（宿主拒绝不得影响会话）。`clearedAtMs`/`survivesClearCutoff`/`clearDoneStatus`
   保留，由 `panel.ts` 与 `/async-clear` 共享。
+- **判活与退出码的显示（REV-35，0.5.4）**：终态快照不声称进程存活；未知写 `null`。详情状态行在快照
+  带观测证据（`processAliveKnown` / `exitCodeKnown` 存在）时追加 `· process: exited|alive|unknown` 与
+  `· exit <code>|exit unknown`：`process: unknown` **绝不**渲染成 `exited`，`exit unknown` **绝不**渲染成
+  `exit 0`。旧快照没有这两个字段 → 按「未知」显示，不做迁移、不推断。
 - **面板**（仅 `/async`）：`ctx.ui.custom({overlay:true, overlayOptions:
   {width:"80%", maxHeight:"70%", anchor:"center"}})`；从 rail 点击直入详情时为
   `{width:"85%", maxHeight:"80%", anchor:"center"}`。固定百分比尺寸，不提供环境变量开关。
@@ -1807,3 +1816,74 @@ timeout / 用户 `async_kill` / 代际 retire 终结。恢复执行时**必须�
    在挂住场景下仍按预期生效（修前它们被饿死）。
 3. 良性模式与 64K 良性输入的命中结果与 `main` **逐字相同**（对照表）。
 4. 变异必红：① 去掉预算回到同步求值 → 验收 1 红；② 把超预算当失败 → 验收 2 红。
+
+## 27. 终态快照不声称进程存活：判活/退出码三态（REV-35，冻结）
+
+基线 `main` `56fff93`（0.5.3 已发）；来源 issue #116（裁决 B，覆盖 `docs/reports/pi-async-81-triage.md`
+的 1.4 + 3.3）。证据见 `docs/reports/snapshot-honesty.md`。
+
+**事故面（两处说了与事实相反的话）**：
+
+- `finalize()` 无条件写 `processAlive: false`。D4 场景（`success_when` 命中、任务 `status = completed`、
+  **进程仍在跑**）的快照因此与事实相反；而 `src/core/notify.ts` 的通知字段表里根本没有这个字段，下游
+  无从分辨「观测到死了」与「默认填了 false」。
+- 收养任务的退出码取到又丢掉：`live.exit.then` 的退役分支（`if (this.suspended || live.retired) return { code }`）
+  拿到了子进程退出码，但一个字节也没落盘。跨进程本就物理不可得，**同进程 `/reload` 却可以**。
+
+**裁决（B，钉死）**：终态快照的价值是「最后一次**确定**的事实」。不知道就写不知道——`processAlive: false`
+会让下游（agent、人、将来的统计）把「没看见」当成「看见了死」。代价是文档必须明说这条边界，并在
+显示层把 `null` 渲染成「未知」而不是「已退出」。
+
+**影响面（改了什么，按 §16 的格式）**：
+
+- **快照新增/变更字段**（`TaskSnapshot`，`src/core/task.ts`）：
+  - `processAlive?: boolean | null`：`false` = 退出**被观测到**；`null` = 什么也没观测到（**JSON 里出现
+    `null`，不是缺字段**，以便与「旧快照没这个字段」区分）；运行中的快照不写。
+  - `processAliveKnown?: boolean`：`true` **仅当** `processAlive` 是一次观测的结论（不是默认值）。
+  - `exitCode?: number | null`：数字 = 观测到的退出码；`null` = 没拿到。
+  - `exitCodeKnown?: boolean`：`true` **仅当** `exitCode` 是观测到的数字。`exitCode: null` +
+    `exitCodeKnown: false` 读作「没拿到」，**不得**与 `exitCode: 0` 混为一谈。
+- **`finalize()` 多一个「观测到了什么」参数**：`"exit"`（退出事件/退出码）/ `"gone"`（探活证明进程组
+  已消失，但没有退出值）/ `"unknown"`（默认：什么都没观测到）。只有前两者写 `processAlive: false` +
+  `Known: true`，`"unknown"` 写 `null` + `false`。
+- **通知字段表**（`src/core/notify.ts`）：新增 `process-alive` / `process-alive-known` / `exit-code-known`
+  三个 XML 字段（structured details 同步）。`exit-code` 只在拿到数字时输出。
+- **显示层**：`snapshotLiveness()` / `formatExitStatus()`（`src/core/task.ts`）是唯一判据；
+  `async_status`（原始快照字段）、`async_wait` / hold / print-wait 的结果行、TUI 详情状态行都走它。
+  旧快照（无新字段）读作 `unknown`，**不推断**：`processAlive: false` 而没有 `processAliveKnown` 时
+  **不**当「已退出」（0.5.3 及更早无条件写 `false`，那个 `false` 是默认值，不是证据）。
+  例外且只此一处：`exitCode` 是**数字**而 `exitCodeKnown` 缺失时按已知处理——旧代码只在观测到退出码时
+  才写数字，这个值是证据形状的（`false` 不是）。
+- **同进程 `/reload` 的退出码交接（3.3）**：退役代在退出回调里把观测到的数字**合并写回**已持久化的
+  快照（只碰 `exitCode` / `exitCodeKnown`，绝不动 `status` / `finishedAt` / `killKind`），收养代在结算
+  该任务时读取这个观测（`persistedExitCode()`）。**不做**跨进程交接（物理不可得，不假装）。
+- **不改**：工具面与 schema（§12 冻结）、`isProcessAlive()`（`async_kill` 的即时探活，仍是布尔）、
+  REV-28a 的「终态快照是唯一记录」、kill 语义、watch 语义。
+
+**不变量**：
+
+1. 没观测到进程退出 → 终态快照 `processAlive: null` + `processAliveKnown: false`（D4 watch 命中、
+   未确认的 kill、`lost` 结算、pending 取消都属于这一类）。
+2. 观测到退出（退出事件，或探活证明进程组消失）→ `processAlive: false` + `processAliveKnown: true`；
+   有退出码时 `exitCode` 是数字且 `exitCodeKnown: true`，没拿到时 `exitCode: null` + `false`。
+3. 旧快照（无 `processAliveKnown` / `exitCodeKnown`）一律按「未知」显示，**不迁移、不推断**。
+4. 终态快照的其它字段不被退役代的交接写坏（REV-28a 不变）。
+
+**已知边界（接受，不修）**：
+
+- 收养代的探活 watcher（默认 100 ms）可能先于退役代的退出回调结算同一任务：那时记录已经终态，
+  交接**跳过**（`status` 是收养代的，退出码保持 `null`）。这条只在同进程 `/reload` 的竞态窗口内出现，
+  不会写出与事实相反的 `false`——只是少一条证据。
+- 跨进程收养（宿主重建进程）拿不到退出码：`exitCode: null` + `exitCodeKnown: false`，不假装。
+
+**回退开关**：无（缺陷修复；回到旧行为只能回退代码）。
+
+**验收**（`docs/reports/snapshot-honesty.md` 是证据）：
+
+1. D4 场景（watch 命中、进程仍在）→ `processAlive: null` + `processAliveKnown: false`；修前是 `false`。
+2. 观测到真退出 → `processAlive: false` + `processAliveKnown: true`（对照组：确定性不变成 `null`）。
+3. 收养任务：同进程拿到退出码 → 落盘且 `exitCodeKnown: true`；拿不到 → `null` + `false`（两个用例）。
+4. 旧快照（无这两个字段）读出来显示「未知」，不崩、不推断。
+5. 通知字段表里能看到这三个字段（表与实现一致）。
+6. 变异必红：① `finalize()` 回到无条件写 `false` → 验收 1 红；② 把 `null` 当 `false` 渲染 → 验收 1/4 红。
+7. `npm run typecheck` exit 0；`npm test` 与 `main` 基线逐条相同（红集合 `diff` 为空）；CI 绿。
