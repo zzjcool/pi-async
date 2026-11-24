@@ -98,19 +98,26 @@ function logOnce(message: string, error: unknown): void {
   console.error(`pi-async: ${message}`, error);
 }
 
-/** Answer every in-flight request with `error`; the worker that owned them is gone. */
-function failAll(reason: string): void {
+/**
+ * Answer every in-flight request when the worker that owned them goes away.
+ *
+ * `kind` is the point: a worker killed **for burning its budget** interrupts its neighbours, and an
+ * interrupted neighbour has no verdict — that is REV-34's `budget` (a plain no-match round), never
+ * `error` (which would spend the `blind_checks` budget for an infrastructure failure). A worker that
+ * **died** did break the checker, so that one really is `error`.
+ */
+function failAll(kind: "budget" | "error", reason: string): void {
   for (const [id, waiter] of [...waiting]) {
     waiting.delete(id);
     clearTimeout(waiter.timer);
-    waiter.resolve({ status: "error", reason });
+    waiter.resolve(kind === "budget" ? { status: "budget" } : { status: "error", reason });
   }
 }
 
-function teardown(reason: string): void {
+function teardown(kind: "budget" | "error", reason: string): void {
   const current = pool;
   pool = undefined;
-  failAll(reason);
+  failAll(kind, reason);
   if (!current) return;
   // `terminate()` is async and the thread may be stuck in a regex call: do not await it, the
   // replacement worker is created on demand by the next evaluation.
@@ -154,7 +161,7 @@ function spawn(): Pool {
     noteIdle(worker);
   });
   const die = (error: unknown) => {
-    if (pool === created) teardown(`regex worker unavailable: ${String(error)}`);
+    if (pool === created) teardown("error", `regex worker unavailable: ${String(error)}`);
     rejectReady(error);
     logOnce("regex worker failed; output_matches cannot be evaluated", error);
   };
@@ -186,7 +193,7 @@ export function evaluateWithBudget(pattern: string, source: string, budgetMs: nu
         waiting.delete(id);
         // The thread is stuck inside the regex engine: it will never answer. Kill it and let the
         // next evaluation build a fresh one, so one pathological pattern cannot poison later rounds.
-        teardown(`match budget of ${budgetMs} ms exceeded`);
+        teardown("budget", `match budget of ${budgetMs} ms exceeded`);
         resolve({ status: "budget" });
       }, budgetMs);
       waiting.set(id, { resolve, timer });

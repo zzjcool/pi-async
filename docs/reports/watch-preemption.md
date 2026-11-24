@@ -66,8 +66,9 @@ code units  eval returned after            the 10 ms timer fired at         verd
 | 该轮视为**未命中**，`pending` 照旧 | `src/core/watch.ts:345`（`budget` → `{status:"budget"}`）→ `:319`（计入 `budgetExceeded`，不参与 pending/error 判定） | `w3:60`（`status === "matched"`、`matched === false`） |
 | **不累计** `blind_checks` | `src/core/watch.ts:260`（`noteBudget` 只回调计数）；盲计数分支在 `:249` 只看 `error` | `w3:142`（`blind_checks: 1` 下任务仍 `running`——越预算若被当 error 会立即 `blind_exhausted`） |
 | **不动** `timeoutMs` / `intervalMs` | 预算只在求值内生效，`scheduleNext` 与 deadline 一字未改 | `w3:162`（`watchDeadline` 前后一致）、`w3:186`（2 s 到期仍如期结算） |
-| **绝不**判失败 / kill | `src/core/registry.ts:737`（`noteMatchBudgetExceeded` 只加计数 + 一次性提示） | `w3:142`（`status`/`failureKind`）、`w3:225`（进程退出路径同样不判失败） |
+| **绝不**判失败 / kill | `src/core/registry.ts:737`（`noteMatchBudgetExceeded` 只加计数 + 一次性提示） | `w3:142`（`status`/`failureKind`）、`w3:238`（进程退出路径同样不判失败） |
 | 每任务计数器进 `async_status` 与详情 | `src/core/task.ts:118` → `async_status`；`src/tui/panel.ts:109`（详情第二状态行） | `w3:176`（工具返回的 payload 里 `matchBudgetExceeded ≥ 2`）、`w3:181` |
+| 共享 worker 被预算杀时，**邻居**那轮按"无裁决"计（不是 error） | `src/core/regex-worker.ts:109`（`failAll(kind, …)`：预算杀 → `budget`；worker 死亡 → `error`） | `w3:225`（两条并发求值里恰好一条被中断，`error` 数必须是 0） |
 | 每条任务**只提示一次** | 闩锁 `metadata.matchBudgetNotified`（`registry.ts:741`，随快照持久化）；发送 `async-watch-notice`（`notify.ts:213`，`followUp` + `triggerTurn:false`） | `w3:166`（跨 ≥2 轮恰好 1 条） |
 
 **用户可见文案**（这是复核逼出来的一处修正）：提示与详情行说的是"**这一轮的裁决被放弃**"，不是"测量到未命中"：
@@ -160,12 +161,25 @@ not ok - #113 (REV-34 ruling 5): the process-exit evaluation credits the same co
   error: 'the exit-path evaluation must credit the per-task counter'
 ```
 
+### 变异 ④（额外，自查发现）：预算杀 worker 时把**邻居**的求值记成基础设施错误
+
+一个 worker 串行处理同一进程里的**所有** `output_matches`。超预算那一轮 terminate 时，若有另一轮求值正在
+飞行（两个 watch 同时 tick），旧实现把邻居也答成 `error` —— 那会消耗**另一个任务**的 `blind_checks`，三轮
+之后把一个健康任务判失败。改成：预算杀 → 邻居答 `budget`（无裁决、按未命中计，裁决 2）；worker **死掉** →
+答 `error`（那才是基础设施坏了）。撤掉这个区分：
+
+```text
+not ok - #113: a budget kill does not turn a concurrent evaluation into an infrastructure error
+  error: a concurrent budget kill must not be reported as an infrastructure error
+    1 !== 0
+```
+
 ## 6. 测试与仓库健康
 
 | 命令 | 本分支 | `origin/main` 同机基线 | 结论 |
 |---|---|---|---|
 | `npm run typecheck` | **exit 0**，无诊断 | exit 0 | 一致 |
-| `npm test` | **499 tests / 470 pass / 16 fail / 13 skip** | **489 / 460 / 16 / 13** | 新增 10 例全绿；失败集合见下 |
+| `npm test` | **500 tests / 471 pass / 16 fail / 13 skip** | **489 / 460 / 16 / 13** | 新增 11 例全绿；失败集合见下 |
 | 失败**名单** `diff` | —— | —— | **空**（16 条逐条同名） |
 
 那 16 条是这台 macOS 上本来就红的（realpath/`/var/folders` 越界判定、rail/hold 时序、`kill EPERM` flake、
@@ -187,6 +201,8 @@ diff main-fails.txt branch-fails.txt   →   无输出（16 / 16 同名）
   打一行原因；不静默放行、不偷偷回退同步求值（那会复活本条要修的冻结）。
 - **每轮把 ≤64K 码元主体 `postMessage` 给 worker** 是一次拷贝（≤128 KB），量级微秒；不共享 `SharedArrayBuffer`
   （复杂度不值得）。
+- **worker 里按 pattern 文本缓存 `RegExp`**：上界是"这个会话里出现过的不同 `output_matches` 正则条数"
+  （个位数），worker 被重建时缓存随之丢弃。
 - **`readWatchOutput` 每轮同步读 8 MiB 尾部**自身的停顿不在本条范围（REV-25 已给它单独的界）。
 - **不做**：换正则引擎（RE2/PCRE）、静态分析判"会不会爆"（黑名单已被证明只能当深度防御）、缩小
   `MAX_MATCH_CHARS`（#112 已论证要缩到 ~16 字符才安全，那会让条件失去用途）。
@@ -244,6 +260,7 @@ worker said {"echo":"ping"}
 | M7 | major | 裁决 4 说"可以收紧黑名单"，而 w3 的量具正是 `(a|a)*$` | 裁决 4 改为：今天**有意**放行这三个形状（它们是 #113 的靶子），将来收紧必须同时换量具 |
 | M8 | major | 死代码：`disposeRegexWorker` / `regexWorkerAlive` / `budgetMs` 形参 / `sendMatchBudgetNotice` 的无用 `registry` 形参 | 全部删除（约 25 行）；`MATCH_BUDGET_MS` 移到 `watch.ts`（TUI 不再把 `worker_threads` 拉进模块图） |
 | M9 | major | 裁决 3（64K 理由）/裁决 5（await 后复检）**无测试** | 各补一条：契约漂移守卫（`CONTRACT.md` 不得再出现「限制 ReDoS 影响面/作用面」）、"stop() 落在 await 中时空转"测试 |
+| 自查 | major | 共享 worker 被预算 terminate 时，同一窗口里在飞的**邻居**求值被答成 `error`（会花掉别的任务的 `blind_checks`，三轮后误判失败） | 已修（`failAll` 区分"预算杀 → budget"与"worker 死 → error"）+ 并发回归测试（变异 ④）。复核清单里没有这条 |
 | m10–m13 | minor | 自指行号失效、悬空 "REV-R3 见下"、README 把主体长度写成正则长度、CHANGELOG 引了不存在的中文文案 | 全部改掉 |
 | m14 | minor | 历史 CHANGELOG（0.2.0）仍把 64K 与 ReDoS 并列 | **不改**（历史记录不改写；当前源码/README/skill/契约已全干净） |
 | m15 | minor | `MATCH_BUDGET_MS` 定义在 worker 模块却被 TUI/notify 导入 | 已移到 `src/core/watch.ts` |

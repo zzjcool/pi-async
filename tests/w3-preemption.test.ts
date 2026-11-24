@@ -222,6 +222,19 @@ test("#113: the loop reports every burned budget to its deps and never stops sch
   assert.deepEqual(burned.slice(0, 2), [1, 1], "each round reports one burned evaluation");
 });
 
+test("#113: a budget kill does not turn a concurrent evaluation into an infrastructure error", async () => {
+  // Two pathological evaluations share the one worker, so the first budget overrun interrupts the
+  // second. An interrupted evaluation has no verdict: that is `budget` (a no-match round), never
+  // `error` — an `error` would spend another task's `blind_checks` budget for a failure that did not
+  // happen. Both are started in the same tick, so exactly one is still in flight at the kill.
+  const subject = pathological(30);
+  const run = () => evaluateConditionsDetailed([{ type: "output_matches", regex: HANGING_REGEX }], { output: subject, stdout: subject, stderr: "" });
+  const [first, second] = await Promise.all([run(), run()]);
+  const errors = [first, second].filter((round) => round.status === "error").length;
+  assert.equal(errors, 0, "a concurrent budget kill must not be reported as an infrastructure error");
+  assert.ok(first.budgetExceeded + second.budgetExceeded >= 1, "at least one round burned its budget");
+});
+
 test("#113 (REV-34 ruling 5): the process-exit evaluation credits the same counter, and is not a failure", async () => {
   const f = fixture();
   try {
