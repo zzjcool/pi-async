@@ -40,11 +40,12 @@ test("#113 acceptance 1: a 10 ms timer fires within 200 ms while a 26/30-code-un
     const elapsed = Date.now() - (armedAt ?? startedAt);
     await timerFired;
 
-    assert.equal(matched, false, `${codeUnits} code units must degrade to "not matched", not to a verdict`);
+    // The hard line first (acceptance 1): the host kept running during the evaluation.
     assert.ok(
       firedAt !== undefined && firedAt <= 200,
       `the 10 ms timer was starved: it fired after ${String(firedAt)} ms while a ${codeUnits}-code-unit subject was evaluated`,
     );
+    assert.equal(matched, false, `${codeUnits} code units must degrade to "not matched", not to a verdict`);
     assert.ok(elapsed <= 1_000, `evaluation must be cut at its ${MATCH_BUDGET_MS} ms budget, took ${elapsed} ms`);
   }
 });
@@ -139,11 +140,16 @@ test("#113 acceptance 2: the task survives over-budget rounds — counter rises,
     f.registry.attachWatch(task.taskId, hangingWatch());
     const deadlineBefore = f.registry.get(task.taskId)?.watchDeadline;
 
-    await until(() => (f.registry.get(task.taskId)?.matchBudgetExceeded ?? 0) >= 2, 12_000, "two over-budget rounds");
+    await until(() => (f.registry.get(task.taskId)?.matchBudgetExceeded ?? 0) >= 1, 12_000, "the first over-budget round");
+    // Asserted right after the first burned budget, before waiting for a second one: this is the
+    // assertion that pins "not a failure" (a mutation that fails the task trips here, not later).
+    const afterFirstRound = f.registry.get(task.taskId)!;
+    assert.equal(afterFirstRound.status, "running", "an over-budget round must never settle the task");
+    assert.equal(afterFirstRound.failureKind, undefined, "an over-budget round is not a failure");
 
+    await until(() => (f.registry.get(task.taskId)?.matchBudgetExceeded ?? 0) >= 2, 12_000, "the second over-budget round");
     const live = f.registry.get(task.taskId)!;
-    assert.equal(live.status, "running", "an over-budget round must never settle the task");
-    assert.equal(live.failureKind, undefined, "an over-budget round is not a failure");
+    assert.equal(live.status, "running", "the task keeps running across over-budget rounds");
     // `attachWatch` feeds the loop a relative remaining budget; what must not move is the deadline
     // that produces it (acceptance 4 asserts the deadline itself still fires).
     assert.equal(live.watchDeadline, deadlineBefore, "the watch deadline is untouched by the budget");
