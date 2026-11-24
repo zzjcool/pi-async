@@ -222,6 +222,37 @@ test("#113: the loop reports every burned budget to its deps and never stops sch
   assert.deepEqual(burned.slice(0, 2), [1, 1], "each round reports one burned evaluation");
 });
 
+test("#113: a burned budget in failure_when does not outrank a real success_when hit", async () => {
+  // Same-round precedence: groups are OR-ed and `failure_when` runs first, so an abandoned failure
+  // verdict must not swallow a genuine match (CONTRACT §26 ruling 2, last bullet).
+  const subject = pathological(26);
+  let successes = 0;
+  const failures: number[] = [];
+  const burned: number[] = [];
+  const loop = new WatchLoop({
+    taskId: "budget-vs-hit",
+    spec: hangingWatch({
+      intervalMs: 1_000,
+      timeoutMs: 5_000,
+      failure_when: [{ type: "output_matches", regex: HANGING_REGEX }],
+      success_when: [{ type: "stdout_contains", value: "!" }],
+    }),
+    readOutput: () => ({ output: subject, stdout: "aaaa!", stderr: "" }),
+    getExitCode: () => undefined,
+    onSuccess: () => { successes++; },
+    onFailure: () => { failures.push(1); },
+    onBlindExhausted: () => { failures.push(1); },
+    onWatchTimeout: () => { failures.push(1); },
+    onMatchBudgetExceeded: (count) => { burned.push(count); },
+  });
+  loop.start();
+  await until(() => successes > 0 || failures.length > 0, 12_000, "the first round to settle");
+  loop.stop();
+  assert.equal(failures.length, 0, "an abandoned failure verdict must not kill a task that matched");
+  assert.equal(successes, 1);
+  assert.equal(burned.length, 1, "the burned failure verdict is still counted for that round");
+});
+
 test("#113: a budget kill does not turn a concurrent evaluation into an infrastructure error", async () => {
   // Two pathological evaluations share the one worker, so the first budget overrun interrupts the
   // second. An interrupted evaluation has no verdict: that is `budget` (a no-match round), never

@@ -66,9 +66,10 @@ code units  eval returned after            the 10 ms timer fired at         verd
 | 该轮视为**未命中**，`pending` 照旧 | `src/core/watch.ts:345`（`budget` → `{status:"budget"}`）→ `:319`（计入 `budgetExceeded`，不参与 pending/error 判定） | `w3:60`（`status === "matched"`、`matched === false`） |
 | **不累计** `blind_checks` | `src/core/watch.ts:260`（`noteBudget` 只回调计数）；盲计数分支在 `:249` 只看 `error` | `w3:142`（`blind_checks: 1` 下任务仍 `running`——越预算若被当 error 会立即 `blind_exhausted`） |
 | **不动** `timeoutMs` / `intervalMs` | 预算只在求值内生效，`scheduleNext` 与 deadline 一字未改 | `w3:162`（`watchDeadline` 前后一致）、`w3:186`（2 s 到期仍如期结算） |
-| **绝不**判失败 / kill | `src/core/registry.ts:737`（`noteMatchBudgetExceeded` 只加计数 + 一次性提示） | `w3:142`（`status`/`failureKind`）、`w3:238`（进程退出路径同样不判失败） |
+| **绝不**判失败 / kill | `src/core/registry.ts:737`（`noteMatchBudgetExceeded` 只加计数 + 一次性提示） | `w3:142`（`status`/`failureKind`）、`w3:269`（进程退出路径同样不判失败） |
 | 每任务计数器进 `async_status` 与详情 | `src/core/task.ts:118` → `async_status`；`src/tui/panel.ts:109`（详情第二状态行） | `w3:176`（工具返回的 payload 里 `matchBudgetExceeded ≥ 2`）、`w3:181` |
-| 共享 worker 被预算杀时，**邻居**那轮按"无裁决"计（不是 error） | `src/core/regex-worker.ts:109`（`failAll(kind, …)`：预算杀 → `budget`；worker 死亡 → `error`） | `w3:225`（两条并发求值里恰好一条被中断，`error` 数必须是 0） |
+| 同一轮「`failure_when` 越预算 + `success_when` 命中」→ 按 success 结算，仍记一次 burned budget | `src/core/watch.ts:233`（先 failure 后 success，与既有 OR 语义一致） | `w3:225` |
+| 共享 worker 被预算杀时，**邻居**那轮按"无裁决"计（不是 error） | `src/core/regex-worker.ts:109`（`failAll(kind, …)`：预算杀 → `budget`；worker 死亡 → `error`） | `w3:256`（两条并发求值里恰好一条被中断，`error` 数必须是 0） |
 | 每条任务**只提示一次** | 闩锁 `metadata.matchBudgetNotified`（`registry.ts:741`，随快照持久化）；发送 `async-watch-notice`（`notify.ts:213`，`followUp` + `triggerTurn:false`） | `w3:166`（跨 ≥2 轮恰好 1 条） |
 
 **用户可见文案**（这是复核逼出来的一处修正）：提示与详情行说的是"**这一轮的裁决被放弃**"，不是"测量到未命中"：
@@ -179,7 +180,7 @@ not ok - #113: a budget kill does not turn a concurrent evaluation into an infra
 | 命令 | 本分支 | `origin/main` 同机基线 | 结论 |
 |---|---|---|---|
 | `npm run typecheck` | **exit 0**，无诊断 | exit 0 | 一致 |
-| `npm test` | **500 tests / 471 pass / 16 fail / 13 skip** | **489 / 460 / 16 / 13** | 新增 11 例全绿；失败集合见下 |
+| `npm test` | **501 tests / 472 pass / 16 fail / 13 skip** | **489 / 460 / 16 / 13** | 新增 12 例全绿；失败集合见下 |
 | 失败**名单** `diff` | —— | —— | **空**（16 条逐条同名） |
 
 那 16 条是这台 macOS 上本来就红的（realpath/`/var/folders` 越界判定、rail/hold 时序、`kill EPERM` flake、
