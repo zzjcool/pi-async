@@ -24,8 +24,8 @@
 |---|---|---|
 | `processAlive` | `false` / `null` / 缺 | `false` = 退出**被观测到**；`null` = 什么都没观测到；缺 = 还没有任何主张（运行中 / 旧快照） |
 | `processAliveKnown` | `true` / `false` | `true` **仅当** `processAlive` 是一次观测的结论，不是默认值 |
-| `exitCode` | 数字 / `null` / 缺 | 数字 = 观测到的退出码；`null` = 没拿到；缺 = 运行中 |
-| `exitCodeKnown` | `true` / `false` | `true` **仅当** `exitCode` 是数字 |
+| `exitCode` | 数字 / `null` / 缺 | 数字 = **确定的**退出码（观测到的，或启动失败的判决 `1`）；`null` = 没拿到；缺 = 运行中 |
+| `exitCodeKnown` | `true` / `false` | `true` **仅当** `exitCode` 是确定的数字（见 §2.2 末尾的两种来源） |
 
 `null` 是**显式写进 JSON 的**（不是缺字段）：缺字段只表示「旧快照」，两者绝不能混。
 
@@ -34,6 +34,7 @@
 ```ts
 private finalize(task, status, code?, killKind?, observed: FinalizeObservation = "unknown")
 // observed: "exit"    → 退出事件（带 code 时 code 就是观测值）
+//           "killed"  → 退出事件，但结论是 killKind：观测到死，不记退出码（§6）
 //           "gone"    → 探活证明进程组已消失，但没有退出值
 //           "unknown" → 什么都没观测到（D4 watch 命中、未确认的 kill、无 pid 的快照）
 ```
