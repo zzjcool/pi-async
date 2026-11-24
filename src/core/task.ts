@@ -68,7 +68,7 @@ export interface RunReceipt {
   outputHint: string;
 }
 
-export type WaitResultItem = { taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind };
+export type WaitResultItem = { taskId: string; status: TaskStatus; exitCode?: number | null; outputTail: string; killKind?: KillKind; failureKind?: FailureKind };
 export type WaitNotReadyItem = { taskId: string; status: "running" | "pending"; elapsedMs: number };
 /** All-terminal → { results }; timeout-only → { notReady }; mixed timeout → { results, notReady } (REV-7 / #43 + #37 kinds). */
 export type WaitOutcome =
@@ -83,7 +83,6 @@ export interface TaskSnapshot {
   mode: TaskMode;
   status: TaskStatus;
   pid?: number;
-  exitCode?: number;
   killKind?: KillKind;
   failureKind?: FailureKind;
   createdAt: number;
@@ -108,8 +107,27 @@ export interface TaskSnapshot {
   remindAt?: number;
   /** Reminders delivered so far; capped at 3, reset by `async_extend` (REV-23 / §18.4). */
   remindCount?: number;
-  /** Process liveness seen when the snapshot was produced (false once finalized). */
-  processAlive?: boolean;
+  /**
+   * D-07 (#116 / CONTRACT §27 REV-35): what the snapshot may honestly claim about the process.
+   *
+   * `false` = the exit was **observed**; `null` = nothing was observed (the snapshot does not know);
+   * absent = no claim at all (a live snapshot, or a pre-0.5.4 snapshot that never wrote it).
+   * `null` is written explicitly so it can never be confused with "this old snapshot has no field".
+   */
+  processAlive?: boolean | null;
+  /**
+   * D-07 (#116): `true` **only** when `processAlive` is the conclusion of an observation, never a
+   * default. Read `processAlive` alone and a pre-0.5.4 `false` (written unconditionally by
+   * `finalize()`) looks like evidence — this flag is what tells the two apart.
+   */
+  processAliveKnown?: boolean;
+  /**
+   * D-07 (#116): the child's exit status. A number = observed; `null` = not observed (never "exit 0");
+   * absent = no claim yet (a running snapshot).
+   */
+  exitCode?: number | null;
+  /** D-07 (#116): `true` only when `exitCode` is an observed number. */
+  exitCodeKnown?: boolean;
   /**
    * 0.5.3 (#113 / REV-34): how many `output_matches` evaluations exceeded the 25 ms budget.
    * An over-budget round is treated as **not matched** — never a failure, never a kill. Only
@@ -122,4 +140,54 @@ export interface TaskSnapshot {
    * exactly one consumer — a consumed task never produces a completion notification.
    */
   consumedAt?: number;
+}
+
+/**
+ * D-07 (#116 / CONTRACT §27 REV-35): what a snapshot may claim about its process.
+ *
+ * `alive` / `exited` / `unknown` — and `unknown` is a real answer, not a failure to answer.
+ *
+ * The gate is `processAliveKnown`, **never** `processAlive` alone: 0.5.3 and earlier wrote
+ * `processAlive: false` unconditionally in `finalize()`, so a `false` without the flag is a default,
+ * not an observation. Old snapshots therefore read as `unknown` — no migration, no inference.
+ */
+export type ProcessLiveness = "alive" | "exited" | "unknown";
+
+export function snapshotLiveness(task: Pick<TaskSnapshot, "processAlive" | "processAliveKnown">): ProcessLiveness {
+  if (task.processAliveKnown !== true) return "unknown";
+  if (task.processAlive === false) return "exited";
+  if (task.processAlive === true) return "alive";
+  return "unknown";
+}
+
+/**
+ * D-07 (#116): the exit status the snapshot can honestly report — a number when one was observed,
+ * `null` when it was not. `null` must never be read as `0` (that is the whole point of the tri-state).
+ *
+ * A legacy snapshot carries a number without `exitCodeKnown`; that number is still evidence (the old
+ * code only ever wrote it from an observed exit), so it is reported as known. The asymmetric rule is
+ * deliberate: `processAlive: false` was a **default**, `exitCode: <number>` was never one.
+ */
+export function snapshotExitCode(task: Pick<TaskSnapshot, "exitCode" | "exitCodeKnown">): number | null {
+  if (typeof task.exitCode === "number") return task.exitCode;
+  return null;
+}
+
+/** D-07 (#116): `true` only when the snapshot carries an observed exit status. */
+export function hasObservedExitCode(task: Pick<TaskSnapshot, "exitCode" | "exitCodeKnown">): boolean {
+  return typeof task.exitCode === "number";
+}
+
+/** D-07 (#116): `exit 7` / `exit unknown` — the one wording for every result line and detail view. */
+export function formatExitStatus(exitCode: number | null | undefined): string {
+  return typeof exitCode === "number" ? `exit ${exitCode}` : "exit unknown";
+}
+
+/**
+ * D-07 (#116): `, exit 7` / `, exit unknown` for the settlement result lines (hold, `pi -p` backstop).
+ * A still-running row has no claim yet and gets no suffix (`undefined`).
+ */
+export function exitSuffix(exitCode: number | null | undefined): string {
+  if (exitCode === undefined) return "";
+  return `, ${formatExitStatus(exitCode)}`;
 }

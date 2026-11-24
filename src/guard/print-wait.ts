@@ -1,6 +1,6 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
-import { isTerminal, type TaskSnapshot } from "../core/task.ts";
+import { exitSuffix, isTerminal, type TaskSnapshot } from "../core/task.ts";
 import { envNumber } from "../core/env.ts";
 import type { HoldNotificationRelay } from "./hold-notify.ts";
 
@@ -106,7 +106,8 @@ function nameOf(task: TaskSnapshot): string {
 }
 
 /**
- * `a (completed, exit 0) · b (failed, exit 7)` — name/status/exitCode only.
+ * `a (completed, exit 0) · b (failed, exit 7)` — name/status/exitCode only; a row whose exit was never
+ * observed reads `exit unknown` (D-07 #116), never `exit 0`.
  *
  * Output tails are up to 8 KiB each and this line is part of a provider request, so the reader is
  * pointed at `async_logs` instead of being handed the bytes (same D-6 rule the hold's results entry
@@ -116,7 +117,8 @@ function nameOf(task: TaskSnapshot): string {
  */
 function summaryItems(done: TaskSnapshot[], missing: number): string {
   const listed = done.slice(0, MAX_LISTED_TASKS).map((task) =>
-    `${nameOf(task)} (${task.status}${task.exitCode === undefined ? "" : `, exit ${task.exitCode}`})`);
+    // D-07 (#116 / §27 REV-35): an unobserved exit status reads `exit unknown`, never `exit 0`.
+    `${nameOf(task)} (${task.status}${exitSuffix(task.exitCode)})`);
   const hidden = done.length - listed.length + Math.max(0, missing);
   if (hidden > 0) listed.push(`+${hidden} more`);
   return listed.join(" · ");

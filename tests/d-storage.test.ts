@@ -298,7 +298,10 @@ test("reloadFromDisk marks a hand-written running snapshot without a pid as lost
     await f.registry.reloadFromDisk();
     assert.equal(f.registry.get("no-pid")?.status, "failed");
     assert.equal(f.registry.get("no-pid")?.failureKind, "lost");
-    assert.equal(f.registry.get("no-pid")?.processAlive, false);
+    // D-07 (#116): a snapshot that never had a pid gives us nothing to observe, so the terminal
+    // record says "unknown" (`null`) instead of claiming a process death nobody saw.
+    assert.equal(f.registry.get("no-pid")?.processAlive, null);
+    assert.equal(f.registry.get("no-pid")?.processAliveKnown, false);
     assert.deepEqual(finalized, ["no-pid"], "the orphan is reported exactly once");
   } finally {
     await f.cleanup();

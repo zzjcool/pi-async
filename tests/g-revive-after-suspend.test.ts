@@ -192,7 +192,12 @@ test("a retired exit callback cannot overwrite the snapshot the revived instance
     assert.equal(after.status, settled.status, "the retired generation must not rewrite the status");
     assert.equal(after.failureKind, settled.failureKind);
     assert.equal(after.finishedAt, settled.finishedAt, "the settlement time is stable");
-    assert.equal(after.exitCode, undefined, "the retired callback did not record an exit code");
+    // D-07 (#116 / §27 REV-35): a terminal record now says `null` when no exit status was observed
+    // at settlement (`undefined` is no longer produced for terminal rows). The retired handle may
+    // also have landed its observation first — `sleep 0.6` exits 0 — so the code is 0 when the
+    // handoff won the race. What must never change: the settlement itself is the revived owner's.
+    assert.ok(after.exitCode === null || after.exitCode === 0,
+      `exitCode must be unknown (null) or the observed 0, got ${String(after.exitCode)}`);
     assert.equal(finalized.filter((id) => id === task.taskId).length, 1, "one finalize, never two");
   } finally {
     await registry.shutdown();
@@ -248,7 +253,9 @@ test("a watch-success task releases its task timeout when the process exits afte
     await delay(100);
     for (const handle of armed) assert.ok(cleared.has(handle), "the task timeout timer is cleared once the process is gone");
     // A terminal snapshot is never rewritten with the late exit code — the accepted S1 semantics.
-    assert.equal(registry.get(task.taskId)?.exitCode, undefined);
+    // D-07 (#116): the watch settlement recorded no exit status, which is now written as `null`.
+    assert.equal(registry.get(task.taskId)?.exitCode, null);
+    assert.equal(registry.get(task.taskId)?.exitCodeKnown, false);
   } finally {
     patched.setTimeout = realSetTimeout;
     patched.clearTimeout = realClearTimeout;
@@ -296,7 +303,11 @@ test("a kill() awaiting a TERM-ignoring child cannot settle the revived snapshot
     assert.ok(settled);
     assert.equal(settled.status, "failed");
     assert.equal(settled.failureKind, "lost");
-    assert.equal(settled.exitCode, undefined, "no stale exit code from the retired handle");
+    // D-07 (#116 3.3): the retired handle's exit observation is no longer thrown away — the adopted
+    // owner records the code it finds on disk (a SIGKILLed child reports 1 through the spawn layer)
+    // and stays `null` when the probe settled first. Either way it is never a code nobody saw.
+    assert.ok(settled.exitCode === null || settled.exitCode === 1,
+      `exitCode must be unknown (null) or the observed 1, got ${String(settled.exitCode)}`);
     assert.equal(finalized.filter((id) => id === task.taskId).length, 1, "settled exactly once");
 
     await delay(400);

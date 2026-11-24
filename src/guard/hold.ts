@@ -1,6 +1,6 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
-import { isTerminal, type TaskSnapshot } from "../core/task.ts";
+import { exitSuffix, isTerminal, type TaskSnapshot } from "../core/task.ts";
 import { formatDuration, formatElapsedMs } from "../core/duration.ts";
 import { envNumber } from "../core/env.ts";
 // SAFETY: `tui/width.ts` is a pure text utility (no TUI/host imports), so the guard layer may share
@@ -207,6 +207,7 @@ function isHoldable(task: TaskSnapshot): boolean {
 
 /**
  * D-6 (修订 1 / F2a, 修订 2): the results line for the transcript — id/name/status/exitCode only.
+ * D-07 (#116): an exit status nobody observed reads `exit unknown` (`exitSuffix`), never `exit 0`.
  *
  * Output tails are 8 KiB each and would blow up the context, so the reader is pointed at
  * `async_logs` instead. The fallback wording never claims a status it does not have: when the
@@ -218,7 +219,8 @@ function resultsSummary(count: number, done: TaskSnapshot[]): string {
   const tail = " Read the output with async_logs before answering.";
   if (done.length === 0) return `${head} they finished (records pruned).${tail}`;
   const items = done
-    .map((task) => `${task.name ?? task.taskId} (${task.status}${task.exitCode === undefined ? "" : `, exit ${task.exitCode}`})`)
+    // D-07 (#116 / §27 REV-35): an unobserved exit status reads `exit unknown`, never `exit 0`.
+    .map((task) => `${task.name ?? task.taskId} (${task.status}${exitSuffix(task.exitCode)})`)
     .join(" · ");
   const missing = count > done.length ? " (records pruned for the rest)" : "";
   return `${head} all finished: ${items}${missing}.${tail}`;

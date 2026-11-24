@@ -2,11 +2,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { clearTaskActivity, raiseTaskActivity, reportActivity } from "../src/core/bus.ts";
-import { sendCompletionNotification, sendMatchBudgetNotice, sendReminder } from "../src/core/notify.ts";
+import { notifyLivenessFields, sendCompletionNotification, sendMatchBudgetNotice, sendReminder } from "../src/core/notify.ts";
 import { registerNudges } from "../src/context/nudges.ts";
 import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
-import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
+import { formatExitStatus, isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { registerHold } from "../src/guard/hold.ts";
 import { registerPrintWait } from "../src/guard/print-wait.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
@@ -126,7 +126,9 @@ function notificationCard(message: unknown, registry: TaskRegistry): string {
   const duration = finishedAt === undefined ? "" : `, ${formatDuration(finishedAt - (snapshot?.startedAt ?? snapshot?.createdAt ?? finishedAt))}`;
   const parts = [`${status === "completed" ? "✓" : "✗"} ${name} (${status}${duration})`];
   const exitCode = typeof d.exitCode === "number" ? d.exitCode : snapshot?.exitCode;
-  if (exitCode !== undefined) parts.push(`exit ${exitCode}`);
+  // D-07 (#116 / CONTRACT §27 REV-35): `null` means "no exit status was observed" — the card omits
+  // the segment instead of printing a code nobody saw (never `exit null`, never `exit 0`).
+  if (typeof exitCode === "number") parts.push(formatExitStatus(exitCode));
   const killKind = typeof d.killKind === "string" ? d.killKind : undefined;
   const failureKind = typeof d.failureKind === "string" ? d.failureKind : undefined;
   if (killKind) parts.push(`kill ${killKind}`);
@@ -366,7 +368,10 @@ export async function init(pi: PiCtx): Promise<void> {
         taskId: snapshot.taskId,
         name: snapshot.name,
         status: snapshot.status,
-        ...(snapshot.exitCode === undefined ? {} : { exitCode: snapshot.exitCode }),
+        // D-07 (#116 / CONTRACT §27 REV-35): the notification carries the *claim*, not a default —
+        // an unobserved exit status and an unobserved process state say so out loud.
+        ...(typeof snapshot.exitCode === "number" ? { exitCode: snapshot.exitCode } : {}),
+        ...notifyLivenessFields(snapshot),
         outputFile,
         ...(outputTail ? { summary: outputTail } : {}),
         ...(guidance ? { guidance } : {}),
