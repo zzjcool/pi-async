@@ -68,7 +68,7 @@ export interface RunReceipt {
   outputHint: string;
 }
 
-export type WaitResultItem = { taskId: string; status: TaskStatus; exitCode?: number | null; outputTail: string; killKind?: KillKind; failureKind?: FailureKind };
+export type WaitResultItem = { taskId: string; status: TaskStatus; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind };
 export type WaitNotReadyItem = { taskId: string; status: "running" | "pending"; elapsedMs: number };
 /** All-terminal → { results }; timeout-only → { notReady }; mixed timeout → { results, notReady } (REV-7 / #43 + #37 kinds). */
 export type WaitOutcome =
@@ -161,20 +161,14 @@ export function snapshotLiveness(task: Pick<TaskSnapshot, "processAlive" | "proc
 }
 
 /**
- * D-07 (#116): the exit status the snapshot can honestly report — a number when one was observed,
- * `null` when it was not. `null` must never be read as `0` (that is the whole point of the tri-state).
+ * D-07 (#116): `true` only when the snapshot carries an observed exit status.
  *
  * A legacy snapshot carries a number without `exitCodeKnown`; that number is still evidence (the old
- * code only ever wrote it from an observed exit), so it is reported as known. The asymmetric rule is
+ * code only ever wrote it from an observed exit), so it counts as observed. The asymmetric rule is
  * deliberate: `processAlive: false` was a **default**, `exitCode: <number>` was never one.
  */
-export function snapshotExitCode(task: Pick<TaskSnapshot, "exitCode" | "exitCodeKnown">): number | null {
-  if (typeof task.exitCode === "number") return task.exitCode;
-  return null;
-}
-
-/** D-07 (#116): `true` only when the snapshot carries an observed exit status. */
 export function hasObservedExitCode(task: Pick<TaskSnapshot, "exitCode" | "exitCodeKnown">): boolean {
+  if (task.exitCodeKnown === false) return false;
   return typeof task.exitCode === "number";
 }
 
@@ -185,9 +179,10 @@ export function formatExitStatus(exitCode: number | null | undefined): string {
 
 /**
  * D-07 (#116): `, exit 7` / `, exit unknown` for the settlement result lines (hold, `pi -p` backstop).
- * A still-running row has no claim yet and gets no suffix (`undefined`).
+ *
+ * Both callers render **terminal** rows only, so a missing field is a 0.5.3 snapshot that could not
+ * write one — that is "unknown" too (`exitSuffix` never says nothing about a finished task).
  */
 export function exitSuffix(exitCode: number | null | undefined): string {
-  if (exitCode === undefined) return "";
   return `, ${formatExitStatus(exitCode)}`;
 }

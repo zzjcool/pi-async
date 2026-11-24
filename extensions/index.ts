@@ -6,7 +6,7 @@ import { notifyLivenessFields, sendCompletionNotification, sendMatchBudgetNotice
 import { registerNudges } from "../src/context/nudges.ts";
 import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
-import { formatExitStatus, isTerminal, type TaskSnapshot } from "../src/core/task.ts";
+import { isTerminal, type TaskSnapshot } from "../src/core/task.ts";
 import { registerHold } from "../src/guard/hold.ts";
 import { registerPrintWait } from "../src/guard/print-wait.ts";
 import { HoldNotificationRelay } from "../src/guard/hold-notify.ts";
@@ -127,8 +127,9 @@ function notificationCard(message: unknown, registry: TaskRegistry): string {
   const parts = [`${status === "completed" ? "✓" : "✗"} ${name} (${status}${duration})`];
   const exitCode = typeof d.exitCode === "number" ? d.exitCode : snapshot?.exitCode;
   // D-07 (#116 / CONTRACT §27 REV-35): `null` means "no exit status was observed" — the card omits
-  // the segment instead of printing a code nobody saw (never `exit null`, never `exit 0`).
-  if (typeof exitCode === "number") parts.push(formatExitStatus(exitCode));
+  // the segment entirely instead of printing a code nobody saw (a one-line card cannot spell out
+  // "unknown" without burying the outcome; the detail view and the notification carry it).
+  if (typeof exitCode === "number") parts.push(`exit ${exitCode}`);
   const killKind = typeof d.killKind === "string" ? d.killKind : undefined;
   const failureKind = typeof d.failureKind === "string" ? d.failureKind : undefined;
   if (killKind) parts.push(`kill ${killKind}`);

@@ -74,11 +74,16 @@ export type RegistryEvent =
  * D-07 (#116 / CONTRACT §27 REV-35): what the settling caller actually observed about the child.
  *
  * - `"exit"`: the child's own exit event (an exit status when one is passed as well).
+ * - `"killed"`: the same exit event, but the task was killed — the outcome is `killKind`, and the
+ *   number the spawn layer reports for a signal death is its own REV-28d fallback, not a verdict
+ *   (§6's failure matrix gives a killed row `kill-kind`, never `exit-code`). So: observed death, no
+ *   exit status. Without this, a timeout kill would record `exit 1` or `null` depending on whether
+ *   the exit event or `killTree()`'s confirmation won the race.
  * - `"gone"`: a liveness probe proved the process group is gone, but no exit status was seen.
  * - `"unknown"`: nothing was observed — a D4 watch hit while the process still runs, an unconfirmed
  *   kill. The snapshot then records `processAlive: null` / `processAliveKnown: false`.
  */
-export type FinalizeObservation = "exit" | "gone" | "unknown";
+export type FinalizeObservation = "exit" | "killed" | "gone" | "unknown";
 
 interface LiveTask {
   outputFile: string;
@@ -508,7 +513,7 @@ export class TaskRegistry {
       if (!isTerminal(task.status)) {
         // A killed task records the *observation* (the process exited) but no exit status: the code
         // the spawn layer reports for a signal death is its own fallback, not the child's verdict.
-        if (live.killKind === "shutdown" || live.killKind === "user" || live.killKind === "timeout" || live.killKind === "watch_failure") this.finalize(task, "killed", undefined, live.killKind, "exit");
+        if (live.killKind === "shutdown" || live.killKind === "user" || live.killKind === "timeout" || live.killKind === "watch_failure") this.finalize(task, "killed", undefined, live.killKind, "killed");
         else if (task.metadata.capped) this.finalize(task, "failed", code, "output_cap", "exit");
         else this.finalize(task, code === 0 ? "completed" : "failed", code, undefined, "exit");
       }
@@ -1182,8 +1187,9 @@ export class TaskRegistry {
       if (live) live.processExited = true;
       if (live?.timer) { clearTimeout(live.timer); live.timer = undefined; }
       task.failureKind = "lost";
-      // D-07 (#116): two consecutive dead probes are an observation of death (no exit status though).
-      this.finalize(task, "failed", undefined, undefined, "gone");
+      // D-07 (#116): two consecutive dead probes are an observation of death (no exit status though) —
+      // but only when there was a pid to probe; a pid-less snapshot observed nothing.
+      this.finalize(task, "failed", undefined, undefined, task.pid !== undefined ? "gone" : "unknown");
     }
     for (const id of [...this.livenessStrikes.keys()]) if (!this.tasks.has(id)) this.livenessStrikes.delete(id);
     if (!this.hasActiveWork()) this.stopLiveness();
@@ -1535,12 +1541,14 @@ export class TaskRegistry {
     return { bytes, files };
   }
 
-  private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number | null; outputTail: string; killKind?: KillKind; failureKind?: FailureKind } {
+  private waitResult(task: TaskSnapshot): { taskId: string; status: TaskSnapshot["status"]; exitCode?: number; outputTail: string; killKind?: KillKind; failureKind?: FailureKind } {
     this.consume(task.taskId);
     return {
       taskId: task.taskId,
       status: task.status,
-      ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
+      // CONTRACT §5/§12 freeze this shape: a numeric code or nothing at all. "Unknown" is the absent
+      // key here; the *snapshot* carries the tri-state for anyone who needs to tell them apart.
+      ...(typeof task.exitCode === "number" ? { exitCode: task.exitCode } : {}),
       outputTail: this.logs(task.taskId, { maxBytes: 8192, tail: true }).text,
       ...(task.killKind ? { killKind: task.killKind } : {}),
       ...(task.failureKind ? { failureKind: task.failureKind } : {}),
@@ -1565,8 +1573,13 @@ export class TaskRegistry {
     // process, a spawn error) carries a code but no observation, so the liveness stays unknown.
     const processObserved = observed !== "unknown";
     // A same-process retired handle (`recordObservedExit()`) may have landed the code the probe could
-    // not see; cross-process adoption has nothing to pick up and stays `null`.
-    const exitCode = typeof code === "number" ? code : observed === "unknown" ? null : this.persistedExitCode(task);
+    // not see; cross-process adoption has nothing to pick up and stays `null`. A code already on the
+    // object (the handoff updates memory too) is never thrown away — except for a kill, where the
+    // outcome is `killKind` and the spawn layer's signal fallback is not an exit status (§6).
+    const exitCode = observed === "killed" ? null
+      : typeof code === "number" ? code
+      : typeof task.exitCode === "number" ? task.exitCode
+      : observed === "unknown" ? null : this.persistedExitCode(task);
     task.exitCode = exitCode;
     task.exitCodeKnown = typeof exitCode === "number";
     task.processAlive = processObserved ? false : null;
@@ -1597,6 +1610,8 @@ export class TaskRegistry {
    * child, and pretending otherwise is exactly what §27 forbids. Same-process `/reload` can:
    * `recordObservedExit()` merges the value into the persisted snapshot without touching status, and
    * the adopting owner picks it up here when it settles the task. `null` = nothing to pick up.
+   *
+   * This read *is* the handoff — synchronous on purpose (the caller is already inside `finalize`).
    */
   private persistedExitCode(task: TaskSnapshot): number | null {
     try {
@@ -1629,6 +1644,13 @@ export class TaskRegistry {
       renameSync(temp, file);
       task.exitCode = code;
       task.exitCodeKnown = true;
+      // Same instance may already own a *different* object for this id (a revival re-adopted from
+      // disk). Keep that object in step too, or its next persist() would clobber the handoff.
+      const owner = this.tasks.get(task.taskId);
+      if (owner !== undefined && owner !== task && !isTerminal(owner.status) && typeof owner.exitCode !== "number") {
+        owner.exitCode = code;
+        owner.exitCodeKnown = true;
+      }
     } catch { /* best effort: a data dir that vanished is not this handoff's failure */ }
   }
   private finalizeEvent(task: TaskSnapshot): void {

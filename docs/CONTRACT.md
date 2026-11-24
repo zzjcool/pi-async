@@ -497,10 +497,10 @@ async_wait({ taskIds: string[], timeoutMs: number })   // timeoutMs 必填（sch
   汇总（可选、默认关闭）。`initStatus` 保留 `reportActivity`（feature-detect），`setStatus` 调用为
   best-effort（宿主拒绝不得影响会话）。`clearedAtMs`/`survivesClearCutoff`/`clearDoneStatus`
   保留，由 `panel.ts` 与 `/async-clear` 共享。
-- **判活与退出码的显示（REV-35，0.5.4）**：终态快照不声称进程存活；未知写 `null`。详情状态行在快照
-  带观测证据（`processAliveKnown` / `exitCodeKnown` 存在）时追加 `· process: exited|alive|unknown` 与
-  `· exit <code>|exit unknown`：`process: unknown` **绝不**渲染成 `exited`，`exit unknown` **绝不**渲染成
-  `exit 0`。旧快照没有这两个字段 → 按「未知」显示，不做迁移、不推断。
+- **判活与退出码的显示（REV-35，0.5.4）**：终态快照不声称进程存活；未知写 `null`。**每一个终态快照**的
+  详情状态行都追加 `· process: exited|alive|unknown` 与 `· exit <code>|exit unknown`（行数不变，接在
+  `status:` 那行后面；运行中的快照不追加，它还没有主张）：`process: unknown` **绝不**渲染成 `exited`，
+  `exit unknown` **绝不**渲染成 `exit 0`。旧快照没有这两个字段 → 按「未知」显示，不做迁移、不推断。
 - **面板**（仅 `/async`）：`ctx.ui.custom({overlay:true, overlayOptions:
   {width:"80%", maxHeight:"70%", anchor:"center"}})`；从 rail 点击直入详情时为
   `{width:"85%", maxHeight:"80%", anchor:"center"}`。固定百分比尺寸，不提供环境变量开关。
@@ -1840,20 +1840,30 @@ timeout / 用户 `async_kill` / 代际 retire 终结。恢复执行时**必须�
   - `processAlive?: boolean | null`：`false` = 退出**被观测到**；`null` = 什么也没观测到（**JSON 里出现
     `null`，不是缺字段**，以便与「旧快照没这个字段」区分）；运行中的快照不写。
   - `processAliveKnown?: boolean`：`true` **仅当** `processAlive` 是一次观测的结论（不是默认值）。
-  - `exitCode?: number | null`：数字 = 观测到的退出码；`null` = 没拿到。
-  - `exitCodeKnown?: boolean`：`true` **仅当** `exitCode` 是观测到的数字。`exitCode: null` +
-    `exitCodeKnown: false` 读作「没拿到」，**不得**与 `exitCode: 0` 混为一谈。
+  - `exitCode?: number | null`：数字 = 拿到退出码；`null` = 没拿到。
+  - `exitCodeKnown?: boolean`：`true` **仅当** `exitCode` 是一个**确定的**数字。确定有两个来源：
+    观测到的退出码（退出事件里拿到的那个），或 pi-async 自己下的判决（**启动失败**：进程根本没起来，
+    §8 规定写 `exitCode: 1`，此时 `processAliveKnown` 仍是 `false` —— 没有进程可观测）。除此之外
+    一律 `null` + `false`，读作「没拿到」，**不得**与 `exitCode: 0` 混为一谈。
+  - **killed 行不带退出码**：`status: killed` 的结算一律 `exitCode: null` + `false`（§6 的失败矩阵
+    只给 killed 行 `kill-kind`）。信号死亡的子进程，spawn 层（REV-28d）会报一个 `1` 兜底值 —— 那是
+    它自己的兜底，不是子进程的判决，所以不作为退出码记录。这条与「谁先结算」无关：退出事件先到或
+    `killTree()` 的确认先到，写出来的都是同一份记录。
 - **`finalize()` 多一个「观测到了什么」参数**：`"exit"`（退出事件/退出码）/ `"gone"`（探活证明进程组
   已消失，但没有退出值）/ `"unknown"`（默认：什么都没观测到）。只有前两者写 `processAlive: false` +
   `Known: true`，`"unknown"` 写 `null` + `false`。
 - **通知字段表**（`src/core/notify.ts`）：新增 `process-alive` / `process-alive-known` / `exit-code-known`
   三个 XML 字段（structured details 同步）。`exit-code` 只在拿到数字时输出。
-- **显示层**：`snapshotLiveness()` / `formatExitStatus()`（`src/core/task.ts`）是唯一判据；
-  `async_status`（原始快照字段）、`async_wait` / hold / print-wait 的结果行、TUI 详情状态行都走它。
+- **显示层**：`snapshotLiveness()` / `formatExitStatus()` / `exitSuffix()`（`src/core/task.ts`）是唯一
+  判据；`async_status`（原始快照字段）、`async_wait` / hold / print-wait 的结果行、TUI 详情状态行、
+  完成卡片都走它。**每一个终态快照**的详情状态行都带 `· process: <alive|exited|unknown> · exit <code
+  |unknown>`（运行中的快照不带：还没有主张）。
   旧快照（无新字段）读作 `unknown`，**不推断**：`processAlive: false` 而没有 `processAliveKnown` 时
   **不**当「已退出」（0.5.3 及更早无条件写 `false`，那个 `false` 是默认值，不是证据）。
   例外且只此一处：`exitCode` 是**数字**而 `exitCodeKnown` 缺失时按已知处理——旧代码只在观测到退出码时
   才写数字，这个值是证据形状的（`false` 不是）。
+- **`async_wait` 的结果行形状不变**（§5/§12 冻结）：`exitCode?: number` 仍是「有数字或没有这个键」，
+  未知就是不出现；三态只在**快照**里（谁需要区分「未知」与「没有」读 `async_status`）。
 - **同进程 `/reload` 的退出码交接（3.3）**：退役代在退出回调里把观测到的数字**合并写回**已持久化的
   快照（只碰 `exitCode` / `exitCodeKnown`，绝不动 `status` / `finishedAt` / `killKind`），收养代在结算
   该任务时读取这个观测（`persistedExitCode()`）。**不做**跨进程交接（物理不可得，不假装）。
@@ -1862,10 +1872,12 @@ timeout / 用户 `async_kill` / 代际 retire 终结。恢复执行时**必须�
 
 **不变量**：
 
-1. 没观测到进程退出 → 终态快照 `processAlive: null` + `processAliveKnown: false`（D4 watch 命中、
-   未确认的 kill、`lost` 结算、pending 取消都属于这一类）。
-2. 观测到退出（退出事件，或探活证明进程组消失）→ `processAlive: false` + `processAliveKnown: true`；
-   有退出码时 `exitCode` 是数字且 `exitCodeKnown: true`，没拿到时 `exitCode: null` + `false`。
+1. 没观测到进程退出 → 终态快照 `processAlive: null` + `processAliveKnown: false`。这一类是：D4 watch
+   命中（进程还在跑）、未确认的 kill、**没有 pid 可探的快照**、pending 取消、`lost` 但没有探活证据。
+2. 观测到退出 → `processAlive: false` + `processAliveKnown: true`。两种观测都算：退出事件，或探活
+   证明进程组已消失（`pidAlive()` 说没了 / 两次连续死探针 / 收养代的 watcher / `killTree()` 确认）。
+   `lost` 但探活到进程组已死，属于这一类，不是第一条。
+   有退出码时 `exitCode` 是数字且 `exitCodeKnown: true`；killed 行或没拿到时 `exitCode: null` + `false`。
 3. 旧快照（无 `processAliveKnown` / `exitCodeKnown`）一律按「未知」显示，**不迁移、不推断**。
 4. 终态快照的其它字段不被退役代的交接写坏（REV-28a 不变）。
 
