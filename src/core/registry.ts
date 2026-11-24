@@ -21,7 +21,7 @@ import {
 import { stripLogControls } from "./output.ts";
 import { assertSafeEnvKeys, envNumber } from "./env.ts";
 import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type TaskSnapshot, type TaskStatus, type WatchSpec, type WaitOutcome } from "./task.ts";
-import { evalConditions, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
+import { evaluateConditionsDetailed, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
 
 export interface RegistryEvents {
   onFinalize(snapshot: TaskSnapshot): void;
@@ -472,16 +472,22 @@ export class TaskRegistry {
       if (watchSpec) {
         try {
           const streams = this.readWatchOutput(task.taskId);
-          const failureMatched = await evalConditions(watchSpec.failure_when, { ...streams, exitCode: code });
+          const failureRound = await evaluateConditionsDetailed(watchSpec.failure_when, { ...streams, exitCode: code });
           // REV-34 ruling 5 (REV-R5): the exit-time evaluation now awaits the budgeted worker, so
           // re-read the invariants from above — a terminal snapshot settled while the regex ran is
           // the record, and a retired generation owns nothing here.
           if (this.suspended || live.retired || isTerminal(task.status)) return { code };
-          if (failureMatched) this.finalize(task, "killed", undefined, "watch_failure");
-          else if (await evalConditions(watchSpec.success_when, { ...streams, exitCode: code })) {
+          // REV-34 ruling 2: the exit path is a round like any other and credits the same counter.
+          if (failureRound.budgetExceeded > 0) this.noteMatchBudgetExceeded(task.taskId, failureRound.budgetExceeded);
+          if (failureRound.status === "matched" && failureRound.matched) this.finalize(task, "killed", undefined, "watch_failure");
+          else {
+            const successRound = await evaluateConditionsDetailed(watchSpec.success_when, { ...streams, exitCode: code });
             if (this.suspended || live.retired || isTerminal(task.status)) return { code };
-            task.metadata.watchSuccess = `success_when matched after process exit: ${JSON.stringify(watchSpec.success_when)}`;
-            this.finalize(task, "completed", code);
+            if (successRound.budgetExceeded > 0) this.noteMatchBudgetExceeded(task.taskId, successRound.budgetExceeded);
+            if (successRound.status === "matched" && successRound.matched) {
+              task.metadata.watchSuccess = `success_when matched after process exit: ${JSON.stringify(watchSpec.success_when)}`;
+              this.finalize(task, "completed", code);
+            }
           }
         } catch { /* WatchLoop owns infrastructure-failure accounting while active. */ }
       }

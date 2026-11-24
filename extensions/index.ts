@@ -429,7 +429,7 @@ export async function init(pi: PiCtx): Promise<void> {
     // budget. Not a completion: no claim, no latch on `notified`, no turn — the registry already
     // applied "once per task" before calling this hook.
     onMatchBudgetNotice: (snapshot) => {
-      void sendMatchBudgetNotice(pi, registry, snapshot)
+      void sendMatchBudgetNotice(pi, snapshot)
         .then((outcome) => {
           if (outcome === "failed") console.error(`pi-async: match-budget notice delivery failed for ${snapshot.taskId}`);
         })

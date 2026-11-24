@@ -3,7 +3,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
-import { MATCH_BUDGET_MS } from "../core/regex-worker.ts";
+import { MATCH_BUDGET_MS } from "../core/watch.ts";
 import { displayWidth, fitWidth, truncateToWidth } from "./width.ts";
 import { clearDoneStatus, survivesClearCutoff } from "./status.ts";
 import { tuiHost } from "./host.ts";
@@ -106,8 +106,8 @@ export function detailStatusLines(task: TaskSnapshot, theme: Theme | null | unde
   const overBudget = task.matchBudgetExceeded ?? 0;
   if (overBudget > 0) {
     lines.push(
-      `${paint(theme, "dim", "output_matches:")} ${paint(theme, "accent", `${overBudget} over the ${MATCH_BUDGET_MS} ms budget`)}` +
-        `${paint(theme, "dim", " · counted as no-match, not a failure")}`,
+      `${paint(theme, "dim", "output_matches:")} ${paint(theme, "accent", `${overBudget} abandoned verdicts (${MATCH_BUDGET_MS} ms budget)`)}` +
+        `${paint(theme, "dim", " · no verdict, not a failure")}`,
     );
   }
   return lines;

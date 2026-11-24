@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { TaskRegistry } from "../src/core/registry.ts";
 import type { TaskSnapshot, WatchSpec } from "../src/core/task.ts";
 import { registerTools, type ToolContext } from "../src/tools/index.ts";
-import { MATCH_BUDGET_MS } from "../src/core/regex-worker.ts";
-import { MAX_MATCH_CHARS, WatchLoop, evalConditions, evaluateConditionsDetailed } from "../src/core/watch.ts";
+import { MATCH_BUDGET_MS, MAX_MATCH_CHARS, WatchLoop, evalConditions, evaluateConditionsDetailed } from "../src/core/watch.ts";
 import { detailStatusLines } from "../src/tui/panel.ts";
 
 /**
@@ -21,6 +20,14 @@ import { detailStatusLines } from "../src/tui/panel.ts";
 
 /** A shape that survives `validateWatchSpec` (the blacklist only catches `(a+)+`) and backtracks. */
 const HANGING_REGEX = "(a|a)*$";
+
+/**
+ * Used where the loop must NOT match before the process exits: `(a|a)*$` also matches an EMPTY
+ * subject (zero-width, `#112` §5(1) documents that it eventually matches at offset n), so a tick
+ * that lands before the output appears would settle the watch. `(.*a){20}$` needs 20 'a' groups and
+ * fails fast on "", while still taking ~880 ms on a 26-code-unit subject.
+ */
+const SLOW_REGEX = "(.*a){20}$";
 
 /** `n` UTF-16 code units ending in a non-matching tail: the cheapest shape known to hang. */
 const pathological = (codeUnits: number): string => "a".repeat(codeUnits - 1) + "!";
@@ -171,8 +178,8 @@ test("#113 acceptance 2: the task survives over-budget rounds — counter rises,
     // …and the TUI detail renders it with the "not a failure" wording.
     const detail = detailStatusLines(live, null, Date.now()).join("\n");
     assert.match(detail, /output_matches:/);
-    assert.match(detail, /over the 25 ms budget/);
-    assert.match(detail, /no-match, not a failure/);
+    assert.match(detail, /abandoned verdicts \(25 ms budget\)/);
+    assert.match(detail, /no verdict, not a failure/);
   } finally { await f.cleanup(); }
 });
 
@@ -213,4 +220,66 @@ test("#113: the loop reports every burned budget to its deps and never stops sch
   await until(() => burned.length >= 2, 12_000, "two over-budget rounds on the loop");
   loop.stop();
   assert.deepEqual(burned.slice(0, 2), [1, 1], "each round reports one burned evaluation");
+});
+
+test("#113 (REV-34 ruling 5): the process-exit evaluation credits the same counter, and is not a failure", async () => {
+  const f = fixture();
+  try {
+    // The subject only appears when the process is already exiting, so the loop's own ticks never
+    // see it: whatever burns the budget here is the exit-path evaluation.
+    // `submit({ watch })` (not `attachWatch`) so `task.watch` is set: the exit path only evaluates
+    // a watch that belongs to the snapshot, and that path is exactly what this test pins.
+    const task = f.registry.submit({
+      command: `sleep 1.1; printf '%s' '${PATHOLOGICAL_OUTPUT}'`,
+      notifyOnCompletion: false,
+      watch: hangingWatch({
+        intervalMs: 1_000,
+        timeoutMs: 20_000,
+        blind_checks: 100,
+        success_when: [{ type: "output_matches", regex: SLOW_REGEX }],
+      }),
+    });
+    await until(
+      () => ["completed", "failed", "killed"].includes(f.registry.get(task.taskId)?.status ?? ""),
+      15_000,
+      "the task to exit",
+    );
+    const settled = f.registry.get(task.taskId)!;
+    assert.equal(settled.status, "completed", `an abandoned exit-time verdict must not fail the task (got ${settled.status}/${String(settled.failureKind)})`);
+    assert.ok((settled.matchBudgetExceeded ?? 0) >= 1, "the exit-path evaluation must credit the per-task counter");
+  } finally { await f.cleanup(); }
+});
+
+test("#113 (REV-34 ruling 5): a round that was in flight when stop() landed reports nothing", async () => {
+  let budgets = 0;
+  let settleCallbacks = 0;
+  const loop = new WatchLoop({
+    taskId: "stop-during-await",
+    spec: hangingWatch({ intervalMs: 1_000, timeoutMs: 60_000 }),
+    readOutput: () => ({ output: PATHOLOGICAL_OUTPUT, stdout: PATHOLOGICAL_OUTPUT, stderr: "" }),
+    getExitCode: () => undefined,
+    onSuccess: () => { settleCallbacks++; },
+    onFailure: () => { settleCallbacks++; },
+    onBlindExhausted: () => { settleCallbacks++; },
+    onWatchTimeout: () => { settleCallbacks++; },
+    onMatchBudgetExceeded: () => { budgets++; },
+  });
+  loop.start();
+  // 1 ms after start the round is inside `await evaluateWithBudget(...)`: stopping now must make the
+  // resumed continuation a no-op (a settled task may not be written by a stale loop).
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  loop.stop();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(budgets, 0, "an abandoned round must not report a burned budget after stop()");
+  assert.equal(settleCallbacks, 0, "a stopped loop must not settle anything");
+});
+
+test("#113 (REV-34 ruling 3): the contract no longer claims the 64K window limits ReDoS", () => {
+  const contract = readFileSync(join(import.meta.dirname, "..", "docs", "CONTRACT.md"), "utf8");
+  // The two sentences this REV was written to remove: both said the window bounds the blast radius.
+  assert.doesNotMatch(contract, /以限制 ReDoS 影响面/);
+  assert.doesNotMatch(contract, /限制 ReDoS 作用面/);
+  // …and the replacement reason is stated, in both places (§4 and the §20.2 table).
+  assert.match(contract, /内存 \/ 取舍边界/);
+  assert.ok(contract.includes("**不是** ReDoS 防线"), "the §20.2 window table must say it is not a ReDoS defence");
 });

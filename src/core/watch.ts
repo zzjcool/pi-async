@@ -23,6 +23,14 @@ export interface WatchOutput {
 export const MAX_MATCH_CHARS = 64 * 1024;
 
 /**
+ * CONTRACT §26 (REV-34): hard budget for **one** `output_matches` evaluation.
+ *
+ * A benign pattern costs 0.06–0.33 ms (cold 0.14–0.33 ms), so this is a ~75–100× margin, while every pathological
+ * shape measured (`docs/reports/redos-benchmark.md` §4.2) crosses it inside 28 code units.
+ */
+export const MATCH_BUDGET_MS = 25;
+
+/**
  * Classic exponential-backtracking shape: a group that itself ends with a
  * quantifier, then another quantifier — e.g. (a+)+ / (a*)* / (a|b+)+.
  *
@@ -336,7 +344,7 @@ async function evaluateCondition(condition: Condition, ctx: WatchEvalContext): P
       return { status: "matched", matched: ctx.stderr.includes(condition.value) };
     case "output_matches": {
       // REV-34: never evaluated on this thread — a catastrophic pattern would freeze the host.
-      const result = await evaluateWithBudget(condition.regex, matchSubject(ctx.output));
+      const result = await evaluateWithBudget(condition.regex, matchSubject(ctx.output), MATCH_BUDGET_MS);
       if (result.status === "budget") return { status: "budget" };
       if (result.status === "error") return { status: "error" };
       return { status: "matched", matched: result.matched };

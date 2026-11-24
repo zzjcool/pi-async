@@ -20,9 +20,6 @@ import { Worker, isMainThread, parentPort } from "node:worker_threads";
  * entry (`new URL(import.meta.url)`) it only runs the child block below.
  */
 
-/** CONTRACT §26: hard per-evaluation budget for one `output_matches` regex. */
-export const MATCH_BUDGET_MS = 25;
-
 export type BudgetedMatch =
   /** The regex ran inside its budget and produced a verdict. */
   | { status: "matched"; matched: boolean }
@@ -144,6 +141,8 @@ function spawn(): Pool {
   const created: Pool = { worker, ready };
   worker.on("message", (message: Reply) => {
     if ("ready" in message) {
+      // Re-arm the diagnostics latch: a *later*, unrelated failure must be reported too.
+      spawnFailureLogged = false;
       resolveReady(worker);
       return;
     }
@@ -179,7 +178,7 @@ function ensurePool(): Promise<Worker> {
  * The caller gets `budget` for "no verdict this round" (REV-34 ruling 2) and `error` for "the
  * checker itself is broken" (REV-25 blind-check accounting).
  */
-export function evaluateWithBudget(pattern: string, source: string, budgetMs: number = MATCH_BUDGET_MS): Promise<BudgetedMatch> {
+export function evaluateWithBudget(pattern: string, source: string, budgetMs: number): Promise<BudgetedMatch> {
   return ensurePool().then(
     (worker) => new Promise<BudgetedMatch>((resolve) => {
       const id = nextId++;
@@ -205,19 +204,3 @@ export function evaluateWithBudget(pattern: string, source: string, budgetMs: nu
   );
 }
 
-/**
- * Drop the worker (registry shutdown / tests). Idempotent and safe to call with nothing running:
- * a leftover ref'd thread would keep a test process alive after its assertions passed.
- */
-export function disposeRegexWorker(): void {
-  if (!pool) {
-    failAll("regex worker disposed");
-    return;
-  }
-  teardown("regex worker disposed");
-}
-
-/** Test hook: true when a worker is currently alive (used to assert reuse instead of re-spawn). */
-export function regexWorkerAlive(): boolean {
-  return pool !== undefined;
-}

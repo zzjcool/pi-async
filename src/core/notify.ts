@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TaskRegistry } from "./registry.ts";
 import type { FailureKind, KillKind, TaskSnapshot, TaskStatus } from "./task.ts";
-import { MATCH_BUDGET_MS } from "./regex-worker.ts";
+import { MATCH_BUDGET_MS } from "./watch.ts";
 
 export type PiCtx = ExtensionAPI;
 export interface NotifyPayload {
@@ -100,7 +100,7 @@ export function reminderGuidance(timeoutAt?: number, now = Date.now()): string {
  * verdict is a silent trap — the model would otherwise wait for a match that cannot arrive.
  */
 export const MATCH_BUDGET_GUIDANCE =
-  "The watch's output_matches evaluation exceeded its 25 ms budget, so that round was treated as no match — not a failure, and the task was not killed. A pattern this expensive may never produce a verdict: prefer stdout_contains, or narrow the pattern (wide `*` / `|` combinations backtrack catastrophically).";
+  "The watch's output_matches evaluation exhausted its evaluation budget, so that round was abandoned and counts as no match. No verdict was reached: the task was not killed, nothing counts as an infrastructure failure, and a real match (success_when) or a real failure (failure_when) on such a round can be missed. A pattern this expensive may never produce a verdict at all — prefer stdout_contains, or narrow the pattern (wide `*` / `|` combinations backtrack catastrophically).";
 
 /** Notice payload (REV-34): one burned-budget notice per task, never a terminal event. */
 export interface MatchBudgetNoticePayload {
@@ -210,7 +210,7 @@ export async function sendReminder(
  * the model asked for, not a wake-up. The registry already guaranteed "once per task" before
  * calling; this function must never throw (a notice is never allowed to fail a watch).
  */
-export async function sendMatchBudgetNotice(pi: PiCtx, registry: TaskRegistry, snapshot: TaskSnapshot): Promise<NotifyOutcome> {
+export async function sendMatchBudgetNotice(pi: PiCtx, snapshot: TaskSnapshot): Promise<NotifyOutcome> {
   const payload: MatchBudgetNoticePayload = {
     taskId: snapshot.taskId,
     name: snapshot.name,
