@@ -1,6 +1,5 @@
 import type { Condition, WatchSpec } from "./task.ts";
-
-const compiledRegexes = new WeakMap<Condition, RegExp>();
+import { evaluateWithBudget } from "./regex-worker.ts";
 
 /** Captured streams for watch evaluation: stdout/stderr are distinct; output is merged. */
 export interface WatchOutput {
@@ -103,7 +102,9 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
             if (danger) return invalid(`${location}: ${danger}`);
           }
           try {
-            compiledRegexes.set(condition, new RegExp(condition.regex, "m"));
+            // Compile here only to fail fast at attach time; the evaluation itself runs in the
+            // budgeted worker, which owns the per-pattern cache (REV-34).
+            new RegExp(condition.regex, "m");
           } catch (error) {
             // Never collapse the reason: V8 distinguishes "Unterminated character class" from
             // "Invalid group" (inline flags), and the caller can only fix what it is told.
@@ -126,8 +127,13 @@ export function validateWatchSpec(spec: WatchSpec): { ok: true } | { ok: false; 
 
 export type WatchEvalContext = WatchOutput & { exitCode?: number };
 
-export function evalConditions(conds: Condition[], ctx: WatchEvalContext): boolean {
-  const result = evaluateConditionsDetailed(conds, ctx);
+/**
+ * REV-34: `output_matches` is evaluated in the budgeted worker thread, so this entry point is
+ * async. There is deliberately **no** synchronous variant left — a sync path is exactly the shape
+ * that froze the host for seconds on a 26-code-unit input (#113).
+ */
+export async function evalConditions(conds: Condition[], ctx: WatchEvalContext): Promise<boolean> {
+  const result = await evaluateConditionsDetailed(conds, ctx);
   return result.status === "matched" && result.matched;
 }
 
@@ -140,12 +146,20 @@ export interface WatchLoopDeps {
   onFailure: () => void;
   onBlindExhausted: () => void;
   onWatchTimeout: () => void;
+  /**
+   * REV-34 ruling 2: `count` evaluations burned their budget this round (each was treated as "not
+   * matched"). The loop never turns this into a failure — the registry owns the counter and the
+   * one-time notice.
+   */
+  onMatchBudgetExceeded?: (count: number) => void;
 }
 
 export class WatchLoop {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = true;
   private finished = false;
+  /** REV-34: a tick awaits the worker, so two ticks must never overlap. */
+  private checking = false;
   private deadline = 0;
   private blindCount = 0;
   private readonly deps: WatchLoopDeps;
@@ -159,7 +173,7 @@ export class WatchLoop {
     this.stopped = false;
     this.blindCount = 0;
     this.deadline = Date.now() + this.deps.spec.timeoutMs;
-    this.check();
+    void this.check();
   }
 
   stop(): void {
@@ -170,8 +184,20 @@ export class WatchLoop {
     }
   }
 
-  private check(): void {
-    if (this.stopped) return;
+  private async check(): Promise<void> {
+    if (this.stopped || this.finished || this.checking) return;
+    this.checking = true;
+    try {
+      await this.round();
+    } catch (error) {
+      // A throwing dep must not become an unhandled rejection now that the tick is async.
+      console.error(`pi-async: watch tick failed for task ${this.deps.taskId}`, error);
+    } finally {
+      this.checking = false;
+    }
+  }
+
+  private async round(): Promise<void> {
     if (Date.now() >= this.deadline) {
       this.finish(this.deps.onWatchTimeout);
       return;
@@ -191,12 +217,19 @@ export class WatchLoop {
     }
 
     const ctx: WatchEvalContext = { ...streams, exitCode };
-    const failure = evaluateConditionsDetailed(this.deps.spec.failure_when, ctx);
+    const failure = await evaluateConditionsDetailed(this.deps.spec.failure_when, ctx);
+    // REV-34 / REV-R5: the await is a suspension point. The task may have been settled while the
+    // regex ran in the worker (watch timeout, `async_kill`, generation retire → `stop()`); a
+    // terminal snapshot is the record, so a stale loop must not act, re-schedule or overwrite it.
+    if (this.stopped || this.finished) return;
+    this.noteBudget(failure.budgetExceeded);
     if (failure.status === "matched" && failure.matched) {
       this.finish(this.deps.onFailure);
       return;
     }
-    const success = evaluateConditionsDetailed(this.deps.spec.success_when, ctx);
+    const success = await evaluateConditionsDetailed(this.deps.spec.success_when, ctx);
+    if (this.stopped || this.finished) return;
+    this.noteBudget(success.budgetExceeded);
     if (success.status === "matched" && success.matched) {
       const matched = success.condition;
       this.finish(() => this.deps.onSuccess(`success_when matched: ${JSON.stringify(matched)}`));
@@ -208,8 +241,20 @@ export class WatchLoop {
     if (failure.status === "error" || success.status === "error") {
       this.countBlindCheck();
     } else {
+      // REV-34 ruling 2: an over-budget round lands here — a plain "not matched" round. Blind
+      // checks are not consumed, `timeoutMs` is untouched, nothing is killed.
       this.blindCount = 0;
       this.scheduleNext();
+    }
+  }
+
+  /** REV-34 ruling 2: report burned budgets; never a failure, never a kill. */
+  private noteBudget(count: number): void {
+    if (count <= 0) return;
+    try {
+      this.deps.onMatchBudgetExceeded?.(count);
+    } catch (error) {
+      console.error(`pi-async: match-budget listener failed for task ${this.deps.taskId}`, error);
     }
   }
 
@@ -231,7 +276,7 @@ export class WatchLoop {
     }
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      this.check();
+      void this.check();
     }, Math.min(this.deps.spec.intervalMs, remaining));
   }
 
@@ -242,26 +287,44 @@ export class WatchLoop {
   }
 }
 
-type ConditionEvaluation =
-  | { status: "matched"; matched: boolean; condition?: Condition }
+/** One condition's verdict. `budget` is REV-34's "no verdict this round" (see below). */
+type ConditionResult =
+  | { status: "matched"; matched: boolean }
   | { status: "pending" }
-  | { status: "error" };
+  | { status: "error" }
+  /**
+   * REV-34 ruling 2: the evaluation burned its budget. Treated as **not matched** for this round —
+   * not pending (pending would still be "waiting for a verdict"), not error (error consumes the
+   * `blind_checks` budget for infrastructure failures).
+   */
+  | { status: "budget" };
 
-function evaluateConditionsDetailed(conditions: Condition[], ctx: WatchEvalContext): ConditionEvaluation {
+/** Aggregate verdict of one condition group, plus the burned-budget count of that round. */
+export interface DetailedEvaluation {
+  status: "matched" | "pending" | "error";
+  matched: boolean;
+  condition?: Condition;
+  /** REV-34: how many `output_matches` evaluations of this group ran out of budget this round. */
+  budgetExceeded: number;
+}
+
+export async function evaluateConditionsDetailed(conditions: Condition[], ctx: WatchEvalContext): Promise<DetailedEvaluation> {
   let pending = false;
   let error = false;
+  let budgetExceeded = 0;
   for (const condition of conditions) {
-    const result = evaluateCondition(condition, ctx);
-    if (result.status === "matched" && result.matched) return { status: "matched", matched: true, condition };
+    const result = await evaluateCondition(condition, ctx);
+    if (result.status === "matched" && result.matched) return { status: "matched", matched: true, condition, budgetExceeded };
+    if (result.status === "budget") { budgetExceeded++; continue; }
     if (result.status === "pending") pending = true;
     if (result.status === "error") error = true;
   }
-  if (error) return { status: "error" };
-  if (pending) return { status: "pending" };
-  return { status: "matched", matched: false };
+  if (error) return { status: "error", matched: false, budgetExceeded };
+  if (pending) return { status: "pending", matched: false, budgetExceeded };
+  return { status: "matched", matched: false, budgetExceeded };
 }
 
-function evaluateCondition(condition: Condition, ctx: WatchEvalContext): ConditionEvaluation {
+async function evaluateCondition(condition: Condition, ctx: WatchEvalContext): Promise<ConditionResult> {
   switch (condition.type) {
     case "exit_code":
       return ctx.exitCode === undefined
@@ -272,18 +335,11 @@ function evaluateCondition(condition: Condition, ctx: WatchEvalContext): Conditi
     case "stderr_contains":
       return { status: "matched", matched: ctx.stderr.includes(condition.value) };
     case "output_matches": {
-      let regex = compiledRegexes.get(condition);
-      if (!regex) {
-        try {
-          regex = new RegExp(condition.regex, "m");
-          compiledRegexes.set(condition, regex);
-        } catch {
-          return { status: "error" };
-        }
-      }
-      // Global/sticky expressions otherwise retain lastIndex between watch polls.
-      regex.lastIndex = 0;
-      return { status: "matched", matched: regex.test(matchSubject(ctx.output)) };
+      // REV-34: never evaluated on this thread — a catastrophic pattern would freeze the host.
+      const result = await evaluateWithBudget(condition.regex, matchSubject(ctx.output));
+      if (result.status === "budget") return { status: "budget" };
+      if (result.status === "error") return { status: "error" };
+      return { status: "matched", matched: result.matched };
     }
     case "json_path_exists": {
       let root: unknown;

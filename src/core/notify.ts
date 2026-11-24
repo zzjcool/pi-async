@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TaskRegistry } from "./registry.ts";
 import type { FailureKind, KillKind, TaskSnapshot, TaskStatus } from "./task.ts";
+import { MATCH_BUDGET_MS } from "./regex-worker.ts";
 
 export type PiCtx = ExtensionAPI;
 export interface NotifyPayload {
@@ -91,6 +92,39 @@ export function reminderGuidance(timeoutAt?: number, now = Date.now()): string {
   return `Still running. A hard deadline (taskTimeoutMs) kills it in ${remainingSec}s. Remind me sooner with async_extend (remindAfterMs), move the deadline (taskTimeoutMs), or stop it with async_kill.`;
 }
 
+/**
+ * Fixed guidance for a burned `output_matches` evaluation budget (REV-34 ruling 2 / #113).
+ *
+ * The notice is deliberately *not* a completion: the task keeps running, the round was a plain
+ * "not matched", nothing was killed. It exists because a condition that can never be evaluated to a
+ * verdict is a silent trap — the model would otherwise wait for a match that cannot arrive.
+ */
+export const MATCH_BUDGET_GUIDANCE =
+  "The watch's output_matches evaluation exceeded its 25 ms budget, so that round was treated as no match — not a failure, and the task was not killed. A pattern this expensive may never produce a verdict: prefer stdout_contains, or narrow the pattern (wide `*` / `|` combinations backtrack catastrophically).";
+
+/** Notice payload (REV-34): one burned-budget notice per task, never a terminal event. */
+export interface MatchBudgetNoticePayload {
+  taskId: string; name: string; status: TaskStatus; budgetMs: number; exceeded: number;
+  outputFile: string; guidance: string;
+}
+
+export function buildMatchBudgetXml(p: MatchBudgetNoticePayload): string {
+  const fields: Array<[string, unknown]> = [
+    ["task-id", p.taskId], ["name", p.name], ["status", p.status],
+    ["budget-ms", p.budgetMs], ["exceeded", p.exceeded],
+    ["output-file", p.outputFile], ["guidance", p.guidance],
+  ];
+  return `<async-watch-notice>${fields.map(([tag, value]) => `<${tag}>${escapeXml(value)}</${tag}>`).join("")}</async-watch-notice>`;
+}
+
+/** Structured twin of the notice XML, consumed by the TUI message renderer. */
+function buildMatchBudgetDetails(p: MatchBudgetNoticePayload): Record<string, unknown> {
+  return {
+    taskId: p.taskId, name: p.name, status: p.status,
+    budgetMs: p.budgetMs, exceeded: p.exceeded, outputFile: p.outputFile, guidance: p.guidance,
+  };
+}
+
 export function buildReminderXml(p: ReminderPayload): string {
   const fields: Array<[string, unknown]> = [
     ["task-id", p.taskId], ["name", p.name], ["status", p.status],
@@ -161,6 +195,38 @@ export async function sendReminder(
     const result = target.sendMessage(
       { customType: "async-task-reminder", content: buildReminderXml(payload), details: buildReminderDetails(payload) },
       { deliverAs: "followUp", ...(options.triggerTurn === false ? {} : { triggerTurn: true }) },
+    );
+    if (isThenable(result)) await result;
+  } catch {
+    return "failed";
+  }
+  return "queued";
+}
+
+/**
+ * Send the one-time burned-budget notice for `snapshot` (REV-34 ruling 2).
+ *
+ * Same channel as a reminder but **without** `triggerTurn`: this is information about a condition
+ * the model asked for, not a wake-up. The registry already guaranteed "once per task" before
+ * calling; this function must never throw (a notice is never allowed to fail a watch).
+ */
+export async function sendMatchBudgetNotice(pi: PiCtx, registry: TaskRegistry, snapshot: TaskSnapshot): Promise<NotifyOutcome> {
+  const payload: MatchBudgetNoticePayload = {
+    taskId: snapshot.taskId,
+    name: snapshot.name,
+    status: snapshot.status,
+    budgetMs: MATCH_BUDGET_MS,
+    exceeded: snapshot.matchBudgetExceeded ?? 0,
+    outputFile: String(snapshot.metadata.outputFile ?? ""),
+    guidance: MATCH_BUDGET_GUIDANCE,
+  };
+  // SAFETY: same runtime feature-detection as the reminder path (sendMessage is optional in older hosts).
+  const target = pi as unknown as { sendMessage?: (message: unknown, options: unknown) => unknown };
+  if (!target.sendMessage) return "failed";
+  try {
+    const result = target.sendMessage(
+      { customType: "async-watch-notice", content: buildMatchBudgetXml(payload), details: buildMatchBudgetDetails(payload) },
+      { deliverAs: "followUp", triggerTurn: false },
     );
     if (isThenable(result)) await result;
   } catch {

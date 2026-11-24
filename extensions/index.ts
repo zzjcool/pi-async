@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { clearTaskActivity, raiseTaskActivity, reportActivity } from "../src/core/bus.ts";
-import { sendCompletionNotification, sendReminder } from "../src/core/notify.ts";
+import { sendCompletionNotification, sendMatchBudgetNotice, sendReminder } from "../src/core/notify.ts";
 import { registerNudges } from "../src/context/nudges.ts";
 import { registerSkillDiscovery } from "../src/context/resources.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
@@ -424,6 +424,16 @@ export async function init(pi: PiCtx): Promise<void> {
           if (outcome === "failed") console.error(`pi-async: reminder delivery failed for ${snapshot.taskId}`);
         })
         .catch((error: unknown) => console.error(`pi-async: reminder delivery failed for ${snapshot.taskId}`, error));
+    },
+    // REV-34 (#113): one notice per task when an `output_matches` evaluation burns its 25 ms
+    // budget. Not a completion: no claim, no latch on `notified`, no turn — the registry already
+    // applied "once per task" before calling this hook.
+    onMatchBudgetNotice: (snapshot) => {
+      void sendMatchBudgetNotice(pi, registry, snapshot)
+        .then((outcome) => {
+          if (outcome === "failed") console.error(`pi-async: match-budget notice delivery failed for ${snapshot.taskId}`);
+        })
+        .catch((error: unknown) => console.error(`pi-async: match-budget notice delivery failed for ${snapshot.taskId}`, error));
     },
   });
 
