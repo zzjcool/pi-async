@@ -1,11 +1,22 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TaskRegistry } from "./registry.ts";
-import type { FailureKind, KillKind, TaskSnapshot, TaskStatus } from "./task.ts";
+import { hasObservedExitCode, snapshotLiveness, type FailureKind, type KillKind, type ProcessLiveness, type TaskSnapshot, type TaskStatus } from "./task.ts";
 import { MATCH_BUDGET_MS } from "./watch.ts";
 
 export type PiCtx = ExtensionAPI;
 export interface NotifyPayload {
-  taskId: string; name: string; status: TaskStatus; exitCode?: number;
+  taskId: string; name: string; status: TaskStatus;
+  /**
+   * D-07 (#116 / CONTRACT §27 REV-35): the observed exit status, or `null` when nothing was observed.
+   * `null` is never rendered as an exit code — it is the honest "exit unknown".
+   */
+  exitCode?: number | null;
+  /** D-07 (#116): `true` only when `exitCode` is an observed number. */
+  exitCodeKnown?: boolean;
+  /** D-07 (#116): the snapshot's liveness claim — `unknown` is a value, not an omission. */
+  processAlive?: ProcessLiveness;
+  /** D-07 (#116): `true` only when that claim came from an observation. */
+  processAliveKnown?: boolean;
   outputFile: string; summary?: string; guidance?: string;
   killKind?: KillKind;
   failureKind?: FailureKind;
@@ -28,7 +39,13 @@ const escapeXml = (value: unknown): string =>
 
 export function buildNotificationXml(p: NotifyPayload): string {
   const fields: Array<[string, unknown]> = [["task-id", p.taskId], ["name", p.name], ["status", p.status]];
-  if (p.exitCode !== undefined) fields.push(["exit-code", p.exitCode]);
+  // D-07 (#116 / §27 REV-35): a terminal notification states the liveness **claim**, including the
+  // case where there is none: `unknown` is written out, never silently dropped, and an unobserved
+  // exit status is never rendered as a code (that would make "no evidence" look like "exit 0").
+  if (p.processAlive !== undefined) fields.push(["process-alive", p.processAlive]);
+  if (p.processAliveKnown !== undefined) fields.push(["process-alive-known", String(p.processAliveKnown)]);
+  if (typeof p.exitCode === "number") fields.push(["exit-code", p.exitCode]);
+  if (p.exitCodeKnown !== undefined) fields.push(["exit-code-known", String(p.exitCodeKnown)]);
   if (p.killKind) fields.push(["kill-kind", p.killKind]);
   if (p.failureKind) fields.push(["failure-kind", p.failureKind]);
   fields.push(["output-file", p.outputFile]);
@@ -46,13 +63,31 @@ function buildNotificationDetails(p: NotifyPayload): Record<string, unknown> {
     taskId: p.taskId,
     name: p.name,
     status: p.status,
-    ...(p.exitCode === undefined ? {} : { exitCode: p.exitCode }),
+    ...(typeof p.exitCode === "number" ? { exitCode: p.exitCode } : {}),
+    ...(p.exitCodeKnown === undefined ? {} : { exitCodeKnown: p.exitCodeKnown }),
+    ...(p.processAlive === undefined ? {} : { processAlive: p.processAlive }),
+    ...(p.processAliveKnown === undefined ? {} : { processAliveKnown: p.processAliveKnown }),
     ...(p.killKind === undefined ? {} : { killKind: p.killKind }),
     ...(p.failureKind === undefined ? {} : { failureKind: p.failureKind }),
     ...(p.summary === undefined ? {} : { summary: p.summary }),
     ...(p.summaryTruncated === undefined ? {} : { summaryTruncated: p.summaryTruncated }),
     outputFile: p.outputFile,
     ...(p.guidance === undefined ? {} : { guidance: p.guidance }),
+  };
+}
+
+/**
+ * D-07 (#116 / CONTRACT §27 REV-35): the liveness facts a completion notification carries for
+ * `snapshot`. One definition for the payload builder, so the field table below and the payload can
+ * never disagree about what "unknown" means — `unknown` / `false` are values here, not omissions.
+ */
+export function notifyLivenessFields(
+  snapshot: Pick<TaskSnapshot, "processAlive" | "processAliveKnown" | "exitCode" | "exitCodeKnown">,
+): { processAlive: ProcessLiveness; processAliveKnown: boolean; exitCodeKnown: boolean } {
+  return {
+    processAlive: snapshotLiveness(snapshot),
+    processAliveKnown: snapshot.processAliveKnown === true,
+    exitCodeKnown: hasObservedExitCode(snapshot),
   };
 }
 

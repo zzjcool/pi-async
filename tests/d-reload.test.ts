@@ -396,3 +396,53 @@ test("session_start resends an unnotified terminal task exactly once (D-02 wirin
     rmSync(session.sessionDir, { recursive: true, force: true });
   }
 });
+
+/**
+ * D-07 (#116 / CONTRACT §27 REV-35): the *production* notification assembly must publish the
+ * liveness claim, and the one-line card must never print a code nobody saw.
+ *
+ * `tests/l-snapshot-honesty.test.ts` pins `notifyLivenessFields()` against the field table; this one
+ * pins that `onFinalize` actually feeds it — dropping the spread from `extensions/index.ts`, or
+ * printing `exit 0` / `exit null` in the card, would otherwise keep the suite green.
+ */
+test("a D4 completion notifies `processAlive: unknown` and the card omits the exit segment (#116)", async () => {
+  const session = freshSession("pi-async-d07-notify-");
+  const pids: number[] = [];
+  try {
+    const gen = makeGeneration(session.sessionDir, session.sessionId);
+    await init(gen.pi as never);
+    await gen.dispatch("session_start", { type: "session_start", reason: "startup" });
+    const task = await gen.call<{ taskId: string }>("async_run", {
+      command: "printf 'READY\\n'; sleep 30",
+      name: "d4-unknown",
+      mode: "background",
+      watch: { intervalMs: 1000, timeoutMs: 20_000, success_when: [{ type: "stdout_contains", value: "READY" }], failure_when: [], blind_checks: 3 },
+      notifyOnCompletion: true,
+    });
+    // Read the record from disk: `async_status` would latch `consumedAt` and suppress the send.
+    const snapshot = await waitForSnapshot(session.dataDir, task.taskId, (s) => s.status === "completed" && s.notified === true, "the settled and notified D4 task");
+    if (snapshot.pid !== undefined) pids.push(snapshot.pid);
+    assert.equal(snapshot.processAlive, null, "the snapshot says unknown, not exited");
+    assert.equal(snapshot.processAliveKnown, false);
+
+    const notification = gen.messages.map((entry) => entry.message).find((message) => message.customType === "async-task-notification");
+    assert.ok(notification, "the completion notification is sent");
+    const details = notification.details as Record<string, unknown>;
+    assert.equal(details.taskId, task.taskId);
+    assert.equal(details.processAlive, "unknown", "the payload carries the claim, not a default");
+    assert.equal(details.processAliveKnown, false);
+    assert.equal(details.exitCodeKnown, false);
+    assert.equal("exitCode" in details, false, "no exit code for a process nobody watched exit");
+    assert.match(String(notification.content), /<process-alive>unknown<\/process-alive>/);
+
+    const renderer = gen.renderers.get("async-task-notification");
+    assert.ok(renderer, "the completion card renderer is registered");
+    const card = renderer(notification).render(80)[0] ?? "";
+    assert.doesNotMatch(card, /exit/, `the card must not claim an exit status: ${card}`);
+
+    await gen.dispatch("session_shutdown", { type: "session_shutdown", reason: "quit" });
+  } finally {
+    pids.forEach(hardKill);
+    rmSync(session.sessionDir, { recursive: true, force: true });
+  }
+});

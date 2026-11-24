@@ -1,6 +1,6 @@
 import type { PiCtx } from "../core/notify.ts";
 import type { TaskRegistry } from "../core/registry.ts";
-import type { TaskSnapshot } from "../core/task.ts";
+import { formatExitStatus, isTerminal, snapshotLiveness, type TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
 import { MATCH_BUDGET_MS } from "../core/watch.ts";
@@ -101,6 +101,13 @@ export function detailStatusLines(task: TaskSnapshot, theme: Theme | null | unde
   const status = paint(theme, statusToken(task.status), task.status);
   const elapsed = paint(theme, "dim", formatDuration(task, now));
   const lines = [`${paint(theme, "dim", "status:")} ${status} · ${paint(theme, "dim", "elapsed:")} ${elapsed}`];
+  // D-07 (#116 / CONTRACT §27 REV-35): a terminal snapshot states what was observed. `unknown` is
+  // printed as `unknown` — never as `exited` — and an unobserved exit status is printed as
+  // `exit unknown`, never as `exit 0`. A pre-0.5.4 snapshot has no evidence field at all, so it
+  // reads `process: unknown` here too: the display never infers a death it cannot see.
+  if (isTerminal(task.status)) {
+    lines[0] = `${lines[0]!}${paint(theme, "dim", ` · process: ${snapshotLiveness(task)}`)}${paint(theme, "dim", ` · ${formatExitStatus(task.exitCode)}`)}`;
+  }
   // REV-34 (#113): a burned evaluation budget is a per-task counter, and the counter must be
   // readable where the task is read. The wording repeats the semantics: no-match, not a failure.
   const overBudget = task.matchBudgetExceeded ?? 0;

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { buildNotificationXml, sendCompletionNotification } from "../src/core/notify.ts";
+import { buildNotificationXml, notifyLivenessFields, sendCompletionNotification } from "../src/core/notify.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import type { TaskSnapshot, WatchSpec } from "../src/core/task.ts";
 import { makeSnapshot } from "./helpers/index.ts";
@@ -45,7 +45,10 @@ function notifyPayloadFromSnapshot(registry: TaskRegistry, snapshot: TaskSnapsho
     taskId: snapshot.taskId,
     name: snapshot.name,
     status: snapshot.status,
-    ...(snapshot.exitCode === undefined ? {} : { exitCode: snapshot.exitCode }),
+    // D-07 (#116): mirror the real assembly — a code only when one was observed, plus the liveness
+    // fields, so this fixture cannot drift from extensions/index.ts again.
+    ...(typeof snapshot.exitCode === "number" ? { exitCode: snapshot.exitCode } : {}),
+    ...notifyLivenessFields(snapshot),
     outputFile,
     ...(outputTail ? { summary: outputTail } : {}),
     ...(guidance ? { guidance } : {}),
