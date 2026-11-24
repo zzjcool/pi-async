@@ -21,7 +21,7 @@ import {
 import { stripLogControls } from "./output.ts";
 import { assertSafeEnvKeys, envNumber } from "./env.ts";
 import { capName, deriveName, isTaskStatus, isTerminal, type FailureKind, type KillKind, type RunOptions, type TaskSnapshot, type TaskStatus, type WatchSpec, type WaitOutcome } from "./task.ts";
-import { evalConditions, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
+import { evaluateConditionsDetailed, validateWatchSpec, WatchLoop, type WatchOutput } from "./watch.ts";
 
 export interface RegistryEvents {
   onFinalize(snapshot: TaskSnapshot): void;
@@ -32,6 +32,12 @@ export interface RegistryEvents {
    * (arming, backoff, suppression) instead of silently skipping it.
    */
   onReminder?(snapshot: TaskSnapshot): void;
+  /**
+   * REV-34 ruling 2 (#113): this task's `output_matches` evaluation burned its 25 ms budget for the
+   * first time. Fires **once per task** (latched in metadata, survives reload) so a pathological
+   * pattern cannot spam the session; the semantics are "treated as no match", never a failure.
+   */
+  onMatchBudgetNotice?(snapshot: TaskSnapshot): void;
 }
 export interface RegistryConfig {
   dataDir: string;
@@ -119,8 +125,9 @@ const MAX_LOG_WINDOW = 8 * 1024 * 1024;
  * A watch decides on the tail, so the read is bounded by the same defensive ceiling as any other
  * output read rather than loading the whole file: a marker that scrolled beyond this window is
  * invisible to the check, and a large log (the write cap defaults to 20 MiB) costs one bounded
- * read per interval instead of a full load. `output_matches` is then narrowed again to `MAX_MATCH_CHARS` (64K UTF-16 units) for ReDoS
- * containment — two different bounds for two different reasons.
+ * read per interval instead of a full load. `output_matches` is then narrowed again to `MAX_MATCH_CHARS`
+ * (64K UTF-16 units) — a memory/trade-off bound, not a ReDoS defence (REV-34); the eval budget is
+ * that defence — two different bounds for two different reasons.
  */
 const WATCH_READ_BYTES = MAX_LOG_WINDOW;
 /** Artifacts owned by one task; migrated wholesale between data dirs (single source of truth). */
@@ -364,6 +371,7 @@ export class TaskRegistry {
       readOutput: () => this.readWatchOutput(taskId),
       getExitCode: () => this.tasks.get(taskId)?.exitCode,
       onSuccess: (detail) => this.markWatchSuccess(taskId, detail),
+      onMatchBudgetExceeded: (count) => this.noteMatchBudgetExceeded(taskId, count),
       onFailure: () => { void this.kill(taskId, "watch_failure").catch((error: unknown) => console.error(`pi-async: watch failure kill failed for task ${taskId}`, error)); },
       onBlindExhausted: () => {
         const current = this.tasks.get(taskId);
@@ -441,7 +449,7 @@ export class TaskRegistry {
     });
     task.pid = handle.pid;
     live.exitObserved = handle.exitObserved;
-    live.exit = handle.exit.then(({ code }) => {
+    live.exit = handle.exit.then(async ({ code }) => {
       // A retired generation no longer owns this process: the next generation adopted it via
       // reloadFromDisk and its snapshot wins (no finalize, no persist, no emit). REV-28a (0.4.2): a
       // later `configure()` on this same instance revives it and retires this handle, so the
@@ -460,13 +468,26 @@ export class TaskRegistry {
       // bookkeeping above (timer, capped, output) already happened.
       if (isTerminal(task.status)) return { code };
       task.exitCode = code;
-      if (task.watch) {
+      const watchSpec = task.watch;
+      if (watchSpec) {
         try {
           const streams = this.readWatchOutput(task.taskId);
-          if (evalConditions(task.watch.failure_when, { ...streams, exitCode: code })) this.finalize(task, "killed", undefined, "watch_failure");
-          else if (evalConditions(task.watch.success_when, { ...streams, exitCode: code })) {
-            task.metadata.watchSuccess = `success_when matched after process exit: ${JSON.stringify(task.watch.success_when)}`;
-            this.finalize(task, "completed", code);
+          const failureRound = await evaluateConditionsDetailed(watchSpec.failure_when, { ...streams, exitCode: code });
+          // REV-34 ruling 5 (REV-R5): the exit-time evaluation now awaits the budgeted worker, so
+          // re-read the invariants from above — a terminal snapshot settled while the regex ran is
+          // the record, and a retired generation owns nothing here.
+          if (this.suspended || live.retired || isTerminal(task.status)) return { code };
+          // REV-34 ruling 2: the exit path is a round like any other and credits the same counter.
+          if (failureRound.budgetExceeded > 0) this.noteMatchBudgetExceeded(task.taskId, failureRound.budgetExceeded);
+          if (failureRound.status === "matched" && failureRound.matched) this.finalize(task, "killed", undefined, "watch_failure");
+          else {
+            const successRound = await evaluateConditionsDetailed(watchSpec.success_when, { ...streams, exitCode: code });
+            if (this.suspended || live.retired || isTerminal(task.status)) return { code };
+            if (successRound.budgetExceeded > 0) this.noteMatchBudgetExceeded(task.taskId, successRound.budgetExceeded);
+            if (successRound.status === "matched" && successRound.matched) {
+              task.metadata.watchSuccess = `success_when matched after process exit: ${JSON.stringify(watchSpec.success_when)}`;
+              this.finalize(task, "completed", code);
+            }
           }
         } catch { /* WatchLoop owns infrastructure-failure accounting while active. */ }
       }
@@ -708,6 +729,23 @@ export class TaskRegistry {
   }
 
   markWatchSuccess(taskId: string, detail: string): void { const task = this.tasks.get(taskId); if (!task || isTerminal(task.status)) return; task.metadata.watchSuccess = detail; this.finalize(task, "completed", task.exitCode); }
+  /**
+   * REV-34 ruling 2 (#113): `count` of this round's `output_matches` evaluations ran out of budget.
+   * Counter only — the round is a plain "not matched" round: no `failureKind`, no kill, no change to
+   * `blind_checks`/`timeoutMs`. The first occurrence per task tells the model once.
+   */
+  private noteMatchBudgetExceeded(taskId: string, count: number): void {
+    const task = this.tasks.get(taskId);
+    if (!task || isTerminal(task.status)) return;
+    task.matchBudgetExceeded = (task.matchBudgetExceeded ?? 0) + count;
+    const firstTime = task.metadata.matchBudgetNotified !== true;
+    if (firstTime) task.metadata.matchBudgetNotified = true;
+    // One persist + one state emit carries both the counter and the latch.
+    this.emitState(task);
+    if (!firstTime) return;
+    try { this.events.onMatchBudgetNotice?.(task); } catch (error) { console.error(`pi-async: match-budget notice failed for task ${taskId}`, error); }
+  }
+
   get(taskId: string): TaskSnapshot | undefined { return this.tasks.get(taskId); }
 
   /**

@@ -103,30 +103,30 @@ test("validateWatchSpec rejects nested-quantifier regexes (#24)", () => {
   if (!result.ok) assert.match(result.error, /nested quantifiers|ReDoS/i);
 });
 
-test("output_matches evaluates only the last MAX_MATCH_CHARS (#24)", () => {
+test("output_matches evaluates only the last MAX_MATCH_CHARS (#24)", async () => {
   assert.ok(MAX_MATCH_CHARS > 0);
   const needle = "UNIQUE_TAIL_MARKER_XYZ";
   const output = "a".repeat(MAX_MATCH_CHARS + 100) + needle;
   assert.equal(
-    evalConditions([{ type: "output_matches", regex: needle }], { output, stdout: output, stderr: "" }),
+    await evalConditions([{ type: "output_matches", regex: needle }], { output, stdout: output, stderr: "" }),
     true,
   );
   // Marker only in the dropped prefix must not match.
   const buried = needle + "b".repeat(MAX_MATCH_CHARS + 10);
   assert.equal(
-    evalConditions([{ type: "output_matches", regex: needle }], { output: buried, stdout: buried, stderr: "" }),
+    await evalConditions([{ type: "output_matches", regex: needle }], { output: buried, stdout: buried, stderr: "" }),
     false,
   );
 });
 
-test("output_matches uses multiline flag so ^/$ bind per line (#48 align with Loom #64)", () => {
+test("output_matches uses multiline flag so ^/$ bind per line (#48 align with Loom #64)", async () => {
   assert.equal(
-    evalConditions([{ type: "output_matches", regex: "^ready$" }], { output: "noise\nready\nmore", stdout: "noise\nready\nmore", stderr: "" }),
+    await evalConditions([{ type: "output_matches", regex: "^ready$" }], { output: "noise\nready\nmore", stdout: "noise\nready\nmore", stderr: "" }),
     true,
   );
   // Without m this would fail; with m it matches the middle line.
   assert.equal(
-    evalConditions([{ type: "output_matches", regex: "^ready$" }], { output: "ready", stdout: "ready", stderr: "" }),
+    await evalConditions([{ type: "output_matches", regex: "^ready$" }], { output: "ready", stdout: "ready", stderr: "" }),
     true,
   );
 });

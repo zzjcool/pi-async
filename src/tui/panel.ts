@@ -3,6 +3,7 @@ import type { TaskRegistry } from "../core/registry.ts";
 import type { TaskSnapshot } from "../core/task.ts";
 import { stripAnsi, visibleText } from "../core/output.ts";
 import { formatDuration } from "../core/duration.ts";
+import { MATCH_BUDGET_MS } from "../core/watch.ts";
 import { displayWidth, fitWidth, truncateToWidth } from "./width.ts";
 import { clearDoneStatus, survivesClearCutoff } from "./status.ts";
 import { tuiHost } from "./host.ts";
@@ -99,7 +100,17 @@ export function detailTitleLines(task: { name: string; taskId: string }, theme: 
 export function detailStatusLines(task: TaskSnapshot, theme: Theme | null | undefined, now: number): string[] {
   const status = paint(theme, statusToken(task.status), task.status);
   const elapsed = paint(theme, "dim", formatDuration(task, now));
-  return [`${paint(theme, "dim", "status:")} ${status} · ${paint(theme, "dim", "elapsed:")} ${elapsed}`];
+  const lines = [`${paint(theme, "dim", "status:")} ${status} · ${paint(theme, "dim", "elapsed:")} ${elapsed}`];
+  // REV-34 (#113): a burned evaluation budget is a per-task counter, and the counter must be
+  // readable where the task is read. The wording repeats the semantics: no-match, not a failure.
+  const overBudget = task.matchBudgetExceeded ?? 0;
+  if (overBudget > 0) {
+    lines.push(
+      `${paint(theme, "dim", "output_matches:")} ${paint(theme, "accent", `${overBudget} abandoned verdicts (${MATCH_BUDGET_MS} ms budget)`)}` +
+        `${paint(theme, "dim", " · no verdict, not a failure")}`,
+    );
+  }
+  return lines;
 }
 
 export function commandSection(command: unknown, theme: Theme | null | undefined, budget: number): string[] {

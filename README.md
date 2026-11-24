@@ -270,6 +270,7 @@ non-zero exit plus the taskId line; `off` reproduces the pre-0.5.0 early exit.
 - `blind_checks` (default 3) counts **only infrastructure errors** (e.g. the output file could not be read). "Not yet decidable" states — process still running, JSON not valid yet — stay pending and never accumulate blind checks.
 - `output_matches` sees only the trailing **64K characters** of output (UTF-16 code units, not bytes), so a marker far from the tail falls out of the window — anchor accordingly. `stdout_contains` / `stderr_contains` scan the captured stream, but every poll reads only the last 8 MiB, so anything older is invisible to every condition.
 - `output_matches` compiles with the `m` flag, so `^` / `$` are line boundaries.
+- Every `output_matches` evaluation runs in a worker thread under a hard **25 ms** budget, so a catastrophic pattern can never freeze the session (a 26-code-unit input to `(a|a)*$` used to block the event loop for 5 s). Going over budget is **not** a failure: that round's verdict is **abandoned** and counts as no match, `blind_checks` and `timeoutMs` are untouched, the process is never killed, the per-task `matchBudgetExceeded` counter shows up in `async_status` and in the task detail, and the first occurrence is reported once. Because the verdict was abandoned rather than measured, a real match or a real failure can be missed on such a round — a pattern that keeps burning its budget may never produce a verdict at all, so prefer `stdout_contains` or narrow the regex.
 
 ## Data directory
 

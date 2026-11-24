@@ -111,6 +111,12 @@ export interface TaskSnapshot {
   /** Process liveness seen when the snapshot was produced (false once finalized). */
   processAlive?: boolean;
   /**
+   * 0.5.3 (#113 / REV-34): how many `output_matches` evaluations exceeded the 25 ms budget.
+   * An over-budget round is treated as **not matched** — never a failure, never a kill. Only
+   * increases, and it stays readable on a terminal snapshot.
+   */
+  matchBudgetExceeded?: number;
+  /**
    * 0.4.3 (CONTRACT §7.2): the terminal state was already handed to the model by a tool that
    * returned it (`async_wait` / `async_status` / `async_logs`). One terminal event is told once, to
    * exactly one consumer — a consumed task never produces a completion notification.

@@ -156,7 +156,11 @@ type Condition =
     上限 `WATCH_READ_BYTES` = `MAX_LOG_WINDOW`（8 MiB，**每流各一次**）。不再整文件 `readFileSync`。
     滚出读取窗口的输出对**任何**条件都不可见。
   - **正则窗口**：`output_matches` 在读取窗口内再截到尾部 `MAX_MATCH_CHARS`（64×1024，按
-    **UTF-16 码元**截断，不是字节）以限制 ReDoS 影响面。
+    **UTF-16 码元**截断，不是字节）。它是**内存 / 取舍边界**——把一次求值要拷贝、要走的主体会
+    有界——**不是 ReDoS 防线，也不是可接受的工作量上界**：引擎代价随主体长度指数增长，窗口只决定
+    「最多能长到多长」；而封顶值早在 16 码元就贴着预算（19 码元越过 25 ms、26 码元 5 s，
+    `docs/reports/redos-benchmark.md` §4.2），所以对任何有用长度的输入它都挡不住（REV-34 修正本条
+    此前的因果陈述）。求值侧的防线是 REV-34 的**硬预算 + 可抢占执行**，不是窗口大小。
   - 因此可见范围：`stdout_contains` / `stderr_contains` 是**尾部 8 MiB**（不是无限）；
     `json_path_exists` 只能解析尾部 8 MiB 内的 JSON（超大 JSON 会因此永远 `pending`，由进程退出、`timeoutMs` 或 `async_kill` 终结 watch）；
     `output_matches` 是尾部 64K 码元；`exit_code` 只看退出码，与窗口无关。
@@ -1161,7 +1165,7 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 | 窗口 | 值 | 适用范围 | 理由 |
 |---|---|---|---|
 | 读取窗口 | 8 MiB（`MAX_LOG_WINDOW`） | 所有条件 | 内存 / CPU 有界 |
-| 正则窗口 | 64K 码元（`MAX_MATCH_CHARS`） | 仅 `output_matches` | 限制 ReDoS 作用面 |
+| 正则窗口 | 64K 码元（`MAX_MATCH_CHARS`） | 仅 `output_matches` | 内存 / 取舍边界——拷贝量与 `slice` 有界；**不是** ReDoS 防线，也不是工作量上界（REV-34 修正） |
 
 滚出读取窗口的输出对**所有**条件都不可见。这是有意语义（watch 决定的是「最近发生了什么」），
 不是实现妥协。**补救路径是 `output-file` 路径 + `bash`**（如 `grep -n marker <file>`）；
@@ -1191,7 +1195,8 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 
 ### 21.1 详情页把 stdout 当主视图（REV-26）
 
-- **详情体是一个视口（#101 / REV-31 起）**：`budget = height - 2`；`header` = title + status（2 行）与
+- **详情体是一个视口（#101 / REV-31 起）**：`budget = height - 2`；`header` = title + status
+  （**1–2 行**：`matchBudgetExceeded > 0` 的任务多一行求值预算计数，REV-34；其余任务仍是 2 行）与
   `footer` = `actionError`/kill 确认提示 + 键位提示（1–3 行）固定，`viewportRows = budget - header - footer`
   是中间内容的窗口。内容 = 三条分隔线 + command 行 + metadata 行 + output 标签 + **全部**输出行；
   `scroll` = 距尾部的行数（0 = 尾部），`pageStep = viewportRows`。0.5.0 的实现把中间内容**永久**折进
@@ -1415,7 +1420,8 @@ Async task admission is closed (registry suspended: a reload or resume retired t
   `selected` 再改 `scroll`，而详情渲染读的是 `selected` —— 滚一下日志就跳到相邻任务（与 README 的
   「in task details, scroll output」冲突）。换任务新增 **`[`（上一个）/`]`（下一个）**；列表模式键义不变
   （`↑`/`↓`/`j`/`k` 仍是选择，`k` 不是 kill，REV-18）。
-- **D2（折叠区可达）**：采用 issue 的 **(a) 统一视口** —— 详情体 = 固定 header（title + status）+ 可滚动
+- **D2（折叠区可达）**：采用 issue 的 **(a) 统一视口** —— 详情体 = 固定 header（title + status，
+  `matchBudgetExceeded > 0` 时为 1–2 行，见 REV-34）+ 可滚动
   内容（三条分隔线 + command + metadata + output 标签 + **全部**输出行）+ 固定 footer（`actionError` /
   kill 二次确认 + 键位提示）。0.5.0 的 `withBodyBudget` 把中间内容**永久**折进 `… (+K lines)`，而 `scroll`
   只作用于输出尾窗，折叠区没有任何按键可达；现在标记是「窗口上方被隐藏的行数」，`↑`/`k` 滚一行、
@@ -1704,3 +1710,100 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 置回默认 `0` 即与 0.5.x 完全一致）。
 
 **证据**：`docs/reports/storage-lifecycle.md` §11（逐项断言、变异「撤掉即红」、仍存留的已知边界）。
+
+## 26. 条件求值可抢占：硬预算 + 超预算 = 未命中（REV-34，冻结）
+
+**事故面（量得到，不是形态学风险）**：`output_matches` 的正则求值全程同步跑在主线程上
+（`src/core/watch.ts` 的 `evaluateCondition`），于是一个**26 码元**的输入就能把宿主冻住：
+
+- `(a|a)*$` + 主体 `"a"*25 + "!"`：冷路径 **5.02 s**（热 781 ms，`docs/reports/redos-benchmark.md` §4.2）；
+  19 码元就越过 25 ms（冷 39.0 ms），而良性形状跑满 64K 只要 0.06 ms（冷 0.14 ms）。
+- 期间事件循环完全停摆：先上弦的 **100 ms 定时器**被拖到 **3.12 s** 才触发（同上 §5（2））。
+  这意味着 `timeoutMs` / `intervalMs`（两者都在同步求值**返回之后**才被读到）**无法抢占**，
+  TUI、其它任务的读取、通知投递一起被冻。
+- 现有唯一守卫是形状黑名单（`NESTED_QUANTIFIER`，`src/core/watch.ts`），4 个已知形状只挡住
+  `(a+)+$`；`(a|a)*$` / `(a|aa)+$` / `(.*a){20}$` 都能通过校验。形状匹配**不可能完备**（`docs/reports/redos-benchmark.md` §6 的 REV-R3），
+  所以它只能算深度防御。
+
+**影响面（改了什么，按 §16 的格式）**：
+
+- **新增源码** `src/core/regex-worker.ts`（worker 池：复用、硬预算、越界 terminate + 重建、按 pattern
+  缓存 `RegExp`）。`output_matches` 是唯一走它的条件类型。
+- **内部 API 变异步**：`evalConditions` / `evaluateConditionsDetailed`（`src/core/watch.ts`）由同步变
+  `async`；`evaluateConditionsDetailed` 由私有变导出，返回里多一个 `budgetExceeded` 计数。对嵌入式调用方
+  是源码级破坏（必须 `await`），对工具面**不动**（§12 冻结的 5/6 个工具与其 schema 一字未改）。
+- **快照新增可选字段** `matchBudgetExceeded?: number`（`TaskSnapshot`，`src/core/task.ts`）：因此
+  `async_status` 的每行多一个**可选**键。**判定为非破坏**——这是新增可选字段，不是修改既有字段的语义，
+  不迁移、不带默认值，旧快照读入后为 `undefined`（`async_status` 与详情把它当 0）。§12 的「修改返回
+  payload 字段」判据针对的是**既有字段意义的改变**，本条不属于那类。
+- **新消息类型 `async-watch-notice`**（`src/core/notify.ts`，`customType` 与 completion/reminder 同级）：
+  `deliverAs: "followUp"`、**`triggerTurn: false`**——它是信息，不该开一个新回合；模型在下一次回合边界
+  读到它，用户侧在 transcript 里看到它。每条任务只发一次（闩锁 `metadata.matchBudgetNotified`，随快照
+  持久化，reload 不重播）。与 completion/reminder 一样，这条消息**没有专用 renderer**（宿主按通用
+  `customType` 消息渲染），与既有提醒一致。
+- **快照 metadata 新增键** `matchBudgetNotified`（布尔闩锁，模型在 `async_status` 里看得到）。
+- **TUI 详情**多一行（仅 `matchBudgetExceeded > 0`）：header 因此是 1–2 行，§21.1 / §24 的「2 行」已
+  按本条改写；视口算术不变（渲染取 `header.length`），超预算任务的中间窗口少一行。
+- **不改**：工具面与 schema、`MAX_MATCH_CHARS`（仍是 64K）、读取窗口（8 MiB）、`blind_checks` /
+  `timeoutMs` / `intervalMs` 语义、REV-4 的三条 kill 路径、黑名单规则本身。
+
+**裁决 1（可抢占是硬要求）**：`output_matches` 的求值必须跑在**可被抢占的执行上下文**里（独立 worker
+thread），**不得**留在主线程上。「求值完再检查耗时」在同进程里是无效实现——上一条实测已经证明期间什么
+都跑不了。单次求值（一条条件一次）的**硬预算 25 ms**：依据是良性形状 < 0.1 ms（冷 0.14–0.33 ms，仍有
+~75–100× 余量），而三种病态形状都在 28 码元以内越线。worker **复用**；越预算即 `terminate()` 并重建，
+**worker 冷启动不计入预算**（否则良性形状第一轮就会被误判超预算）。预算只在消息投递之后计时。
+
+**裁决 2（超预算的语义，钉死）**：预算越界 **不是**失败，也**不是**基础设施错误：
+
+- 该轮该条件视为**未命中**（`matched: false`），`pending` 语义照旧，**不累计** `blind_checks`，
+  不修改 `timeoutMs` / `intervalMs` 的行为，**绝不**因此把任务判失败或 kill（REV-4 的三条杀路径不动）。
+- 每任务一个计数器 `matchBudgetExceeded`（只增不减，非终态与终态快照都保留），出现在 `async_status`
+  的返回与 TUI 详情里。
+- 每条任务**只提示一次**（不刷屏）：首次越界发一条提示，文案说明「条件求值超预算，已按未命中处理」，
+  之后静默；计数继续累加。提示是**通知**，不是终态，不改 `status` / `failureKind`。
+- **同一轮内的先后不变**：`failure_when` 先求值、再求值 `success_when`（既有 OR / 首命中语义，§4）。
+  因此「`failure_when` 越预算 + `success_when` 命中」按 **success 结算**——放弃一次失败裁决不比让一个
+  真命中落空更保守，而 `matchBudgetExceeded` 仍记这一轮（用户能从计数看出这一轮有一次未完成的裁决）。
+
+**裁决 3（64K 窗口的理由改正）**：`MAX_MATCH_CHARS`（64K 码元）保留，但它的理由是**内存 / 取舍边界**
+（一次求值要拷贝、要 `slice` 的主体会被有界），**不是**「限制 ReDoS 影响面」。§4 的「正则窗口」条目与 §20.2 的窗口表格行已按本条改写——原来那句话被 19 码元 / 26 码元两个数据点**证伪**：距 25 ms 预算，
+只差 3 个码元。相应地 `src/core/watch.ts` 与 `src/core/registry.ts` 里把窗口说成 ReDoS 防线的注释同步改正。
+
+**裁决 4（黑名单的定位）**：`rejectDangerousRegex` 是**深度防御**，不是防线。`(.*a){n}` 一类「有界重复
+套 `.*`」永远挡不住，所以**防线是运行期预算**，不是形状判断。不做静态分析判「这个模式会不会爆」，也不换
+正则引擎（另拆）。
+
+今天 `(a|a)*$` / `(a|aa)+$` / `(.*a){20}$` **仍然通过校验**——这是有意的：#113 的复现形状必须能被求值，
+否则本条没有可测的靶子（`tests/w3-preemption.test.ts` 的量具就是它们）。将来若收紧黑名单（例如补上
+「含 `|` 的组 + 量词」），**必须同时**把 w3 的量具换成一个不被新规则拒绝的病态形状，并在同一次改动里
+证明预算仍然咬得住；否则「收紧」只是把测试逼红，不改变防线。
+
+**裁决 4b（超预算不是「测量到的未命中」）**：预算越界的字面语义是**放弃这一轮的裁决**（reason 同裁决 2：
+按未命中处理）。用户可见文案必须说清这一点——`(a|a)*$` 穷举完指数路径后**会真的匹配**（`docs/reports/redos-benchmark.md`
+§5（1）），所以一次越界可能**漏掉一个真命中**（`success_when`：一直不命中，最后由 `timeoutMs` 终结）或
+**漏掉一次真失败**（`failure_when`）。提示与详情行的措辞因此是「abandoned verdict / no verdict」，不是
+「确定的未命中」；能不能接受这个取舍由用户按提示换 `stdout_contains` 或收窄正则。
+
+**裁决 5（异步化后的交错，REV-R5）**：求值变成 `await` 之后，同一个 task 可能在等待期间被 watch
+timeout / 用户 `async_kill` / 代际 retire 终结。恢复执行时**必须重新判** `isTerminal(status)`（以及
+`stopped` / `suspended` / `retired`），终态快照是唯一记录，`await` 之后不得重写终态，也不得再
+`scheduleNext()`。进程退出路径（`live.exit.then` 里那次求值）同样走预算，同样遵守这条。
+
+**已知限制（接受，不修）**：
+
+- worker **起不来**（平台限制、被禁）时，该轮记为 `error`（既有语义：`blind_checks` 计一次基础设施
+  失败），并在 stderr 打一行原因。不静默放行、也不偷偷退回同步求值（那会复活本条要修的冻结）。
+- 每轮把 ≤64K 码元的**主体** `postMessage` 给 worker 是一次拷贝（128 KB 上限），量级在微秒。
+- `readWatchOutput` 每轮同步读 8 MiB 尾部（REV-25）自身的停顿不在本条范围；它有自己的界。
+
+**回退开关**：无（这是缺陷修复；需要回到旧行为只能回退代码）。
+
+**验收**（`docs/reports/watch-preemption.md` 是证据）：
+
+1. 对 `("a"*29+"!")`（30 码元）与 `("a"*25+"!")`（26 码元）配 `(a|a)*$` 求值时，**10 ms 定时器在
+   200 ms 内触发**。修前两者都在同步求值里把定时器拖到秒级（28 码元实测 3.12 s，§5（2）已经量过；
+   26/30 码元同一个量级）。
+2. 同一轮 `async_status` 显示 `matchBudgetExceeded ≥ 1`，任务**不是** `failed`；`timeoutMs` / `intervalMs`
+   在挂住场景下仍按预期生效（修前它们被饿死）。
+3. 良性模式与 64K 良性输入的命中结果与 `main` **逐字相同**（对照表）。
+4. 变异必红：① 去掉预算回到同步求值 → 验收 1 红；② 把超预算当失败 → 验收 2 红。
