@@ -2,6 +2,25 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## 0.5.4 — 2026-11-24（快照不再撒谎：进程存活三态）
+
+快照不再撒谎（#116 / D-07 裁决 B）：终态快照**不声称**进程存活，不知道就写 `null` 并说明"不知道"。
+契约修订见 `docs/CONTRACT.md` §27（REV-35）。`package.json` 版本不动（由 release 提交统一抬）。
+
+### Changed
+
+- **`processAlive` 从二态变三态**：此前 `finalize` 无条件写 `processAlive: false`，而 D4 场景（`watch` 命中、
+  进程仍在、`status = completed`）会让快照与同一瞬间 `isProcessAlive() === true` 直接矛盾。现在只在
+  **观测到退出**时写 `false`；没观测到写 `null`，并配 `processAliveKnown: boolean`（仅当有证据为 `true`）。
+  通知字段表新增 `process-alive` / `process-alive-known` / `exit-code-known`。
+- **收养任务的退出码不再"拿到又丢掉"**（#81 的 3.3）：退役代的退出回调把观测到的码合并写回已持久化快照
+  （只碰 `exitCode` / `exitCodeKnown`，不动 `status` / `finishedAt`），收养代结算时读取 —— 同进程 `/reload`
+  拿得到；跨进程仍是 `null` + `false`，不假装。
+- **`killed` 行不带退出码**：结论是 `killKind`。否则 timeout kill 会按"退出事件 / `killTree` 谁先到"记 `1` 或
+  `null` —— 不确定的东西不记。
+- **显示层单一判据**：`snapshotLiveness` / `formatExitStatus` / `exitSuffix` 由 TUI 详情、hold/`pi -p` 结果行、
+  完成卡片共用，"未知"只在一处定义，不会各页各说法。旧快照没有这两个字段时一律显示「未知」，不推断、不迁移。
+
 ## 0.5.3 — 2026-11-24（条件求值可抢占；含 0.5.1 详情视口与 0.5.2 存储生命周期）
 
 > 本节与下面两节在同一次发布里出厂：0.5.1 与 0.5.2 当时「不发版、不打 tag」，所以它们的
