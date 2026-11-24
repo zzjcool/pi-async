@@ -10,7 +10,13 @@ export interface WatchOutput {
 }
 
 /**
- * Cap the regex subject so catastrophic patterns cannot grow without bound (#24).
+ * Cap the regex subject (REV-25 / #24).
+ *
+ * This is a **memory / trade-off bound**, not a ReDoS defence: it keeps the subject a single
+ * evaluation has to copy and `slice` bounded. Backtracking work is NOT bounded by it — 19 code
+ * units already blow a 25 ms budget and 26 code units froze the loop for 5 s
+ * (`docs/reports/redos-benchmark.md` §4.2). The defence against catastrophic shapes is the
+ * preemptible per-eval budget (REV-34), never the window size.
  *
  * The value is a count of **UTF-16 code units** (`String.length` / `String.prototype.slice`), not
  * bytes — the old name `MAX_OUTPUT_MATCH_BYTES` claimed otherwise and was misleading.
@@ -20,6 +26,9 @@ export const MAX_MATCH_CHARS = 64 * 1024;
 /**
  * Classic exponential-backtracking shape: a group that itself ends with a
  * quantifier, then another quantifier — e.g. (a+)+ / (a*)* / (a|b+)+.
+ *
+ * Depth defence only (REV-34 ruling 4): shape matching can never be complete — `(a|a)*$` and
+ * `(.*a){20}$` pass this check and still hang — so the real defence is the runtime budget.
  * Conservative; does not catch every polynomial case.
  */
 const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*]\)\s*[+*]/;

@@ -156,7 +156,10 @@ type Condition =
     上限 `WATCH_READ_BYTES` = `MAX_LOG_WINDOW`（8 MiB，**每流各一次**）。不再整文件 `readFileSync`。
     滚出读取窗口的输出对**任何**条件都不可见。
   - **正则窗口**：`output_matches` 在读取窗口内再截到尾部 `MAX_MATCH_CHARS`（64×1024，按
-    **UTF-16 码元**截断，不是字节）以限制 ReDoS 影响面。
+    **UTF-16 码元**截断，不是字节）。它是**内存 / 取舍边界**——把一次求值要拷贝、要走的主体会
+    有界——**不是 ReDoS 防线**：实测 19 码元就越过 25 ms、26 码元冻死 5 s（`docs/reports/redos-benchmark.md`
+    §4.2），影响面与窗口大小无关（REV-34 修正本条此前的因果陈述）。求值侧的防线是 REV-34 的
+    **硬预算 + 可抢占执行**，不是窗口大小。
   - 因此可见范围：`stdout_contains` / `stderr_contains` 是**尾部 8 MiB**（不是无限）；
     `json_path_exists` 只能解析尾部 8 MiB 内的 JSON（超大 JSON 会因此永远 `pending`，由进程退出、`timeoutMs` 或 `async_kill` 终结 watch）；
     `output_matches` 是尾部 64K 码元；`exit_code` 只看退出码，与窗口无关。
@@ -1161,7 +1164,7 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 | 窗口 | 值 | 适用范围 | 理由 |
 |---|---|---|---|
 | 读取窗口 | 8 MiB（`MAX_LOG_WINDOW`） | 所有条件 | 内存 / CPU 有界 |
-| 正则窗口 | 64K 码元（`MAX_MATCH_CHARS`） | 仅 `output_matches` | 限制 ReDoS 作用面 |
+| 正则窗口 | 64K 码元（`MAX_MATCH_CHARS`） | 仅 `output_matches` | 内存 / 取舍边界——拷贝量与 `slice` 有界；**不是** ReDoS 防线（REV-34 修正） |
 
 滚出读取窗口的输出对**所有**条件都不可见。这是有意语义（watch 决定的是「最近发生了什么」），
 不是实现妥协。**补救路径是 `output-file` 路径 + `bash`**（如 `grep -n marker <file>`）；
@@ -1704,3 +1707,65 @@ Async task admission is closed (registry suspended: a reload or resume retired t
 置回默认 `0` 即与 0.5.x 完全一致）。
 
 **证据**：`docs/reports/storage-lifecycle.md` §11（逐项断言、变异「撤掉即红」、仍存留的已知边界）。
+
+## 26. 条件求值可抢占：硬预算 + 超预算 = 未命中（REV-34，冻结）
+
+**事故面（量得到，不是形态学风险）**：`output_matches` 的正则求值全程同步跑在主线程上
+（`src/core/watch.ts` 的 `evaluateCondition`），于是一个**26 码元**的输入就能把宿主冻住：
+
+- `(a|a)*$` + 主体 `"a"*25 + "!"`：冷路径 **5.02 s**（热 781 ms，`docs/reports/redos-benchmark.md` §4.2）；
+  19 码元就越过 25 ms（冷 39.0 ms），而良性形状跑满 64K 只要 0.06 ms（冷 0.14 ms）。
+- 期间事件循环完全停摆：先上弦的 **100 ms 定时器**被拖到 **3.12 s** 才触发（同上 §5（2））。
+  这意味着 `timeoutMs` / `intervalMs`（两者都在同步求值**返回之后**才被读到）**无法抢占**，
+  TUI、其它任务的读取、通知投递一起被冻。
+- 现有唯一守卫是形状黑名单（`NESTED_QUANTIFIER`，`src/core/watch.ts`），4 个已知形状只挡住
+  `(a+)+$`；`(a|a)*$` / `(a|aa)+$` / `(.*a){20}$` 都能通过校验。形状匹配**不可能完备**（REV-R3 见下），
+  所以它只能算深度防御。
+
+**裁决 1（可抢占是硬要求）**：`output_matches` 的求值必须跑在**可被抢占的执行上下文**里（独立 worker
+thread），**不得**留在主线程上。「求值完再检查耗时」在同进程里是无效实现——上一条实测已经证明期间什么
+都跑不了。单次求值（一条条件一次）的**硬预算 25 ms**：依据是良性形状 < 0.1 ms（冷 0.14–0.33 ms，仍有
+~75–100× 余量），而三种病态形状都在 28 码元以内越线。worker **复用**；越预算即 `terminate()` 并重建，
+**worker 冷启动不计入预算**（否则良性形状第一轮就会被误判超预算）。预算只在消息投递之后计时。
+
+**裁决 2（超预算的语义，钉死）**：预算越界 **不是**失败，也**不是**基础设施错误：
+
+- 该轮该条件视为**未命中**（`matched: false`），`pending` 语义照旧，**不累计** `blind_checks`，
+  不修改 `timeoutMs` / `intervalMs` 的行为，**绝不**因此把任务判失败或 kill（REV-4 的三条杀路径不动）。
+- 每任务一个计数器 `matchBudgetExceeded`（只增不减，非终态与终态快照都保留），出现在 `async_status`
+  的返回与 TUI 详情里。
+- 每条任务**只提示一次**（不刷屏）：首次越界发一条提示，文案说明「条件求值超预算，已按未命中处理」，
+  之后静默；计数继续累加。提示是**通知**，不是终态，不改 `status` / `failureKind`。
+
+**裁决 3（64K 窗口的理由改正）**：`MAX_MATCH_CHARS`（64K 码元）保留，但它的理由是**内存 / 取舍边界**
+（一次求值要拷贝、要 `slice` 的主体会被有界），**不是**「限制 ReDoS 影响面」。§4（`:159`）与 §20.2
+（`:1164`）的旧措辞已按本条改写——原来那句话被 19 码元 / 26 码元两个数据点**证伪**：影响面与窗口大小
+无关。相应地 `src/core/watch.ts` 与 `src/core/registry.ts` 里把窗口说成 ReDoS 防线的注释同步改正。
+
+**裁决 4（黑名单的定位）**：`rejectDangerousRegex` 是**深度防御**，不是防线。它可以继续收紧（例如补上
+「含 `|` 的组 + 量词」以挡住 `(a|a)*` / `(a|aa)+`），但 `(.*a){n}` 一类「有界重复套 `.*`」永远挡不住，
+所以**防线是运行期预算**，不是形状判断。不做静态分析判「这个模式会不会爆」，也不换正则引擎（另拆）。
+
+**裁决 5（异步化后的交错，REV-R5）**：求值变成 `await` 之后，同一个 task 可能在等待期间被 watch
+timeout / 用户 `async_kill` / 代际 retire 终结。恢复执行时**必须重新判** `isTerminal(status)`（以及
+`stopped` / `suspended` / `retired`），终态快照是唯一记录，`await` 之后不得重写终态，也不得再
+`scheduleNext()`。进程退出路径（`live.exit.then` 里那次求值）同样走预算，同样遵守这条。
+
+**已知限制（接受，不修）**：
+
+- worker **起不来**（平台限制、被禁）时，该轮记为 `error`（既有语义：`blind_checks` 计一次基础设施
+  失败），并在 stderr 打一行原因。不静默放行、也不偷偷退回同步求值（那会复活本条要修的冻结）。
+- 每轮把 ≤64K 码元的**主体** `postMessage` 给 worker 是一次拷贝（128 KB 上限），量级在微秒。
+- `readWatchOutput` 每轮同步读 8 MiB 尾部（REV-25）自身的停顿不在本条范围；它有自己的界。
+
+**回退开关**：无（这是缺陷修复；需要回到旧行为只能回退代码）。
+
+**验收**（`docs/reports/watch-preemption.md` 是证据）：
+
+1. 对 `("a"*29+"!")`（30 码元）与 `("a"*25+"!")`（26 码元）配 `(a|a)*$` 求值时，**10 ms 定时器在
+   200 ms 内触发**。修前两者都在同步求值里把定时器拖到秒级（28 码元实测 3.12 s，§5（2）已经量过；
+   26/30 码元同一个量级）。
+2. 同一轮 `async_status` 显示 `matchBudgetExceeded ≥ 1`，任务**不是** `failed`；`timeoutMs` / `intervalMs`
+   在挂住场景下仍按预期生效（修前它们被饿死）。
+3. 良性模式与 64K 良性输入的命中结果与 `main` **逐字相同**（对照表）。
+4. 变异必红：① 去掉预算回到同步求值 → 验收 1 红；② 把超预算当失败 → 验收 2 红。

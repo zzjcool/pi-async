@@ -2,6 +2,28 @@
 
 本文件记录用户可见变更。格式参考 Keep a Changelog，版本遵循 SemVer。
 
+## [Unreleased] — 0.5.3 (fix)
+
+条件求值可抢占（#113）：`output_matches` 的正则求值不再跑在主线程上，而是一个 25 ms 硬预算的可抢占
+worker；越预算**按未命中处理**，不是失败。契约修订见 `docs/CONTRACT.md` §26（REV-34），证据见
+`docs/reports/watch-preemption.md`。`package.json` 版本不动（由 release 提交统一抬）。
+
+### Fixed
+
+- **26 码元就能冻死宿主**：`(a|a)*$` + `"a"*25 + "!"` 冷路径 **5.02 s**，期间事件循环完全停摆（先上弦的
+  100 ms 定时器被拖到 3.12 s），所以 `timeoutMs` / `intervalMs` 无法抢占。修后同一输入的求值在 25 ms
+  内被掐断，10 ms 定时器照常触发（`docs/reports/watch-preemption.md` §2）。
+- **`MAX_MATCH_CHARS` 的理由写错了**：`CONTRACT.md` §4 / §20.2 把 64K 窗口说成「限制 ReDoS 影响面」，
+  实测 19 码元就越过 25 ms——影响面与窗口大小无关。窗口保留，理由是**内存 / 取舍边界**，不是 ReDoS
+  防线；防线是可抢占预算（REV-34）。
+- **形状黑名单的定位**：4 个已知灾难形状只挡住 `(a+)+$`。它现在是**深度防御**，不是防线（REV-34 裁决 4）。
+
+### Added
+
+- `async_status` / TUI 详情新增每任务计数器 `matchBudgetExceeded`：`output_matches` 求值超预算的次数。
+  超预算的轮次视为**未命中**（不累计 `blind_checks`、不动 `timeoutMs`、绝不 kill），每条任务首次越界
+  提示一次「条件求值超预算，已按未命中处理」，之后静默。
+
 ## [Unreleased] — 0.5.2 (minor)
 
 存储生命周期（#102）：新增两个**默认关闭**的开关，解决「旧 session 目录只增不减」与「没有字节上限」。
